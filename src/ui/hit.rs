@@ -141,6 +141,8 @@ pub struct HitMap {
     pub viewer: Option<ViewerHit>,
     /// The host picker or bookmark list.
     pub picker: Option<ListHit>,
+    /// Visible picker tab cells and their indices; clipped to drawn text.
+    pub picker_tabs: Vec<(Rect, usize)>,
     /// The open dialog.
     pub dialog: Option<DialogHit>,
     /// The open popup menu (sort menu, context menu).
@@ -169,7 +171,9 @@ impl HitMap {
         match self.layer_at(point)? {
             Layer::Menu(menu) => find(&menu.items, point).map(ClickTarget::MenuRow),
             Layer::Dialog(dialog) => find(&dialog.buttons, point).map(ClickTarget::DialogButton),
-            Layer::Picker(list) => list_index(list, point).map(ClickTarget::PickerRow),
+            Layer::Picker(list) => find(&self.picker_tabs, point)
+                .map(ClickTarget::PickerTab)
+                .or_else(|| list_index(list, point).map(ClickTarget::PickerRow)),
             Layer::Viewer(_) => None,
             Layer::SyncView(list) => list_index(list, point).map(ClickTarget::SyncRow),
             Layer::Queue(queue) => find(&queue.rows, point).map(ClickTarget::QueueRow),
@@ -506,6 +510,41 @@ mod tests {
         // The queue panel covers the bottom of the pane.
         assert_eq!(map.resolve(5, 15), None);
         assert_eq!(map.scroll_region(5, 15), Some(ScrollRegion::Queue));
+    }
+
+    #[test]
+    fn picker_tabs_resolve_only_drawn_rectangles_and_remain_modal() {
+        for width in [18, 11] {
+            let mut map = HitMap {
+                panes: vec![left_pane()],
+                picker: Some(ListHit {
+                    area: Rect::new(10, 2, width + 2, 10),
+                    rows: Rect::new(11, 5, width, 6),
+                    first_visible: 3,
+                    row_count: 2,
+                }),
+                // The second tab is clipped on the narrow layout.
+                picker_tabs: vec![
+                    (Rect::new(11, 3, 7, 1), 2),
+                    (Rect::new(18, 3, width - 7, 1), 3),
+                ],
+                ..HitMap::default()
+            };
+            assert_eq!(map.resolve(11, 3), Some(ClickTarget::PickerTab(2)));
+            assert_eq!(map.resolve(17, 3), Some(ClickTarget::PickerTab(2)));
+            assert_eq!(map.resolve(18, 3), Some(ClickTarget::PickerTab(3)));
+            assert_eq!(map.resolve(10 + width, 3), Some(ClickTarget::PickerTab(3)));
+            assert_eq!(map.resolve(11 + width, 3), None);
+            assert_eq!(map.resolve(11, 4), None);
+            assert_eq!(map.resolve(11, 5), Some(ClickTarget::PickerRow(3)));
+            assert_eq!(map.resolve(0, 3), None);
+            assert_eq!(map.drop_target(11, 3), DropTarget::Invalid);
+            map.dialog = Some(DialogHit {
+                area: Rect::new(10, 2, 20, 10),
+                buttons: Vec::new(),
+            });
+            assert_eq!(map.resolve(11, 3), None);
+        }
     }
 
     #[test]

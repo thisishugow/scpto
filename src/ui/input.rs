@@ -13,8 +13,10 @@
 //!   - left press: a button-bar button (`HitMap::bar_button`) first becomes
 //!     its action, exactly as its key; then a queue button
 //!     (`HitMap::queue_button`) becomes `Action::Queue { target: Some(..) }`;
-//!     otherwise `HitMap::resolve`. With Alt (Option) held, a press on a
-//!     `ClickTarget::PaneRow` becomes `Action::ContextMenu` anchored at the
+//!     otherwise `HitMap::resolve`. A press on a
+//!     `ClickTarget::PickerTab` becomes `Action::PickerSelectTab` directly,
+//!     without starting a double click or drag. With Alt (Option) held,
+//!     a press on a `ClickTarget::PaneRow` becomes `Action::ContextMenu` anchored at the
 //!     pointer. A press on the same `ClickTarget` as the previous press
 //!     within `DOUBLE_CLICK` becomes `Action::DoubleClick`, else
 //!     `Action::Click` with modifiers (Ctrl or Super → toggle, Shift →
@@ -268,6 +270,10 @@ impl InputState {
             self.last_click = None;
             return None;
         };
+        if let ClickTarget::PickerTab(index) = target {
+            self.last_click = None;
+            return Some(Action::PickerSelectTab(index));
+        }
         if let (true, ClickTarget::PaneRow { side, index }) =
             (mouse.modifiers.contains(KeyModifiers::ALT), target)
         {
@@ -606,7 +612,7 @@ mod tests {
     use crate::state::SortKey;
     use crate::transfer::model::{ItemId, JobId, QueueTarget};
     use crate::ui::action::{DialogButton, DropTarget, ScrollRegion};
-    use crate::ui::hit::{DialogHit, PaneHit, QueueHit, ViewerHit, ViewerKind};
+    use crate::ui::hit::{DialogHit, ListHit, PaneHit, QueueHit, ViewerHit, ViewerKind};
 
     const JOB: QueueTarget = QueueTarget::Job(JobId(1));
     const ITEM: QueueTarget = QueueTarget::Item(ItemId(2));
@@ -1101,6 +1107,47 @@ mod tests {
         // Arrows never start a sync by accident.
         assert_eq!(map(mode, key(KeyCode::Right)), None);
         assert_eq!(map(mode, key(KeyCode::Left)), None);
+    }
+
+    #[test]
+    fn picker_tab_presses_select_the_group_without_double_click_or_drag() {
+        let hits = HitMap {
+            picker: Some(ListHit {
+                area: Rect::new(10, 2, 30, 10),
+                rows: Rect::new(11, 5, 28, 6),
+                first_visible: 0,
+                row_count: 1,
+            }),
+            picker_tabs: vec![(Rect::new(18, 3, 8, 1), 1)],
+            ..hits()
+        };
+        let mut state = InputState::new();
+        let now = Instant::now();
+        for _ in 0..2 {
+            assert_eq!(
+                state.handle(&down(20, 3), InputMode::Picker, &hits, now),
+                Some(Action::PickerSelectTab(1))
+            );
+            assert_eq!(
+                state.handle(&drag(21, 3), InputMode::Picker, &hits, now),
+                None
+            );
+            assert_eq!(
+                state.handle(&up(21, 3), InputMode::Picker, &hits, now),
+                None
+            );
+        }
+        assert_eq!(
+            state.handle(&down(0, 3), InputMode::Picker, &hits, now),
+            None
+        );
+        let right = mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            20,
+            3,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(state.handle(&right, InputMode::Picker, &hits, now), None);
     }
 
     #[test]

@@ -1071,6 +1071,7 @@ impl App {
             | Action::DialogFocus(_)
             | Action::ToggleOption
             | Action::DialogHotkey(_)
+            | Action::PickerSelectTab(_)
             | Action::PickerRemove => {}
             Action::Resize { .. } => {}
         }
@@ -1160,6 +1161,7 @@ impl App {
             | ClickTarget::DialogButton(_)
             | ClickTarget::MenuRow(_)
             | ClickTarget::PickerRow(_)
+            | ClickTarget::PickerTab(_)
             | ClickTarget::SyncRow(_) => {}
         }
         Vec::new()
@@ -1209,6 +1211,7 @@ impl App {
             | ClickTarget::DialogButton(_)
             | ClickTarget::MenuRow(_)
             | ClickTarget::PickerRow(_)
+            | ClickTarget::PickerTab(_)
             | ClickTarget::SyncRow(_) => Vec::new(),
         }
     }

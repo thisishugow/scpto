@@ -241,6 +241,8 @@ pub enum ClickTarget {
     DialogButton(DialogButton),
     /// A row of the host picker or bookmark list (visible index).
     PickerRow(usize),
+    /// A visible group tab of the picker (index into its tabs).
+    PickerTab(usize),
     /// A row of the comparison view (visible index).
     SyncRow(usize),
     /// An item of the open popup menu (index in the menu).
@@ -410,6 +412,8 @@ pub enum Action {
     DialogHotkey(char),
     /// Remove the selected picker entry (bookmark list).
     PickerRemove,
+    /// Select a picker group tab by index, keeping the filter.
+    PickerSelectTab(usize),
 
     // Mouse.
     /// A single click.

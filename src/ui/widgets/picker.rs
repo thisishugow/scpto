@@ -2,7 +2,7 @@
 //! the bookmark list.
 //!
 //! A centered popup: title, a tab row (host picker: `All`, each sshto group,
-//! `Other`; selected with digit keys like sshto; omitted when empty), the
+//! `Other`; selected with digit keys or clicks; omitted when empty), the
 //! filter line, and the rows (label, then dimmed detail such as
 //! `user@hostname` once resolved).
 //!
@@ -34,8 +34,8 @@
 //! }
 //!
 //! /// Draws the popup centered in `screen` and returns its hit data
-//! /// (`first_visible` and `row_count` as drawn).
-//! pub fn render(view: &PickerView<'_>, screen: Rect, buf: &mut Buffer) -> ListHit;
+//! /// (list rows and visible tab rectangles with their indices).
+//! pub fn render(view: &PickerView<'_>, screen: Rect, buf: &mut Buffer) -> (ListHit, Vec<(Rect, usize)>);
 //! ```
 
 use ratatui::buffer::Buffer;
@@ -86,8 +86,12 @@ pub struct PickerRow<'a> {
 }
 
 /// Draws the popup centered in `screen` and returns its hit data
-/// (`first_visible` and `row_count` as drawn).
-pub fn render(view: &PickerView<'_>, screen: Rect, buf: &mut Buffer) -> ListHit {
+/// (list rows and visible tab rectangles with their indices).
+pub fn render(
+    view: &PickerView<'_>,
+    screen: Rect,
+    buf: &mut Buffer,
+) -> (ListHit, Vec<(Rect, usize)>) {
     let tab_rows = u16::from(!view.tabs.is_empty());
     // Border, optional tab row, filter line.
     let chrome = 2 + tab_rows + 1;
@@ -106,8 +110,9 @@ pub fn render(view: &PickerView<'_>, screen: Rect, buf: &mut Buffer) -> ListHit 
     block.render(area, buf);
 
     let mut y = inner.y;
+    let mut tabs = Vec::new();
     if tab_rows > 0 && y < inner.bottom() {
-        draw_tabs(
+        tabs = draw_tabs(
             view.tabs,
             view.active_tab,
             Rect {
@@ -162,12 +167,15 @@ pub fn render(view: &PickerView<'_>, screen: Rect, buf: &mut Buffer) -> ListHit 
         row_count += 1;
     }
 
-    ListHit {
-        area,
-        rows,
-        first_visible: view.first_visible,
-        row_count,
-    }
+    (
+        ListHit {
+            area,
+            rows,
+            first_visible: view.first_visible,
+            row_count,
+        },
+        tabs,
+    )
 }
 
 fn count_label(count: usize) -> String {
@@ -188,7 +196,7 @@ fn tab_captions(tabs: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn draw_tabs(tabs: &[&str], active: usize, line: Rect, buf: &mut Buffer) {
+fn draw_tabs(tabs: &[&str], active: usize, line: Rect, buf: &mut Buffer) -> Vec<(Rect, usize)> {
     let captions = tab_captions(tabs);
     let widths: Vec<u16> = captions.iter().map(|caption| text_width(caption)).collect();
     // Skip leading tabs until the active one fits.
@@ -197,20 +205,30 @@ fn draw_tabs(tabs: &[&str], active: usize, line: Rect, buf: &mut Buffer) {
     while first < last && widths[first..=last].iter().sum::<u16>() > line.width {
         first += 1;
     }
-    let spans: Vec<Span<'_>> = captions
-        .iter()
-        .enumerate()
-        .skip(first)
-        .map(|(index, caption)| {
-            let style = if index == active {
-                Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                Style::new()
-            };
-            Span::styled(caption.as_str(), style)
-        })
-        .collect();
-    buf.set_line(line.x, line.y, &Line::from(spans), line.width);
+    let mut hits = Vec::new();
+    let mut x = line.x;
+    for (index, caption) in captions.iter().enumerate().skip(first) {
+        if x >= line.right() {
+            break;
+        }
+        let style = if index == active {
+            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let (end, _) = buf.set_stringn(x, line.y, caption, usize::from(line.right() - x), style);
+        let width = end - x;
+        if width > 0 {
+            hits.push((Rect::new(x, line.y, width, 1), index));
+        }
+        // A clipped wide character may leave a blank cell at the edge.
+        // Neither that cell nor any later tab was drawn.
+        if width < widths[index] {
+            break;
+        }
+        x = end;
+    }
+    hits
 }
 
 fn draw_filter(filter: &str, line: Rect, buf: &mut Buffer) {
@@ -305,13 +323,21 @@ mod tests {
         u16::try_from(start).unwrap()
     }
 
-    fn draw(view: &PickerView<'_>, width: u16, height: u16) -> (Buffer, ListHit) {
+    fn draw(view: &PickerView<'_>, width: u16, height: u16) -> (Buffer, HitMap) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut hit = None;
         terminal
             .draw(|frame| hit = Some(render(view, frame.area(), frame.buffer_mut())))
             .unwrap();
-        (terminal.backend().buffer().clone(), hit.unwrap())
+        let (list, tabs) = hit.unwrap();
+        (
+            terminal.backend().buffer().clone(),
+            HitMap {
+                picker: Some(list),
+                picker_tabs: tabs,
+                ..HitMap::default()
+            },
+        )
     }
 
     const ROWS: [PickerRow<'static>; 3] = [
@@ -341,7 +367,8 @@ mod tests {
             cursor: 1,
             first_visible: 0,
         };
-        let (buf, hit) = draw(&view, 100, 30);
+        let (buf, map) = draw(&view, 100, 30);
+        let hit = map.picker.as_ref().unwrap();
         // 80 wide, 2 + 1 + 1 + 20 tall, centered.
         assert_eq!(hit.area, Rect::new(10, 3, 80, 24));
         assert!(row_text(&buf, 3).contains(" Connect "));
@@ -367,12 +394,60 @@ mod tests {
         assert!(!buf[(12, 6)].modifier.contains(Modifier::REVERSED));
         assert!(row_text(&buf, 26).contains(" 3 entries "));
 
-        let map = HitMap {
-            picker: Some(hit),
-            ..HitMap::default()
-        };
         assert_eq!(map.resolve(20, 8), Some(ClickTarget::PickerRow(2)));
         assert_eq!(map.resolve(20, 9), None);
+    }
+
+    #[test]
+    fn tab_hits_follow_drawn_cells_including_wide_names_and_clipping() {
+        let view = PickerView {
+            title: "Connect",
+            filter: "",
+            tabs: &["All", "\u{4e2d}\u{6587}", "Other"],
+            active_tab: 0,
+            rows: &ROWS,
+            cursor: 0,
+            first_visible: 0,
+        };
+        for (width, expected) in [
+            (50, vec![(7, 0), (8, 1), (9, 2)]),
+            (19, vec![(7, 0), (5, 1)]),
+        ] {
+            let (buf, map) = draw(&view, width, 20);
+            let list = map.picker.as_ref().unwrap();
+            let y = list.area.y + 1;
+            let mut x = list.area.x + 1;
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(width, index)| {
+                    let rect = Rect::new(x, y, width, 1);
+                    x += width;
+                    (rect, index)
+                })
+                .collect();
+            assert_eq!(map.picker_tabs, expected);
+            for &(rect, index) in &map.picker_tabs {
+                assert_eq!(buf[(rect.x + 1, y)].symbol(), (index + 1).to_string());
+                for column in rect.x..rect.right() {
+                    assert_eq!(map.resolve(column, y), Some(ClickTarget::PickerTab(index)));
+                }
+            }
+            let wide = map.picker_tabs[1].0;
+            assert_eq!(buf[(wide.x + 3, y)].symbol(), "\u{4e2d}");
+            assert_eq!(buf[(wide.x + 4, y)].symbol(), " ");
+            if width == 50 {
+                assert_eq!(buf[(wide.x + 5, y)].symbol(), "\u{6587}");
+                assert_eq!(buf[(map.picker_tabs[2].0.x + 3, y)].symbol(), "O");
+            } else {
+                // The second wide glyph cannot fit in the remaining cell.
+                assert_eq!(buf[(x, y)].symbol(), " ");
+                assert!(!row_text(&buf, y).contains('\u{6587}'));
+            }
+            for column in x..list.area.right() {
+                assert_eq!(map.resolve(column, y), None);
+            }
+            assert_eq!(map.resolve(list.area.x, y), None);
+        }
     }
 
     #[test]
@@ -386,7 +461,9 @@ mod tests {
             cursor: 0,
             first_visible: 0,
         };
-        let (buf, hit) = draw(&view, 100, 30);
+        let (buf, map) = draw(&view, 100, 30);
+        let hit = map.picker.as_ref().unwrap();
+        assert!(map.picker_tabs.is_empty());
         assert_eq!(hit.area, Rect::new(10, 4, 80, 23));
         assert!(row_text(&buf, 5).contains("/srv "));
         assert!(buf[(15, 5)].modifier.contains(Modifier::REVERSED));
@@ -408,7 +485,8 @@ mod tests {
         };
         // 10 rows: 6 for the popup, leaving 3 list rows of which the last
         // two entries fill two.
-        let (buf, hit) = draw(&view, 40, 10);
+        let (buf, map) = draw(&view, 40, 10);
+        let hit = map.picker.as_ref().unwrap();
         assert_eq!(hit.area, Rect::new(2, 2, 36, 6));
         assert_eq!(hit.rows, Rect::new(3, 4, 34, 3));
         assert_eq!(hit.first_visible, 1);
@@ -429,7 +507,8 @@ mod tests {
             cursor: 0,
             first_visible: 0,
         };
-        let (buf, hit) = draw(&view, 60, 20);
+        let (buf, map) = draw(&view, 60, 20);
+        let hit = map.picker.as_ref().unwrap();
         assert_eq!(hit.row_count, 0);
         assert!(row_text(&buf, hit.rows.y).contains("No matches"));
     }
@@ -449,12 +528,20 @@ mod tests {
             cursor: 0,
             first_visible: 0,
         };
-        let (buf, _) = draw(&view, 50, 20);
+        let (buf, map) = draw(&view, 50, 20);
         let line = row_text(&buf, 3);
         assert!(line.contains(" Other "), "{line:?}");
         assert!(!line.contains(" 1 All "));
         // Tabs past the ninth have no digit key.
         assert!(line.contains(" india "));
+        let (area, index) = map.picker_tabs.last().unwrap();
+        assert_eq!(*index, 10);
+        assert_eq!(area.x + 1, column_of(&buf, area.y, "Other"));
+        assert_eq!(
+            map.resolve(area.x, area.y),
+            Some(ClickTarget::PickerTab(10))
+        );
+        assert!(map.picker_tabs.iter().all(|(_, index)| *index > 0));
     }
 
     #[test]
