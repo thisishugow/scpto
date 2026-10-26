@@ -1655,6 +1655,85 @@ mod tests {
         assert!(!root.join("other").exists());
     }
 
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[tokio::test]
+    async fn copy_file_restricts_the_part_while_copying_and_after_cancel() {
+        use crate::transfer::stream::test_support::MemFs;
+        use crate::transfer::stream::{copy_file, CopySpec};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = dir.path().join("id_rsa");
+        let part = dir.path().join("id_rsa.scpto-part");
+        let source = MemFs::new(Endpoint::Local);
+        source.add_file("/id_rsa", b"0123456789", 5, 0o600);
+        let _gate = source.gate_reads("/id_rsa", 4);
+        let fs = local_fs().await;
+        let copy = copy_file(
+            CopySpec {
+                source: &*source,
+                source_path: Path::new("/id_rsa"),
+                destination: &fs,
+                destination_path: &destination,
+                size: 10,
+                mtime: Some(1_700_000_000),
+                mode: Some(0o600),
+                resume_from: 0,
+            },
+            &|_| {},
+        );
+        let mut copy = Box::pin(copy);
+        tokio::select! {
+            result = copy.as_mut() => panic!("copy finished unexpectedly: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        assert_eq!(mode_of(&part), 0o600, "while copying");
+        drop(copy);
+        assert_eq!(mode_of(&part), 0o600, "after cancel");
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn copy_file_restricts_the_part_before_a_server_side_copy() {
+        use crate::transfer::stream::{copy_file, CopySpec};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("secret"), b"0123").expect("write");
+        std::fs::set_permissions(root.join("secret"), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        // A directory at the destination makes the final rename fail, so
+        // the part the server filled stays behind for inspection.
+        std::fs::create_dir(root.join("copy")).expect("mkdir");
+        let fs = local_fs().await;
+        if !fs.capabilities().copy_within {
+            // Servers before OpenSSH 9.0 lack copy-data and stream instead,
+            // which the test above covers.
+            return;
+        }
+        let error = copy_file(
+            CopySpec {
+                source: &fs,
+                source_path: &root.join("secret"),
+                destination: &fs,
+                destination_path: &root.join("copy"),
+                size: 4,
+                mtime: None,
+                mode: Some(0o600),
+                resume_from: 0,
+            },
+            &|_| {},
+        )
+        .await
+        .expect_err("rename onto a directory fails");
+        assert!(!matches!(error, FsError::Disconnected), "{error:?}");
+        let part = root.join("copy.scpto-part");
+        assert_eq!(std::fs::read(&part).expect("part kept"), b"0123");
+        assert_eq!(mode_of(&part), 0o600);
+    }
+
     #[tokio::test]
     async fn a_killed_channel_is_disconnected_everywhere() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -1,24 +1,22 @@
-//! Modal dialog widget: message, checkbox, buttons.
+//! Modal dialog widget: message, optional text field, checkbox, buttons.
 //!
 //! Centered on the screen, cleared underneath, sized to its content (at most
 //! the screen minus a 2-cell margin). Buttons show their hotkey letter
-//! underlined; the focused button or checkbox is highlighted. The checkbox
+//! underlined; the focused button, field, or checkbox is highlighted. The
+//! text field (rename, mkdir, chmod, sudo password) is drawn by
+//! [`text_input::render`], which also masks a password. The checkbox
 //! is drawn as `[x] <label>` and recorded as a clickable
 //! `DialogButton::ApplyToAll` button.
 //!
 //! Layout inside the border (one cell of horizontal padding): the message,
 //! wrapped at word boundaries (explicit newlines kept, words longer than a
-//! line broken), then a blank row and the checkbox when present, then a
-//! blank row and the buttons as `[Label]`, centered and flowed onto as many
-//! rows as needed. A hotkey that does not occur in its label is shown as
-//! `[Label (k)]`. When the screen is too short, message lines are dropped
-//! from the end (the last kept line ends in `...`) so the checkbox and the
-//! buttons stay visible.
-//!
-//! The text field (rename, mkdir, chmod, sudo password) is not part of this
-//! module yet: the frozen seam types it as `text_input::TextInputView`, a
-//! sibling Wave 2 module this one may not depend on, so the field and the
-//! caret position return value land when Wave 3 wires the two together.
+//! line broken), then a blank row and the text field (one row, full content
+//! width) when present, then a blank row and the checkbox when present, then
+//! a blank row and the buttons as `[Label]`, centered and flowed onto as
+//! many rows as needed. A hotkey that does not occur in its label is shown
+//! as `[Label (k)]`. When the screen is too short, message lines are dropped
+//! from the end (the last kept line ends in `...`) so the field, the
+//! checkbox, and the buttons stay visible.
 //!
 //! # Public API (Wave 2, widgets)
 //!
@@ -27,6 +25,7 @@
 //!     pub title: &'a str,
 //!     /// Wrapped to the dialog width.
 //!     pub message: &'a str,
+//!     pub field: Option<TextInputView<'a>>,
 //!     pub checkbox: Option<CheckboxView<'a>>,
 //!     pub buttons: &'a [ButtonView<'a>],
 //! }
@@ -44,18 +43,20 @@
 //!     pub focused: bool,
 //! }
 //!
-//! /// Draws the dialog centered in `screen`; returns its hit data.
-//! pub fn render(view: &DialogView<'_>, screen: Rect, buf: &mut Buffer) -> DialogHit;
+//! /// Draws the dialog centered in `screen`; returns its hit data and the
+//! /// caret position of a focused text field.
+//! pub fn render(view: &DialogView<'_>, screen: Rect, buf: &mut Buffer) -> (DialogHit, Option<Position>);
 //! ```
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Widget};
 
 use crate::ui::action::DialogButton;
 use crate::ui::hit::DialogHit;
+use crate::ui::widgets::text_input::{self, TextInputView};
 
 /// Narrowest content width (inside border and padding) on a large screen.
 pub const MIN_CONTENT_WIDTH: u16 = 30;
@@ -78,6 +79,9 @@ pub struct DialogView<'a> {
     pub title: &'a str,
     /// Wrapped to the dialog width.
     pub message: &'a str,
+    /// The text field of the rename, mkdir, chmod, and sudo password
+    /// dialogs; masked for a password.
+    pub field: Option<TextInputView<'a>>,
     /// The conflict dialog's "apply to all in this job" box.
     pub checkbox: Option<CheckboxView<'a>>,
     /// Buttons in display order.
@@ -108,8 +112,13 @@ pub struct ButtonView<'a> {
     pub focused: bool,
 }
 
-/// Draws the dialog centered in `screen`; returns its hit data.
-pub fn render(view: &DialogView<'_>, screen: Rect, buf: &mut Buffer) -> DialogHit {
+/// Draws the dialog centered in `screen`; returns its hit data and the
+/// caret position of a focused text field.
+pub fn render(
+    view: &DialogView<'_>,
+    screen: Rect,
+    buf: &mut Buffer,
+) -> (DialogHit, Option<Position>) {
     let captions: Vec<Line<'_>> = view.buttons.iter().map(button_caption).collect();
     let checkbox = view.checkbox.as_ref().map(checkbox_caption);
 
@@ -129,6 +138,7 @@ pub fn render(view: &DialogView<'_>, screen: Rect, buf: &mut Buffer) -> DialogHi
 
     let mut message = wrap(view.message, content_width);
     let button_rows = flow(&captions, content_width);
+    let field_rows: u16 = if view.field.is_some() { 2 } else { 0 };
     let checkbox_rows: u16 = if checkbox.is_some() { 2 } else { 0 };
     let buttons_rows = if button_rows.is_empty() {
         0
@@ -136,7 +146,7 @@ pub fn render(view: &DialogView<'_>, screen: Rect, buf: &mut Buffer) -> DialogHi
         1 + count_u16(button_rows.len())
     };
     let max_height = screen.height.saturating_sub(2 * MARGIN).max(FRAME_HEIGHT);
-    let fixed = FRAME_HEIGHT + checkbox_rows + buttons_rows;
+    let fixed = FRAME_HEIGHT + field_rows + checkbox_rows + buttons_rows;
     let message_rows = count_u16(message.len()).min(max_height.saturating_sub(fixed));
     if usize::from(message_rows) < message.len() {
         message.truncate(usize::from(message_rows));
@@ -165,6 +175,12 @@ pub fn render(view: &DialogView<'_>, screen: Rect, buf: &mut Buffer) -> DialogHi
     for (line, y) in message.iter().zip(rows.by_ref()) {
         buf.set_stringn(inner.x, y, line, usize::from(inner.width), Style::new());
     }
+    let mut caret = None;
+    if let Some(field) = &view.field {
+        if let Some(y) = rows.nth(1) {
+            caret = text_input::render(field, Rect::new(inner.x, y, inner.width, 1), buf);
+        }
+    }
     if let Some(caption) = &checkbox {
         if let Some(y) = rows.nth(1) {
             let width = line_width(caption).min(inner.width);
@@ -188,7 +204,7 @@ pub fn render(view: &DialogView<'_>, screen: Rect, buf: &mut Buffer) -> DialogHi
             x += width + BUTTON_GAP;
         }
     }
-    hit
+    (hit, caret)
 }
 
 /// `[Label]` with the hotkey underlined; the whole caption is reversed
@@ -362,8 +378,18 @@ mod tests {
     }
 
     fn draw(view: &DialogView<'_>, width: u16, height: u16) -> (Buffer, DialogHit) {
+        let (buf, hit, caret) = draw_with_caret(view, width, height);
+        assert_eq!(caret, None, "no focused field");
+        (buf, hit)
+    }
+
+    fn draw_with_caret(
+        view: &DialogView<'_>,
+        width: u16,
+        height: u16,
+    ) -> (Buffer, DialogHit, Option<Position>) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let mut hit = None;
+        let mut drawn = None;
         terminal
             .draw(|frame| {
                 // Something underneath that the dialog must clear.
@@ -371,10 +397,11 @@ mod tests {
                 for position in area.positions() {
                     frame.buffer_mut()[position].set_symbol("#");
                 }
-                hit = Some(render(view, area, frame.buffer_mut()));
+                drawn = Some(render(view, area, frame.buffer_mut()));
             })
             .unwrap();
-        (terminal.backend().buffer().clone(), hit.unwrap())
+        let (hit, caret) = drawn.unwrap();
+        (terminal.backend().buffer().clone(), hit, caret)
     }
 
     fn button(button: DialogButton, label: &'static str, hotkey: char) -> ButtonView<'static> {
@@ -405,6 +432,7 @@ mod tests {
         let view = DialogView {
             title: "Delete",
             message: "Delete 3 items from web:/srv?\nRemote deletion is permanent.",
+            field: None,
             checkbox: None,
             buttons: &buttons,
         };
@@ -464,6 +492,7 @@ mod tests {
         let view = DialogView {
             title: "File exists",
             message: "report.pdf already exists in web:/srv/docs.",
+            field: None,
             checkbox: Some(CheckboxView {
                 label: "Apply to all in this job",
                 checked: true,
@@ -521,6 +550,7 @@ mod tests {
         let view = DialogView {
             title: "VPN",
             message: "VPN may be required for nadi-gpu.\nCommand: ssh -t ts-dgx-dev ovpn",
+            field: None,
             checkbox: None,
             buttons: &buttons,
         };
@@ -541,6 +571,7 @@ mod tests {
         let view = DialogView {
             title: "Connection failed",
             message,
+            field: None,
             checkbox: None,
             buttons: &buttons,
         };
@@ -561,6 +592,7 @@ mod tests {
         let view = DialogView {
             title: "Error",
             message,
+            field: None,
             checkbox: None,
             buttons: &buttons,
         };
@@ -573,6 +605,107 @@ mod tests {
             drawn_buttons(&buf, &hit),
             vec![("[OK]".to_owned(), DialogButton::Ok)]
         );
+    }
+
+    fn ok_cancel() -> [ButtonView<'static>; 2] {
+        [
+            button(DialogButton::Ok, "OK", 'o'),
+            button(DialogButton::Cancel, "Cancel", 'c'),
+        ]
+    }
+
+    #[test]
+    fn masked_password_field_sits_below_the_message_with_its_caret() {
+        let buttons = ok_cancel();
+        let view = DialogView {
+            title: "sudo",
+            message: "Password for deploy@web:",
+            field: Some(TextInputView {
+                value: "hunter2",
+                caret: 7,
+                masked: true,
+                focused: true,
+            }),
+            checkbox: None,
+            buttons: &buttons,
+        };
+        let (buf, hit, caret) = draw_with_caret(&view, 80, 24);
+        // Frame 2, message 1, blank + field 2, blank + buttons 2.
+        assert_eq!(hit.area.height, 7);
+        let field_y = hit.area.y + 3;
+        let field_x = hit.area.x + 2;
+        assert_eq!(
+            text_at(&buf, Rect::new(field_x, field_y, MIN_CONTENT_WIDTH, 1)),
+            format!("*******{}", " ".repeat(usize::from(MIN_CONTENT_WIDTH) - 7))
+        );
+        assert!(!(0..24).any(|y| row_text(&buf, y).contains("hunter2")));
+        assert_eq!(caret, Some(Position::new(field_x + 7, field_y)));
+        // The field spans the content width and nothing else.
+        assert_eq!(buf[(field_x, field_y)].bg, ratatui::style::Color::DarkGray);
+        assert_eq!(
+            buf[(field_x + MIN_CONTENT_WIDTH - 1, field_y)].bg,
+            ratatui::style::Color::DarkGray
+        );
+        assert_ne!(
+            buf[(field_x + MIN_CONTENT_WIDTH, field_y)].bg,
+            ratatui::style::Color::DarkGray
+        );
+        assert_eq!(hit.buttons[0].0.y, field_y + 2);
+    }
+
+    #[test]
+    fn unfocused_field_returns_no_caret_and_stacks_above_the_checkbox() {
+        let buttons = ok_cancel();
+        let view = DialogView {
+            title: "Rename",
+            message: "New name:",
+            field: Some(TextInputView {
+                value: "report.pdf",
+                caret: 3,
+                masked: false,
+                focused: false,
+            }),
+            checkbox: Some(CheckboxView {
+                label: "Keep extension",
+                checked: false,
+                focused: true,
+            }),
+            buttons: &buttons,
+        };
+        let (buf, hit, caret) = draw_with_caret(&view, 80, 24);
+        assert_eq!(caret, None);
+        let field_y = hit.area.y + 3;
+        assert!(row_text(&buf, field_y).contains("report.pdf"));
+        let (checkbox, button) = hit.buttons[0];
+        assert_eq!(button, DialogButton::ApplyToAll);
+        assert_eq!(checkbox.y, field_y + 2);
+        assert_eq!(hit.buttons[1].0.y, field_y + 4);
+        assert_eq!(hit.area.height, 2 + 1 + 2 + 2 + 2);
+    }
+
+    #[test]
+    fn short_screen_drops_message_lines_but_keeps_the_field() {
+        let buttons = ok_cancel();
+        let view = DialogView {
+            title: "Create directory",
+            message: "one\ntwo\nthree\nfour",
+            field: Some(TextInputView {
+                value: "new",
+                caret: 3,
+                masked: false,
+                focused: true,
+            }),
+            checkbox: None,
+            buttons: &buttons,
+        };
+        // 11 rows - 2 * 2 margin = 7: frame 2, field 2, buttons 2, 1 line.
+        let (buf, hit, caret) = draw_with_caret(&view, 60, 11);
+        assert_eq!(hit.area.height, 7);
+        assert!(row_text(&buf, hit.area.y + 1).contains("one..."));
+        let field_y = hit.area.y + 3;
+        assert!(row_text(&buf, field_y).contains("new"));
+        assert_eq!(caret, Some(Position::new(hit.area.x + 2 + 3, field_y)));
+        assert_eq!(hit.buttons[0].0.y, field_y + 2);
     }
 
     #[test]
