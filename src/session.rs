@@ -3,7 +3,7 @@
 //! classification, remote tool probes, exponential backoff reconnect, and teardown. `Sessions`
 //! implements `connections::Connections`.
 //!
-//! # Master lifecycle (plan 2.5, 7.3, 8.5)
+//! # Master lifecycle
 //!
 //! - ControlPath directory: `/tmp/scpto-<uid>/<pid>/` (both levels mode
 //!   0700, created by scpto; an existing `/tmp/scpto-<uid>` must be a real
@@ -12,8 +12,9 @@
 //!   `ESRCH`) are removed.
 //! - Master: `<program> [-F <file>] -o ControlPath=<dir>/%C -o
 //!   ControlMaster=yes -o ControlPersist=10m -o ServerAliveInterval=<keepalive>
-//!   -o ServerAliveCountMax=3 <7.3 common options> -o BatchMode=yes -N -f --
-//!   <host>`, spawned with `process_group(0)`, stdin null, `kill_on_drop`.
+//!   -o ServerAliveCountMax=3 <common non-interactive options>
+//!   -o BatchMode=yes -N -f -- <host>`, spawned with `process_group(0)`,
+//!   stdin null, `kill_on_drop`.
 //!   Classification uses the exit code first: exit 0 is success even with a
 //!   non-empty stderr (OpenSSH 10 prints a post-quantum warning for old
 //!   servers); stderr lines end in `\r\n`.
@@ -24,13 +25,13 @@
 //!   authenticated) through `term::TerminalGuard::run_foreground` and calls
 //!   `connect` again, which finds the master through `ssh -O check`.
 //! - Children (sftp channels, `spawn_remote`, probes, `ssh_command`):
-//!   `-o ControlPath=<dir>/%C -o ControlMaster=no`, the 7.3 common options,
-//!   `-o BatchMode=yes`; `ssh -O check <host>` before each spawn, and a
+//!   `-o ControlPath=<dir>/%C -o ControlMaster=no`, the common non-interactive
+//!   options, `-o BatchMode=yes`; `ssh -O check <host>` before each spawn, and a
 //!   missing master is rebuilt instead of letting the child connect itself.
 //!   SFTP channel: `-s -- <host> sftp`; its stderr is drained by a dedicated
 //!   task into a `StderrTail` of the last 64 lines (each line capped at
 //!   4 KiB).
-//! - Each endpoint keeps a Browse and a Transfer channel (S17). For a sudo
+//! - Each endpoint keeps a Browse and a Transfer channel. For a sudo
 //!   endpoint both channels share one root sftp-server started through
 //!   `Backends::start_sudo` (`sudo::start`): sudo endpoints use neither tar
 //!   nor rsync, and one start means one password prompt. The password is
@@ -44,7 +45,7 @@
 //!   before removing the `<pid>` directory. `disconnect` closes a host's
 //!   master the same way once no endpoint of that host remains.
 //!
-//! # Classification and reconnect (S1, S10)
+//! # Classification and reconnect
 //!
 //! - ssh exit 255 with stderr matching timeout / no route / refused / name
 //!   resolution → `ConnectError::Unreachable`; `Permission denied (` /
@@ -67,7 +68,7 @@
 //! - VPN hint eligibility is `ConnectError::vpn_hint_eligible()`; matching
 //!   the `vpn` rule is the app's job (`Settings::vpn_rule`).
 //!
-//! # Quoting (7.3)
+//! # Quoting
 //!
 //! Every remote command string (tar `-C`, the `t` shell, probes, sudo) is
 //! built with `connections::quote` / `connections::join_command`, the one
@@ -87,12 +88,13 @@
 //!
 //! The SFTP client (`vfs::sftp`), the sudo start (`sudo`), and the local
 //! file system (`vfs::local`) are reached through the [`Backends`] trait so
-//! that this module compiles and is tested on its own; Wave 3 wires the
-//! production implementation. Its methods mirror the frozen signatures of
-//! `SftpFs::start` / `SftpFs::closed`, `sudo::locate_sftp_server`,
-//! `sudo::start`, and `LocalFs::new`.
+//! tests can substitute these dependencies. `ui::effects::session` provides
+//! `ProductionBackends` and the `SftpChannel` implementation for `SftpFs`;
+//! startup passes the production backends to `Sessions::new`. These adapters
+//! delegate to `SftpFs::start` / `SftpFs::closed`,
+//! `sudo::locate_sftp_server`, `sudo::start`, and `LocalFs::new`.
 //!
-//! # Public API (Wave 2)
+//! # Public API
 //!
 //! ```text
 //! pub struct Sessions { /* private */ }
@@ -189,7 +191,7 @@ use crate::settings::{Settings, KEEPALIVE_COUNT_MAX};
 use crate::ui::action::{BgEvent, Secret};
 use crate::vfs::{Endpoint, Fs};
 
-/// The plan 7.3 common non-interactive options, each passed as `-o <opt>`.
+/// Common non-interactive SSH options, each passed as `-o <opt>`.
 const COMMON_OPTIONS: [&str; 6] = [
     "RemoteCommand=none",
     "RequestTTY=no",
@@ -230,7 +232,7 @@ pub fn backoff_delay(attempt: u32, base: Duration, cap: Duration) -> Duration {
 }
 
 /// Classifies a finished ssh process that did not succeed, by its exit
-/// status and stderr tail (plan 7.3 S1, 8.5).
+/// status and stderr tail.
 ///
 /// Callers check for success first: exit 0 is success whatever stderr says.
 /// Only exit 255 is ssh's own failure; other codes come from the remote
@@ -2426,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn command_shapes_follow_the_plan() {
+    fn commands_set_master_multiplexing_and_auth_options() {
         let root = tempfile::Builder::new()
             .prefix("scpto-t")
             .tempdir_in("/tmp")

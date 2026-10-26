@@ -5,11 +5,11 @@
 //!
 //! # Ownership and teardown
 //!
-//! An `SftpFs` owns its child for as long as its `Sftp` lives (plan 7.3
-//! S10). The `Sftp` field is declared before the child so it drops first;
+//! An `SftpFs` owns its child for as long as its `Sftp` lives.
+//! The `Sftp` field is declared before the child so it drops first;
 //! the child then drops and `kill_on_drop` (set by the spawner) kills the
 //! ssh process, which ends the session. `Sftp::close()` is never called:
-//! after a disconnect it only reports the broken pipe (plan 8.5), and on a
+//! after a disconnect it only reports the broken pipe, and on a
 //! healthy session the kill ends the channel just as well. Nothing is ever
 //! shown for teardown.
 //!
@@ -19,10 +19,9 @@
 //!
 //! # Server differences
 //!
-//! Facts from the Wave 1 spike that this module honors: `readdir` returns
-//! `.` and `..` (filtered here); OpenSSH 7.9 lacks `limits`, `copy-data`,
-//! and `expand-path`, so every extension is feature-detected from the
-//! server's hello: `posix_rename` from `posix-rename@openssh.com`,
+//! `readdir` returns `.` and `..` (filtered here). OpenSSH 7.9 lacks
+//! `limits`, `copy-data`, and `expand-path`, so every extension is detected
+//! from the server's hello: `posix_rename` from `posix-rename@openssh.com`,
 //! `copy_within` from `copy-data`; the client applies `limits` when present
 //! and uses `expand-path` for `canonicalize` when present (plain `realpath`
 //! otherwise); `home` is the canonical form of `.` (the server's start
@@ -31,7 +30,7 @@
 //! Without `posix-rename@openssh.com`, the client sends a plain
 //! `SSH_FXP_RENAME`, which refuses an existing target. `rename` then
 //! confirms the target with `lstat`, removes it when it is not a directory,
-//! and renames again. This is not atomic (plan 7.5 S14): a failure between
+//! and renames again. This is not atomic: a failure between
 //! the two steps leaves the target removed.
 //!
 //! `open_write` with `WriteMode::Truncate { permissions }` truncates an
@@ -83,7 +82,7 @@
 //!   matches the class (`NotFound`, `PermissionDenied`, `ConnectionAborted`
 //!   for a lost connection, `Other` otherwise).
 //!
-//! # Public API (Wave 2)
+//! # Public API
 //!
 //! ```text
 //! pub struct SftpFs { /* private: endpoint, Sftp, RemoteChild, extensions */ }
@@ -152,7 +151,7 @@ const WRITE_BEHIND: usize = 2 * 1024 * 1024;
 const SYMLINK_CONCURRENCY: usize = 64;
 
 /// The stderr line ssh prints when a configured `RemoteCommand` conflicts
-/// with the sftp subsystem (spike experiment 2B).
+/// with the sftp subsystem.
 const REMOTE_COMMAND_CONFLICT: &str = "Cannot execute command-line and remote command.";
 
 /// Stderr lines quoted in a `SftpServerMissing` detail.
@@ -323,7 +322,7 @@ impl SftpFs {
             });
         }
         // Plain SSH_FXP_RENAME refuses an existing target: remove it first
-        // (not atomic, plan 7.5 S14).
+        // (not atomic).
         fs.remove_file(to)
             .await
             .map_err(|error| self.fail(&error, to, "rename"))?;

@@ -11,7 +11,7 @@
 //! raw data so that highlighting and Markdown rendering run in the UI layer
 //! (through the functions below), not in the effect executor.
 //!
-//! # Contract (plan 8.4)
+//! # Contract
 //!
 //! - `load` stats the file (following symlinks). Names ending in `.png`,
 //!   `.jpg`, `.jpeg`, `.gif`, `.webp` (case-insensitive) are images: larger
@@ -32,7 +32,7 @@
 //!   `ThreadProtocol` inside `spawn_blocking` and sends the result as
 //!   `BgEvent::ImageResized`.
 //!
-//! # Public API (Wave 3)
+//! # Public API
 //!
 //! ```text
 //! pub async fn load(fs: &dyn Fs, path: &Path, picker: &Picker) -> Result<PreviewData, Error>;
@@ -143,7 +143,7 @@ impl fmt::Debug for ImageResized {
 }
 
 /// The terminal's background brightness, detected once at startup by
-/// `term` and used to pick the syntax highlighting theme (plan 8.4).
+/// `term` and used to pick the syntax highlighting theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Background {
     /// Dark background; also the fallback when detection fails.

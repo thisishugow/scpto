@@ -69,7 +69,7 @@
 //!   `Overwrite`, under the given job id. Selected directories and paths the
 //!   comparison does not know produce no pair.
 //!
-//! # Public API (Wave 3)
+//! # Public API
 //!
 //! ```text
 //! pub async fn compare(

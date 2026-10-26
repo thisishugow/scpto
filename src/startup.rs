@@ -1,5 +1,5 @@
 //! Process startup: parses the command line and dispatches to the requested
-//! mode. Owned by the integration owner (not a frozen contract).
+//! mode.
 //!
 //! # Launching the TUI
 //!

@@ -26,7 +26,7 @@
 //! - `check_dropped_paths`: every path must be absolute and exist
 //!   (`tokio::fs::symlink_metadata`); answered with `DroppedPathsChecked`.
 //!
-//! # Public API (Wave 3, ui/effects/external)
+//! # Public API
 //!
 //! ```text
 //! pub async fn shell(ctx: Ctx, location: Location) -> Option<Foreground>;

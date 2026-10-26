@@ -14,7 +14,7 @@
 //!
 //! - The positional argument is always remote: `host` alone (no colon)
 //!   means the host's start directory. It conflicts with `--right`.
-//! - `<ep>` follows scp rules (plan 7.6): `host:path` and `host:` are
+//! - `<ep>` follows scp rules: `host:path` and `host:` are
 //!   remote; a value without `:`, or with a `/` before the first `:` (as in
 //!   `./a:b`), is a local path; `[v6addr]:path` is remote with the brackets
 //!   removed from the host. An empty host (`:path`) or an empty value is a

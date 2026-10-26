@@ -87,7 +87,7 @@ pub struct Location {
 }
 
 /// Non-regular, non-directory, non-symlink file types. They are listed but
-/// never transferred (plan 7.5 S15).
+/// never transferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SpecialKind {
     /// Named pipe.
@@ -178,7 +178,7 @@ pub struct Capabilities {
     /// `rename` atomically replaces an existing target
     /// (`posix-rename@openssh.com` on SFTP; always true locally). When false,
     /// `rename` onto an existing target deletes the target first and is not
-    /// atomic (plan 7.5 S14).
+    /// atomic.
     pub posix_rename: bool,
     /// `copy_within` is available (`copy-data` extension on SFTP).
     pub copy_within: bool,

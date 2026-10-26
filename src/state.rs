@@ -5,14 +5,14 @@
 //! - `state.json`: [`PersistedState`], the last directory and the last
 //!   pane sort per endpoint, and the bookmarks.
 //! - `partials.json`: [`Partials`], the source size and mtime recorded for
-//!   each `.scpto-part` file (plan 7.5 S12).
+//!   each `.scpto-part` file.
 //!
 //! Both files are JSON written by `serde_json`. A write goes to a temp file
 //! in the same directory (created with mode 0700 when missing) and is
 //! renamed over the target, so readers never see a half-written file.
 //! Concurrent scpto instances are not coordinated: the last writer wins.
 //! A missing file loads as the empty value. `state.json` never stops
-//! startup (plan 2.6): an unparsable file is renamed to `state.json.bak`
+//! startup: an unparsable file is renamed to `state.json.bak`
 //! (replacing an older backup) and loads as the empty state with the
 //! warning `Error::StateCorrupt`, so the user's bookmarks can still be
 //! recovered by hand; an unreadable file loads as the empty state with
@@ -127,7 +127,7 @@ pub struct PersistedState {
     pub sorts: Vec<EndpointSort>,
 }
 
-/// What a pane sorts by (plan 8.9). Directories always come first,
+/// What a pane sorts by. Directories always come first,
 /// whatever the key and order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -16,7 +16,7 @@
 //!   `transfer::tar::upload` / `transfer::tar::download` with the same
 //!   arguments.
 //!
-//! # Public API (Wave 3, ui/effects/transfer)
+//! # Public API
 //!
 //! ```text
 //! pub fn start_engine(

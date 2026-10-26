@@ -1,7 +1,7 @@
 //! Dialogs in the app: the modal stack (confirmations, text fields such as
 //! rename, mkdir, and chmod, delete and trash-failed prompts, and the
 //! prompts other features open), focus and hotkeys, the popup menus (sort
-//! menu and context menu, plan 8.9), the picker lists (the bookmark list
+//! menu and context menu), the picker lists (the bookmark list
 //! and the host picker's mechanics), and the file operations those dialogs
 //! start.
 //!
@@ -106,7 +106,7 @@
 //!   Picking a `PickerKind::Hosts` row closes the picker and puts
 //!   [`Answer::Picked`] into [`DialogState::answer`].
 //!
-//! # Public API (Wave 3, ui/app/dialog)
+//! # Public API
 //!
 //! ```text
 //! impl App {

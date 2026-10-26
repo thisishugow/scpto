@@ -27,7 +27,7 @@ pub enum JobKind {
     /// Copy sources to the destination.
     Copy,
     /// Move sources: a rename within one endpoint, otherwise copy and then
-    /// delete each source after its item succeeds (plan 7.5).
+    /// delete each source after its item succeeds.
     Move,
 }
 
@@ -40,10 +40,9 @@ pub enum TransferMode {
     PerFile,
     /// One tar stream for the whole job (local ↔ non-sudo remote, file count
     /// at least `tar-threshold`). No `.scpto-part` protection and no resume.
-    /// There is no separate confirmation before a tar job starts: the
-    /// "dialog says so" of plan 7.5 S8 is the dialog shown for
-    /// [`TransferEvent::TarConflictRaised`], which states that existing files
-    /// are overwritten without resume protection.
+    /// There is no separate confirmation before a tar job starts. The
+    /// conflict dialog for [`TransferEvent::TarConflictRaised`] states that
+    /// existing files are overwritten without resume protection.
     Tar,
 }
 
@@ -97,7 +96,7 @@ pub enum ItemKind {
     },
     /// A FIFO, socket, or device found while expanding a directory. Such
     /// items are created already `Skipped { reason: SpecialFile }` and are
-    /// never transferred (plan 7.5 S15).
+    /// never transferred.
     Special(SpecialKind),
 }
 
@@ -134,7 +133,7 @@ pub enum SkipReason {
     /// "Overwrite if newer" found the destination as new or newer.
     NotNewer,
     /// The source is a FIFO, socket, or device; the item's kind is
-    /// [`ItemKind::Special`] (plan 7.5 S15).
+    /// [`ItemKind::Special`].
     SpecialFile,
     /// The user canceled the item or its job. Any `.scpto-part` is kept and
     /// the item can be retried or its partial discarded.
@@ -182,7 +181,7 @@ impl ItemState {
     }
 }
 
-/// Answer options of the per-item conflict prompt (plan 2.3).
+/// Answer options of the per-item conflict prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictChoice {
     /// Replace the destination.
@@ -224,8 +223,8 @@ pub struct PartialInfo {
     pub size: u64,
 }
 
-/// Source attributes recorded for a `.scpto-part` in `partials.json`
-/// (plan 7.5 S12). Resume is allowed only when both still match the source.
+/// Source attributes recorded for a `.scpto-part` in `partials.json`.
+/// Resume is allowed only when both still match the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialRecord {
     /// Source size when the partial was started.
@@ -243,7 +242,7 @@ pub struct Conflict {
     pub job: JobId,
     /// Source attributes.
     pub source: Entry,
-    /// Attributes of the existing destination (actual stat, plan 7.5).
+    /// Attributes of the existing destination (actual stat).
     pub destination: Entry,
     /// A matching resumable partial, when one exists.
     pub partial: Option<PartialInfo>,

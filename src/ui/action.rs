@@ -75,7 +75,7 @@ impl fmt::Debug for Secret {
 /// How the app wants keys interpreted; reported to `ui/input.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// Pane browsing: the full key table of plan 2.4.
+    /// Pane browsing: the key table documented in `ui::input`.
     Browse,
     /// Typing a pane filter: characters edit the filter, arrows move the
     /// cursor, Enter keeps the filter, Esc clears it.
@@ -187,7 +187,7 @@ pub enum DialogButton {
     Retry,
 }
 
-/// Where a context menu opens (plan 8.9: Option/Alt+click on a pane row).
+/// Where a context menu opens (Option/Alt+click on a pane row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuAnchor {
     /// The pane clicked in.
@@ -304,7 +304,7 @@ pub enum QueueControl {
 /// `Instant` of the input event so the state machine stays testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    // Navigation (plan 2.4, 8.9: letter keys only, no function keys).
+    // Navigation (letter keys only, no function keys).
     /// Tab: switch the focused pane (and the queue panel when visible).
     SwitchFocus,
     /// Move the cursor or scroll a viewer.

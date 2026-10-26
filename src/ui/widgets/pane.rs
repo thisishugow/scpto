@@ -4,7 +4,7 @@
 //!
 //! Layout inside `area`: a bordered block; the top border carries the
 //! endpoint as a clickable button `[ <endpoint> ▾ ]` (`Endpoint` display,
-//! so sudo shows `[sudo]`; plan 8.9) followed by `status`; the first inner
+//! so sudo shows `[sudo]`) followed by `status`; the first inner
 //! row is the current path (left-truncated with an ellipsis); the second is
 //! the column header row (`Name`, `Size`, `Modified`, each drawn only with
 //! its column; the sort column is marked `▲` ascending or `▼` descending,
@@ -23,7 +23,7 @@
 //! for other symlinks, `|` for FIFOs, `=` for sockets. Sizes are shown for
 //! regular files only.
 //!
-//! # Public API (Wave 2, widgets; header and title button per plan 8.9)
+//! # Public API
 //!
 //! ```text
 //! /// Rows of `area` that are not list rows: top border, path line, header

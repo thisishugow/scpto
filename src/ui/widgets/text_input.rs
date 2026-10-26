@@ -11,7 +11,7 @@
 //! They measure by grapheme with ratatui's own `CellWidth`, so measured
 //! widths always agree with what `Buffer::set_stringn` draws.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct TextInputView<'a> {

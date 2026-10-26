@@ -5,7 +5,7 @@
 //! the label over the pointer cell, it goes one row up instead (one row down
 //! on the top row), so the pointer's own cell stays visible.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct DragLabelView {

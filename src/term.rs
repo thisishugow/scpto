@@ -12,7 +12,7 @@
 //! from the panic hook (which then calls the previous hook). sshto's
 //! `O_NONBLOCK` stdin hack and raw `?1000h ?1006h` sequences are not ported.
 //!
-//! Suspend/resume (plan 7.2), all inside [`TerminalGuard::run_foreground`]:
+//! Suspend/resume, all inside [`TerminalGuard::run_foreground`]:
 //! 1. drop the caller's `EventStream` and wait until its reader thread has
 //!    released crossterm's input reader, so no key typed for the child is
 //!    stolen; the replacement stream is built at that moment and stays
@@ -40,7 +40,7 @@
 //! whose reader thread would otherwise outlive its timeout and swallow the
 //! first keystrokes.
 //!
-//! # Public API (Wave 2)
+//! # Public API
 //!
 //! ```text
 //! pub struct TerminalGuard { /* private: the ratatui terminal */ }
@@ -148,7 +148,7 @@ impl TerminalGuard {
     }
 
     /// Suspends the TUI, runs `command` in the foreground with inherited
-    /// stdio, and resumes (plan 7.2; steps 1-4 in the module doc).
+    /// stdio, and resumes (steps 1-4 in the module doc).
     ///
     /// `events` is dropped before the terminal is handed over and a fresh
     /// stream is always returned, also on error. The result is the child's

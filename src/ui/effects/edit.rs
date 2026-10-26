@@ -22,7 +22,7 @@
 //!   `EditOutcome::UploadFailed` with the temp file's path, as for any other
 //!   upload failure.
 //!
-//! # Public API (Wave 3, ui/effects/edit)
+//! # Public API
 //!
 //! ```text
 //! pub async fn prepare(ctx: Ctx, location: Location) -> Option<Foreground>;

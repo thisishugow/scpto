@@ -22,7 +22,7 @@
 //! follows symlinks, like `chmod`. `trash` on a missing path is
 //! `FsError::NotFound`, never `TrashFailed`.
 //!
-//! # Public API (Wave 2)
+//! # Public API
 //!
 //! ```text
 //! pub struct LocalFs { /* private: endpoint == Endpoint::Local */ }

@@ -60,7 +60,7 @@
 //! status is reported by the runtime as `Error::CommandFailed`; it does not
 //! call [`finish`], so nothing is uploaded.
 //!
-//! # Public API (Wave 3)
+//! # Public API
 //!
 //! ```text
 //! /// A file being edited.

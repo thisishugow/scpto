@@ -15,7 +15,7 @@
 //! The viewer region in the `HitMap` is recorded by render from the same
 //! `area`.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct PreviewView<'a> {

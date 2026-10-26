@@ -7,7 +7,7 @@
 //! aborts a pending timer of the same id): it sleeps for `after`, then sends
 //! `TimerFired { id, at: Instant::now() }`.
 //!
-//! # Public API (Wave 3, ui/effects/timer)
+//! # Public API
 //!
 //! ```text
 //! pub fn schedule(ctx: &Ctx, id: TimerId, after: Duration);

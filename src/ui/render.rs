@@ -29,7 +29,7 @@
 //!
 //! The status bar shows the status message, the focused pane's selection
 //! (`N selected, <size of the selected files>`), and the transfer summary.
-//! The button bar (plan 8.9) shows the buttons of the current mode, each
+//! The button bar shows the buttons of the current mode, each
 //! recorded in `HitMap::bar` with the action its key has in that mode:
 //!
 //! - browse and filter: `c` Copy, `m` Move, `n` Mkdir, `d` Delete, `r`
@@ -44,7 +44,7 @@
 //! - comparison view: Space Select, `>` Copy right, `<` Copy left, `?`
 //!   Help, Esc Close.
 //!
-//! # Public API (Wave 3, integration owner)
+//! # Public API
 //!
 //! ```text
 //! /// Draws one frame. `&mut` because image previews render statefully.

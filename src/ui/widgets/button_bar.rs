@@ -1,4 +1,4 @@
-//! Button bar widget (plan 8.9): one row of clickable buttons with their
+//! Button bar widget: one row of clickable buttons with their
 //! keys, such as `[c Copy] [m Move] [? Help]`, for the current mode.
 //!
 //! Each button stands for the action its key produces, so a click is the
@@ -10,7 +10,7 @@
 //! the rest fit. Buttons keep their given order. An `active` button (a
 //! toggle that is on, such as quick view) is highlighted.
 //!
-//! # Public API (plan 8.9)
+//! # Public API
 //!
 //! ```text
 //! pub struct BarButton<'a> {

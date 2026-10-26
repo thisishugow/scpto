@@ -31,7 +31,7 @@
 //! session, which passes it to `sudo::start` and drops (zeroizes) it. This
 //! module never formats, copies, or reports it.
 //!
-//! # Public API (Wave 3, ui/effects/session)
+//! # Public API
 //!
 //! ```text
 //! pub fn connect(ctx: &Ctx, endpoint: Endpoint);

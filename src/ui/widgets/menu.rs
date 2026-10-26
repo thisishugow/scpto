@@ -1,4 +1,4 @@
-//! Popup menu widget (plan 8.9): the sort menu and the context menu of a
+//! Popup menu widget: the sort menu and the context menu of a
 //! pane row.
 //!
 //! A bordered box with the title in the top border and one row per item:
@@ -8,7 +8,7 @@
 //! too short for every item, the rows scroll so the cursor item stays
 //! visible. The cursor item is highlighted.
 //!
-//! # Public API (plan 8.9)
+//! # Public API
 //!
 //! ```text
 //! pub struct MenuItemView<'a> {

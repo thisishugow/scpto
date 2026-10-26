@@ -16,7 +16,7 @@
 //! instead of using a semaphore, so paused and conflicting items never hold
 //! a slot.
 //!
-//! # Behavior (plan 2.3, 7.5)
+//! # Behavior
 //!
 //! - Every queue change is reported as `TransferEvent`s per
 //!   `transfer::model`; the app never sees engine internals.
@@ -105,8 +105,8 @@
 //!     pub fn from_settings(settings: &Settings) -> EngineConfig;
 //! }
 //!
-//! /// The tar streams, implemented in Wave 3 by delegating to
-//! /// `transfer::tar::{upload, download}` (same arguments).
+//! /// Tar streams; `ui::effects::transfer::TarStreams` delegates to
+//! /// `transfer::tar::{upload, download}` with the same arguments.
 //! pub trait TarTransfer: Send + Sync { fn upload(..); fn download(..); }
 //!
 //! pub async fn run(
@@ -119,9 +119,8 @@
 //! );
 //! ```
 //!
-//! `tar` is the one addition to the signature frozen for Wave 2:
-//! `transfer::tar` is a Wave 3 module, so the engine takes it injected like
-//! `Connections` and `PartialStore`.
+//! The engine receives `TarTransfer`, `Connections`, and `PartialStore`
+//! as injected dependencies, so tests can substitute their implementations.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};

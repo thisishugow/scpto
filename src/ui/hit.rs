@@ -6,7 +6,7 @@
 //! queue button, [`ScrollRegion`], or [`DropTarget`]. Neither side computes
 //! layout on its own, so a click always resolves against what is on screen.
 //!
-//! The button bar (plan 8.9, the last row) is checked before every layer:
+//! The button bar (the last row) is checked before every layer:
 //! [`HitMap::bar_button`] gives the `Action` of the button under the
 //! pointer, the same one its key produces in the current mode, so input
 //! emits it directly. Then layers are resolved top-down: dialog, popup
@@ -20,7 +20,7 @@
 //! and a list row to `ClickTarget::PaneRow` (the `..` row is row 0 like any
 //! other; it is never a folder drop target).
 //!
-//! In single-pane mode (plan 8.8) each pane has a tab in the tab row: a
+//! In single-pane mode each pane has a tab in the tab row: a
 //! click on a tab is `ClickTarget::PaneArea` of its pane (which focuses and
 //! so shows it), and a drag released on a tab drops into that pane's
 //! directory (`DropTarget::Pane`).

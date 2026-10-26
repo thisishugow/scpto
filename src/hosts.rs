@@ -5,7 +5,7 @@
 //! a `Host` line (keyword matched case-insensitively and separated from its
 //! arguments by whitespace or `=`, as OpenSSH allows; words split on
 //! whitespace, up to a word starting with `#`) that contains none of `*`,
-//! `?`, `!`. `Include` is followed per plan 7.6: each argument is
+//! `?`, `!`. `Include` is followed recursively: each argument is
 //! `~`-expanded (`~` and `~/...` only; a `~user` argument is reported as a
 //! warning), relative paths are taken against `~/.ssh/` (also with
 //! `SshClient::config_file`, as OpenSSH does), a glob in the last component
@@ -25,7 +25,7 @@
 //! task, and each answer arrives as `BgEvent::HostResolved`, so the host
 //! picker opens immediately.
 //!
-//! # Public API (Wave 2)
+//! # Public API
 //!
 //! ```text
 //! /// Reads the configuration and every included file (blocking file I/O;

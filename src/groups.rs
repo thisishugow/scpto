@@ -25,7 +25,7 @@
 //! (lazily, `BgEvent::HostResolved`); until then only alias rules apply, so a
 //! host may move to another group when its hostname arrives.
 //!
-//! # Public API (Wave 2, with `pattern`)
+//! # Public API
 //!
 //! ```text
 //! /// Parses group settings text.

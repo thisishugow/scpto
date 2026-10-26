@@ -18,7 +18,7 @@
 //! from the end (the last kept line ends in `...`) so the field, the
 //! checkbox, and the buttons stay visible.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct DialogView<'a> {

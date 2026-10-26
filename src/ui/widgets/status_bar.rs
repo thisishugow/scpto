@@ -7,7 +7,7 @@
 //! separated by a dimmed bar, and each is cut with an ellipsis when it does
 //! not fit, so the message always wins the space.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct StatusBarView<'a> {

@@ -1,6 +1,6 @@
-//! sudo mode: starting a root sftp-server over the master connection
-//! (plan 8.5, verified by the Wave 1 sudo spike on OpenSSH 7.9 and current
-//! OpenSSH with sudo 1.8 and 1.9).
+//! sudo mode: starting a root sftp-server over the master connection.
+//! Behavior verified against OpenSSH 7.9 and current OpenSSH with sudo
+//! 1.8 and 1.9.
 //!
 //! # Flow
 //!
@@ -30,7 +30,7 @@
 //! `process_group(0)`, `kill_on_drop(true)`) from the argv of
 //! `Connections::ssh_command(endpoint, false)` plus `--`, the host alias, and
 //! the remote command. Every word of the remote command is single-quoted by
-//! `connections::join_command`, the crate's one plan 7.3 quoting helper; its
+//! `connections::join_command`, the crate's remote shell quoting helper; its
 //! newline rejection (`Error::NewlineInPath`) becomes `SudoError::Other`.
 //! The wrapper is a fixed string without single quotes; `$0` is the quoted
 //! sftp-server path.
@@ -128,7 +128,7 @@
 //! # Tests
 //!
 //! Unit tests run sudo's side as a local `sh` script through a test
-//! `Connections`. The Docker integration cases (plan 6) run only with
+//! `Connections`. The Docker integration cases run only with
 //! `SCPTO_IT=1` against the fixtures of `tests/it/fixtures/` (started with
 //! `tests/it/fixtures/up.sh`); `SCPTO_IT_DIR` overrides the directory of the
 //! generated `ssh_config` (default `target/it` in the crate root).
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_commands_match_plan_8_5() {
+    fn stage_commands_quote_wrapper_and_set_password_options() {
         let path = "/usr/lib/ssh/sftp-server";
         assert_eq!(
             stage_command(SudoStage::NoPassword, path).unwrap(),
@@ -1575,8 +1575,8 @@ mod tests {
         ));
     }
 
-    /// Docker integration cases (plan 6), run only with `SCPTO_IT=1`: the 13
-    /// cases of the Wave 1 sudo spike on both fixture images.
+    /// Docker integration cases for sudo authentication, policy failures,
+    /// and SFTP startup on both fixture images; run only with `SCPTO_IT=1`.
     mod it {
         use super::*;
 
@@ -1973,9 +1973,9 @@ mod tests {
             assert_eq!(u32::from_be_bytes([body[1], body[2], body[3], body[4]]), 3);
         }
 
-        async fn pw_plan_command(h: &Harness) {
-            // The original plan 7.4 command prints the marker before the
-            // sudo that runs sftp-server fails: a false positive.
+        async fn pw_marker_before_start_reports_false_success(h: &Harness) {
+            // Printing the marker after credential validation but before
+            // starting sftp-server falsely signals success when startup fails.
             let path = located(h).await;
             let cmd = format!(
                 "sudo -S -p '' -v && printf 'SCPTO-SUDO-OK\\n' >&2 && exec sudo -n {}",
@@ -2039,7 +2039,7 @@ mod tests {
             modern_pw_session_cache_hazard: "modern", "sudopw", pw_session_cache_hazard;
             modern_pw_session_cache_k: "modern", "sudopw", pw_session_cache_k;
             modern_pw_overread: "modern", "sudopw", pw_overread;
-            modern_pw_plan_command: "modern", "sudopw", pw_plan_command;
+            modern_pw_marker_before_start_reports_false_success: "modern", "sudopw", pw_marker_before_start_reports_false_success;
             modern_tty_requiretty: "modern", "sudotty", tty_requiretty;
             modern_limited_not_allowed: "modern", "limited", limited_not_allowed;
             modern_plain_not_in_sudoers: "modern", "plain", plain_not_in_sudoers;
@@ -2052,7 +2052,7 @@ mod tests {
             legacy_pw_session_cache_hazard: "legacy", "sudopw", pw_session_cache_hazard;
             legacy_pw_session_cache_k: "legacy", "sudopw", pw_session_cache_k;
             legacy_pw_overread: "legacy", "sudopw", pw_overread;
-            legacy_pw_plan_command: "legacy", "sudopw", pw_plan_command;
+            legacy_pw_marker_before_start_reports_false_success: "legacy", "sudopw", pw_marker_before_start_reports_false_success;
             legacy_tty_requiretty: "legacy", "sudotty", tty_requiretty;
             legacy_limited_not_allowed: "legacy", "limited", limited_not_allowed;
             legacy_plain_not_in_sudoers: "legacy", "plain", plain_not_in_sudoers;

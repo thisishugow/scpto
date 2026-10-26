@@ -40,7 +40,7 @@
 //! pub fn load(location: &ConfigPath) -> Result<Settings, ConfigError>;
 //!
 //! impl Settings {
-//!     /// Wave 3 (vpn): the first rule whose glob (`pattern`, matched against
+//!     /// The first VPN rule whose glob (`pattern`, matched against
 //!     /// the lowercased value like sshto) matches the alias or, when known,
 //!     /// the resolved hostname.
 //!     pub fn vpn_rule(&self, alias: &str, hostname: Option<&str>) -> Option<&VpnRule>;
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_plan() {
+    fn defaults_set_transfer_display_and_connection_options() {
         let settings = Settings::default();
         assert_eq!(settings.concurrency, 3);
         assert_eq!(settings.tar_threshold, 200);

@@ -25,7 +25,7 @@
 //!   directory to empty), the event receiver and this runtime's engine
 //!   sender are dropped, and `Sessions::shutdown` closes the masters.
 //!
-//! # Public API (Wave 3, integration owner)
+//! # Public API
 //!
 //! ```text
 //! /// Runs the TUI until quit; always shuts down the executors.

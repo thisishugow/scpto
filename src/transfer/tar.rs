@@ -3,7 +3,7 @@
 //! in `spawn_blocking` (symlinks not followed; absolute and `..` entries
 //! rejected), streaming through remote `tar -C <dir> -mxf -` / `-cf -`.
 //!
-//! # Contract (plan 7.5 S8)
+//! # Contract
 //!
 //! - The remote side is `Connections::spawn_remote(remote, ["tar", "-C",
 //!   dir, "-mxf", "-"])` for uploads and `["tar", "-C", dir, "-cf", "-",
@@ -15,7 +15,7 @@
 //! - Packing: `Builder::follow_symlinks(false)`, entries named relative to
 //!   the local source's parent, so each source lands under its own name.
 //!   Regular files, directories, and symlinks (as links) are archived; FIFOs,
-//!   sockets, and devices are skipped, as in per-file transfers (S15).
+//!   sockets, and devices are skipped, as in per-file transfers.
 //!   Upload extraction skips timestamps with `-m`; after the stream succeeds,
 //!   `Fs::set_times` restores regular files, then directories deepest first.
 //!   Symlinks are excluded because SFTP SETSTAT follows their targets.
@@ -39,7 +39,7 @@
 //! - `progress` is called with the tar stream bytes moved so far.
 //! - Cancel is by dropping the future (the remote child is killed on drop).
 //!
-//! # Public API (Wave 3)
+//! # Public API
 //!
 //! ```text
 //! /// Packs `sources` (absolute local paths) into remote `remote_dir`.

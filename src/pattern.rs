@@ -7,7 +7,7 @@
 //! `[[:alpha:]]`. Matching is case-sensitive; callers that want sshto's
 //! case-insensitive rules lowercase the subject before matching.
 //!
-//! # Public API (Wave 2)
+//! # Public API
 //!
 //! ```text
 //! /// A compiled glob.

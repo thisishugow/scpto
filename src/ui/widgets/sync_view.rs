@@ -9,7 +9,7 @@
 //! [`MIN_PATH_WIDTH`] cells. The cursor row is highlighted; the bottom
 //! border shows the selected and shown counts.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct SyncListView<'a> {

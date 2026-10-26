@@ -14,7 +14,7 @@
 //!   `show_hidden` (a leading `.` hides) and the fuzzy `filter`, sorted by
 //!   `sort`. Directories and symlinks to directories come first, in both
 //!   orders. Ties break by name compared case-insensitively, then bytewise.
-//! - Rows (plan 8.9): a listed pane whose `cwd` is not `/` shows a `..` row
+//! - Rows: a listed pane whose `cwd` is not `/` shows a `..` row
 //!   first, then one row per `visible` entry. Every index called a row
 //!   (cursor, scroll, `row_entry`, clicks, drags) counts the `..` row. It
 //!   has no entry: it is never selected, marked, transferred, or counted
@@ -49,7 +49,7 @@
 //! first, then NFC-insensitively, so a name typed by the user (NFC) finds
 //! the entry a macOS volume lists in decomposed form.
 //!
-//! # Public API (Wave 2, ui/pane)
+//! # Public API
 //!
 //! ```text
 //! impl Pane {
@@ -92,7 +92,7 @@
 //!     /// else the cursor entry; absolute paths. Empty when nothing applies.
 //!     pub fn targets(&self) -> Vec<PathBuf>;
 //!     /// Drag sources for a press on visible row `index`: every target when
-//!     /// that row is selected, else that row alone (plan 2.4).
+//!     /// that row is selected, else that row alone.
 //!     pub fn drag_sources(&self, index: usize) -> Vec<PathBuf>;
 //!
 //!     // Cursor and scrolling. `page` is the number of list rows on screen.
@@ -386,7 +386,7 @@ impl Pane {
     }
 
     /// Drag sources for a press on row `index`: every target when that row
-    /// is selected, else that row alone (plan 2.4); nothing for the `..`
+    /// is selected, else that row alone; nothing for the `..`
     /// row.
     pub fn drag_sources(&self, index: usize) -> Vec<PathBuf> {
         match self.row_entry(index) {
@@ -1288,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_sources_follow_plan_2_4() {
+    fn drag_sources_use_selection_or_pressed_row() {
         let mut pane = listed(sample());
         pane.toggle(3);
         pane.toggle(4);

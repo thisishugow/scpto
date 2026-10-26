@@ -9,8 +9,8 @@
 //! into `Effect::ListDir` and `Effect::RememberDirectory`. Core does not
 //! implement features: transfers, dialogs, connections, sync, edit, and
 //! preview handle their own actions and events in their modules, and core
-//! routes to them by input mode and event kind as specified in "Wave 3
-//! routing" below.
+//! routes to them by input mode and event kind as described in "Routing"
+//! below.
 //!
 //! # Behavior
 //!
@@ -36,8 +36,8 @@
 //!   row. Double click opens. The wheel scrolls the pane under the pointer.
 //!   A click on a pane's endpoint button (`ClickTarget::PaneTitle`) focuses
 //!   it and opens the host picker for it (`connection_open_picker`), like
-//!   `o`. Right clicks never reach the app (plan 8.9).
-//! - Sorting (plan 8.9): `SortBy(key)` sorts the focused pane by `key` in
+//!   `o`. Right clicks never reach the app.
+//! - Sorting: `SortBy(key)` sorts the focused pane by `key` in
 //!   its natural order (`state::Sort::by`) unless it already sorts by it;
 //!   `ReverseSort` flips the order; a click on a column header
 //!   (`ClickTarget::ColumnHeader`, also a double click, so quick clicks
@@ -53,11 +53,11 @@
 //!   is already bookmarked; `R` reveals the cursor entry; `t` opens a shell
 //!   in the focused pane's directory; `q` quits.
 //! - Status messages stay until replaced.
-//! - Layout (plan 8.8, `CoreState::layout`): below 60 columns one pane is
+//! - Layout (`CoreState::layout`): below 60 columns one pane is
 //!   drawn at a time (the focused one) under a tab row; Tab or a click on
 //!   the other tab (`ClickTarget::PaneArea`) switches it. The queue panel
 //!   takes at most a third of the rows and is one summary row below 24
-//!   rows. The last row is the button bar (plan 8.9) and the row above it
+//!   rows. The last row is the button bar and the row above it
 //!   the status bar. Below 40x10 every action except `Quit` and `Resize` is ignored
 //!   and the state is kept for when the terminal grows. A resize that hides
 //!   the source pane of a drag ends the drag.
@@ -76,7 +76,7 @@
 //! can be closed also depends on the transfer queue, so `Effect::Disconnect`
 //! is the connection feature's decision.
 //!
-//! # Public API (Wave 2, ui/app/core)
+//! # Public API
 //!
 //! ```text
 //! impl App {
@@ -120,7 +120,7 @@
 //!     /// Screen areas for the current size and panel visibility; render
 //!     /// draws into exactly these so key paging and the screen agree.
 //!     pub fn layout(&self) -> AppLayout;
-//!     /// Plan 8.8: too small to draw anything but a message.
+//!     /// Whether the terminal is too small to draw anything but a message.
 //!     pub fn too_small(&self) -> bool;
 //!     /// Whether a pane's file list is on screen.
 //!     pub fn pane_drawn(&self, side: PaneSide) -> bool;
@@ -151,7 +151,7 @@
 //!     pub queue_collapsed: bool,
 //!     /// The row above the button bar.
 //!     pub status_bar: Rect,
-//!     /// The last row (plan 8.9).
+//!     /// The last row.
 //!     pub button_bar: Rect,
 //! }
 //!
@@ -170,8 +170,9 @@
 //! Until the first `Action::Resize` the size is 0x0, so every page height is
 //! 0 (which panes treat as 1); the runtime sends the initial size first.
 //!
-//! # Wave 3 routing (integration owner; the feature methods are specified
-//! in each feature module's "Public API")
+//! # Routing
+//!
+//! Each feature module documents its handlers in its "Public API" section.
 //!
 //! Feature action handlers share one shape: `fn <feature>_action(&mut self,
 //! action: Action) -> Result<Vec<Effect>, Action>`; `Ok` claims the action,
@@ -305,7 +306,7 @@ use crate::ui::pane::Pane;
 use crate::ui::widgets::pane::CHROME_ROWS;
 use crate::vfs::{Endpoint, Entry, Location};
 
-/// Terminals narrower than this show one pane at a time (plan 8.8).
+/// Terminals narrower than this show one pane at a time.
 pub const SINGLE_PANE_BELOW_WIDTH: u16 = 60;
 /// The smallest terminal scpto draws its interface in; below it only a
 /// "Terminal too small" message is drawn.
@@ -449,7 +450,7 @@ impl CoreState {
     }
 
     /// Screen areas for the current size and panel visibility; render draws
-    /// into exactly these so key paging and the screen agree (plan 8.8). The
+    /// into exactly these so key paging and the screen agree. The
     /// button bar is the last row and the status bar the row above it; the
     /// queue panel, when visible, takes the
     /// bottom third of the rest, or one summary row on terminals shorter
@@ -721,7 +722,7 @@ impl App {
             }
             return Vec::new();
         }
-        // Plan 8.8: a too-small terminal draws only a message, so nothing
+        // A too-small terminal draws only a message, so nothing
         // but quitting may act on the hidden state.
         if self.core.too_small && !matches!(action, Action::Quit) {
             return Vec::new();

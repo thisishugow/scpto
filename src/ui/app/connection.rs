@@ -66,7 +66,7 @@
 //! - Session events for an endpoint that is neither in the map nor used
 //!   are stale (it was released while they were in flight) and ignored.
 //!
-//! # Public API (Wave 3, ui/app/connection)
+//! # Public API
 //!
 //! ```text
 //! impl App {

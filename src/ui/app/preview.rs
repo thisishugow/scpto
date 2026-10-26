@@ -47,7 +47,7 @@
 //! - The runtime takes [`PreviewState::resize_requests`] once at startup and
 //!   hands it to `ui::effects::preview::spawn_resize_worker`.
 //!
-//! # Public API (Wave 3, ui/app/preview)
+//! # Public API
 //!
 //! ```text
 //! impl App {

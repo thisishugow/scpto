@@ -56,7 +56,7 @@
 //! - The queue job of a sync is a `JobKind::Copy` labeled
 //!   `sync N entries -> <destination>`.
 //!
-//! # Public API (Wave 3, ui/app/sync)
+//! # Public API
 //!
 //! ```text
 //! impl App {

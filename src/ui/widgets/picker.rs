@@ -14,7 +14,7 @@
 //! hint while empty. The cursor row is highlighted; an empty list shows
 //! `No matches`. The bottom border shows the row count.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct PickerView<'a> {

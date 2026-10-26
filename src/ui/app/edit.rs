@@ -34,7 +34,7 @@
 //!   another `EditFinished`, which removes it. `EditUploadFailed` Cancel
 //!   removes it at once and repeats the temp path in an info status.
 //!
-//! # Public API (Wave 3, ui/app/edit)
+//! # Public API
 //!
 //! ```text
 //! impl App {

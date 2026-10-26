@@ -22,7 +22,7 @@
 //!   Err(Error::Canceled) }`; otherwise the job is an engine job and gets
 //!   `TransferCommand::Cancel(QueueTarget::Job(job))`.
 //!
-//! # Public API (Wave 3, ui/effects/sync)
+//! # Public API
 //!
 //! ```text
 //! pub fn compare(ctx: &Ctx, request: RequestId, left: Location, right: Location);

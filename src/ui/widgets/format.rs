@@ -1,7 +1,7 @@
 //! Formatting helpers shared by the widgets that show file attributes
 //! (the pane list, the comparison view, the preview's binary summary).
 //!
-//! # Public API (Wave 3 seam pass)
+//! # Public API
 //!
 //! ```text
 //! /// Most cells `format_size` ever takes.

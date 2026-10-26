@@ -33,7 +33,7 @@
 //!   pushes a [`DialogPurpose::FinderDrop`] dialog ("Upload N items to
 //!   `<dir>`", buttons Upload / Cancel) whose destination is the focused
 //!   pane's directory when it is remote, else the other pane's when that one
-//!   is remote, else the focused pane's (plan 2.4). `all_exist: false` only
+//!   is remote, else the focused pane's. `all_exist: false` only
 //!   shows a status message.
 //! - Queue mirror: `TransferEvent`s update [`TransferState::jobs`] in place.
 //!   `JobCreated` for an id already in the list (a submitted job, or a sync
@@ -83,7 +83,7 @@
 //! pause/resume (per-file) and cancel while unfinished, and retry plus
 //! discard (per-file files) once failed or canceled.
 //!
-//! # Public API (Wave 3, ui/app/transfer)
+//! # Public API
 //!
 //! ```text
 //! impl App {
@@ -256,8 +256,7 @@ pub struct Drag {
     pub hover: Option<(PaneSide, TimerId)>,
 }
 
-/// How long a drag rests on the hidden pane's tab before that pane is shown
-/// (plan 8.8).
+/// How long a drag rests on the hidden pane's tab before that pane is shown.
 pub const TAB_HOVER: Duration = Duration::from_millis(400);
 
 impl QueueJob {
@@ -1031,7 +1030,7 @@ impl App {
         }
     }
 
-    /// Plan 2.4: the focused pane's directory when it is remote, else the
+    /// The focused pane's directory when it is remote, else the
     /// other pane's when that one is remote, else the focused pane's.
     fn finder_drop_destination(&self) -> Option<Location> {
         let focused = self.core.focused();

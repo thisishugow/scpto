@@ -11,7 +11,7 @@
 //! `StateWriteFailed`. Without a state directory nothing is saved (startup
 //! already said so in the status bar).
 //!
-//! # Public API (Wave 3, ui/effects/state)
+//! # Public API
 //!
 //! ```text
 //! pub fn remember_directory(ctx: &Ctx, location: Location);

@@ -5,9 +5,9 @@
 //!
 //! # Contract
 //!
-//! - Keys follow plan 2.4 as amended by plan 8.9 (letter keys only: no
-//!   function key is mapped in any mode) in `InputMode::Browse` and the
-//!   per-mode rules in `ui::action::InputMode`. Only key press and repeat
+//! - Keys follow the key table below and the per-mode rules in
+//!   `ui::action::InputMode`. Commands use letter keys rather than function
+//!   keys; no function key is mapped in any mode. Only key press and repeat
 //!   events are mapped; releases and unmapped keys produce no action.
 //! - Mouse, resolved only through `ui::hit::HitMap` of the last frame:
 //!   - left press: a button-bar button (`HitMap::bar_button`) first becomes
@@ -22,8 +22,8 @@
 //!     `Action::Click` with modifiers (Ctrl or Super → toggle, Shift →
 //!     range). Bar buttons and context menus never start a double click or
 //!     a drag.
-//!   - right and middle buttons: ignored entirely (plan 8.9: herdr and the
-//!     terminal own the right button).
+//!   - right and middle buttons: ignored entirely, leaving them to the
+//!     terminal or its host application.
 //!   - drag with the button held: once the pointer is at least one cell
 //!     away from a press on a `ClickTarget::PaneRow`, emit `DragStart`
 //!     once, then `DragMove` (with `HitMap::drop_target`) whenever the cell
@@ -52,7 +52,7 @@
 //!
 //! # Key table
 //!
-//! `Browse` (plan 2.4): Tab `SwitchFocus`; Up/`k`, Down/`j`, PgUp, PgDn,
+//! `Browse`: Tab `SwitchFocus`; Up/`k`, Down/`j`, PgUp, PgDn,
 //! Home/`g`, End/`G` `MoveCursor`; Enter/Right/`l` `Open`; Backspace/Left/`h`
 //! `Parent`; Space/Insert `ToggleSelect`; Ctrl+A `SelectAll`; `*`
 //! `InvertSelection`; `c` `Copy`; `m` `Move`; `n` `MakeDir`; Delete/`d`
@@ -93,7 +93,7 @@
 //! `ToggleSelect`; `>` `StartSync(LeftToRight)`; `<` `StartSync(RightToLeft)`;
 //! `?` `Help`; Esc/`q`/Ctrl+C `Cancel`.
 //!
-//! # Public API (Wave 2)
+//! # Public API
 //!
 //! ```text
 //! /// Maximum interval between two presses of a double click.
@@ -735,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_follows_the_plan_key_table() {
+    fn browse_maps_documented_keys_to_actions() {
         use Action::*;
         let table: Vec<(Event, Action)> = vec![
             (key(KeyCode::Tab), SwitchFocus),

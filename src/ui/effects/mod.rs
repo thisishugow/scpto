@@ -21,7 +21,9 @@
 //!   (listings, file operations, previews, edits, comparisons) or
 //!   `FsChannel::Transfer` (the engine and engine-path sync deletions).
 //!
-//! # Dispatch (integration owner wires `ui/runtime.rs` from this table)
+//! # Dispatch
+//!
+//! `ui/runtime.rs` dispatches effects to the entry points below.
 //!
 //! | Effect | Entry point |
 //! |---|---|
@@ -77,7 +79,7 @@
 //! terminating signal) stop reading input, drop the engine command sender,
 //! `Sessions::shutdown().await`, and remove [`Ctx::edit_temp`].
 //!
-//! # Public API (Wave 3 seam pass)
+//! # Public API
 //!
 //! ```text
 //! #[derive(Clone)]

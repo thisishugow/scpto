@@ -16,7 +16,7 @@
 //!   can offer a permanent delete), with `DeleteMethod::Permanent` →
 //!   `vfs::remove_tree` per path; `Chmod` → `Fs::chmod` per path.
 //!
-//! # Public API (Wave 3, ui/effects/fs)
+//! # Public API
 //!
 //! ```text
 //! pub fn list_dir(ctx: &Ctx, request: RequestId, location: Location);

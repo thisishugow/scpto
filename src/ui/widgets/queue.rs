@@ -18,7 +18,7 @@
 //! The cursor row is highlighted only while the
 //! panel is focused, and a focused panel has a bold border.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct QueueView<'a> {

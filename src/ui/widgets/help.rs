@@ -1,12 +1,11 @@
 //! Help screen listing key and mouse bindings.
 //!
-//! The content is static (the plan 2.4 key table as amended by plan 8.9:
-//! letter keys only, no function keys; mouse gestures; and the
-//! Terminal.app / iTerm2 modifier notes) and scrolls by line. Every content
-//! line is one screen row (nothing wraps), so [`line_count`] is exactly the
-//! number of rows the content takes.
+//! The content is static: key bindings (letter keys, no function keys),
+//! mouse gestures, and Terminal.app / iTerm2 modifier notes. It scrolls by
+//! line. Every content line is one screen row (nothing wraps), so
+//! [`line_count`] is exactly the number of rows the content takes.
 //!
-//! # Public API (Wave 2, widgets)
+//! # Public API
 //!
 //! ```text
 //! pub struct HelpView {
@@ -209,8 +208,8 @@ mod tests {
         lines(&buf)
     }
 
-    /// Every key of the plan 2.4 table as amended by plan 8.9, as listed.
-    const PLAN_KEYS: &[&str] = &[
+    /// Every documented browse-mode key binding, as displayed.
+    const BROWSE_KEYS: &[&str] = &[
         "Tab",
         "Up Down / j k",
         "PgUp PgDn",
@@ -245,8 +244,8 @@ mod tests {
     ];
 
     #[test]
-    fn content_covers_the_plan_key_table() {
-        for keys in PLAN_KEYS {
+    fn content_covers_browse_key_bindings() {
+        for keys in BROWSE_KEYS {
             assert!(
                 CONTENT
                     .iter()

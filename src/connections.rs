@@ -34,7 +34,7 @@
 //! start: when a second sudo channel needs a password, the session asks
 //! again through `BgEvent::SudoPasswordRequired`.
 //!
-//! # Quoting (plan 7.3)
+//! # Quoting
 //!
 //! [`quote`] and [`join_command`] are the crate's only POSIX shell quoting
 //! helper, used for every remote command string: the session's
@@ -55,7 +55,7 @@ use crate::vfs::{Endpoint, Fs};
 
 /// Quotes one word for a remote POSIX shell: wrapped in single quotes, with
 /// every `'` written as `'\''`. A word containing a newline is rejected with
-/// [`Error::NewlineInPath`] (plan 7.3).
+/// [`Error::NewlineInPath`].
 pub fn quote(word: &str) -> Result<String, Error> {
     if word.contains('\n') {
         return Err(Error::NewlineInPath {
@@ -74,7 +74,7 @@ pub fn join_command(words: &[impl AsRef<str>]) -> Result<String, Error> {
     Ok(quoted.join(" "))
 }
 
-/// Which of a remote endpoint's two SFTP channels to use (plan 7.3 S17).
+/// Which of a remote endpoint's two SFTP channels to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FsChannel {
     /// Directory listings, file operations, previews, and edits.
@@ -84,7 +84,7 @@ pub enum FsChannel {
 }
 
 /// The most recent stderr lines of a background child, filled by the
-/// session's drain task and kept bounded by it (plan 7.3 S10). Lines are
+/// session's drain task and kept bounded by it. Lines are
 /// stored without their `\r\n` / `\n` terminator, oldest first. Read it to
 /// classify or report a failure after the child ended.
 pub type StderrTail = Arc<Mutex<VecDeque<String>>>;
@@ -110,10 +110,10 @@ pub struct RemoteChild {
 /// Remote tools found by probing a remote endpoint once per connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteTools {
-    /// `tar` is available (tar acceleration, plan 7.5 S8).
+    /// `tar` is available (tar acceleration).
     pub tar: bool,
     /// `rsync --version` reports a real rsync 3.1 or newer (not openrsync),
-    /// so it may serve as an rsync sync peer (plan 7.5 S14). Decided by
+    /// so it may serve as an rsync sync peer. Decided by
     /// [`rsync_version_ok`].
     pub rsync_ok: bool,
 }
@@ -183,7 +183,7 @@ pub trait Connections: Send + Sync {
     ) -> BoxFuture<'a, Result<Arc<dyn Fs>, Error>>;
 
     /// Starts `argv` on a remote endpoint as a multiplexed, non-interactive
-    /// child (plan 7.2, 7.3, 8.5): the common non-interactive options plus
+    /// child: the common non-interactive options plus
     /// `BatchMode=yes` and `ControlMaster=no`, after `ssh -O check`, spawned
     /// with `process_group(0)`, piped stdin and stdout, `kill_on_drop`, and
     /// stderr drained into [`RemoteChild::stderr`]. Callers pass raw words;
@@ -204,7 +204,7 @@ pub trait Connections: Send + Sync {
     /// [`SshClient::config_file`] is set; `-o ControlPath=<path>`,
     /// `-o ControlMaster=no`; then
     ///
-    /// - `interactive == false` (rsync `-e`): the plan 7.3 common options
+    /// - `interactive == false` (rsync `-e`): the common non-interactive options
     ///   `-o RemoteCommand=none -o RequestTTY=no -o ClearAllForwardings=yes
     ///   -o PermitLocalCommand=no -o ForwardX11=no -o ForwardAgent=no`, then
     ///   `-o BatchMode=yes`. The sync runner encodes the argv for rsync's

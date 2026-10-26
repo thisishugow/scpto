@@ -73,7 +73,7 @@ pub enum Error {
         message: String,
     },
     /// `state.json` could not be parsed. It was moved to `backup` and scpto
-    /// continues with an empty state (plan 2.6); the next save writes a
+    /// continues with an empty state; the next save writes a
     /// fresh file.
     #[error(
         "{} is damaged ({message}); it was kept as {} and scpto starts without bookmarks or remembered directories",
@@ -166,7 +166,7 @@ impl fmt::Display for UnreachableReason {
     }
 }
 
-/// Classified SSH connection failure (plan 2.5 and 7.3 S1, S10).
+/// Classified SSH connection failure.
 ///
 /// `detail` fields carry the relevant stderr excerpt from `ssh`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -265,7 +265,7 @@ impl ConnectError {
     }
 }
 
-/// Classified failure of the sudo sftp-server start (plan 8.5, `sudo.rs`).
+/// Classified failure of the sudo sftp-server start (`sudo.rs`).
 ///
 /// Each class corresponds to one rule of the stderr classification. sudo's
 /// own text is never shown verbatim: its "not allowed to execute" line
@@ -378,7 +378,7 @@ pub enum FsError {
         reason: String,
     },
     /// Moving the path to the system trash failed; a permanent delete may be
-    /// offered instead (plan 7.6 S9).
+    /// offered instead.
     #[error("Cannot move {} to the trash: {message}", path.display())]
     TrashFailed {
         /// The path concerned.
@@ -387,7 +387,7 @@ pub enum FsError {
         message: String,
     },
     /// The connection to the endpoint was lost during the operation. Items
-    /// failing with this error wait for reconnect instead of failing (7.3 S10).
+    /// failing with this error wait for reconnect instead of failing.
     #[error("The connection was lost")]
     Disconnected,
     /// Any other I/O failure.
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_error_policies_follow_the_plan() {
+    fn connect_errors_select_reconnect_auth_and_vpn_policies() {
         let unreachable = ConnectError::Unreachable {
             reason: UnreachableReason::Timeout,
             detail: String::new(),

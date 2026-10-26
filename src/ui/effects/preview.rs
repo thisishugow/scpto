@@ -5,14 +5,14 @@
 //!
 //! - `load` runs under `ctx.requests` (a superseded load is aborted by
 //!   `CancelRequest`): `Connections::fs(endpoint, Browse)` (never the
-//!   transfer channel, plan 8.4), then `preview::load(&*fs, &path,
+//!   transfer channel), then `preview::load(&*fs, &path,
 //!   &ctx.image_picker)`, answered with `PreviewLoaded`.
 //! - `spawn_resize_worker` starts one `std::thread` that receives
 //!   `ResizeRequest`s from the app's image protocols, runs `preview::resize`
 //!   on each, and sends `ImageResized`; it ends when every sender is gone
 //!   (the app was dropped) or the event channel is closed.
 //!
-//! # Public API (Wave 3, ui/effects/preview)
+//! # Public API
 //!
 //! ```text
 //! pub fn load(ctx: &Ctx, request: RequestId, location: Location);
