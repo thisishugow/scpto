@@ -407,7 +407,6 @@ fn interrupted_modern() {
 }
 
 #[test]
-#[ignore = "bug: killing the legacy master mid-upload can resume a corrupt partial and report success"]
 fn interrupted_legacy() {
     isolated("transfers::interrupted_legacy", || interrupted("legacy"));
 }
@@ -462,6 +461,12 @@ async fn interrupted(image: &str) {
     let fs = f.fs(&ep).await;
     let part_size = fs.stat(&part_path(&dst)).await.unwrap().size.unwrap();
     assert!(part_size > 0 && part_size < content.len() as u64);
+    let partial = read(fs.as_ref(), &part_path(&dst)).await;
+    let mismatch = partial.iter().zip(&content).position(|(a, b)| a != b);
+    assert!(
+        partial == content[..part_size as usize],
+        "interrupted upload left a corrupt prefix: first mismatch {mismatch:?}, partial size {part_size}"
+    );
     assert_eq!(
         engine
             .partials

@@ -47,9 +47,16 @@
 //!
 //! Reads and writes are pipelined: a reader keeps up to 2 MiB of 64 KiB
 //! read requests in flight and a writer up to 2 MiB of write requests, so
-//! throughput does not collapse to one request per round trip. A writer's
-//! `shutdown()` waits for every write acknowledgement and then closes the
-//! remote handle, reporting a failed close; only then is the data committed.
+//! throughput does not collapse to one request per round trip. Pipelined write
+//! chunks never exceed the negotiated write limit, so each chunk is one
+//! request sent in offset order. Interrupted uploads therefore leave a
+//! contiguous prefix that can be resumed from the part file's size.
+//! The first accepted chunk runs alone to learn a safe request size from
+//! the client's actual write count; its remaining bytes finish before the
+//! pipeline starts. This also works when the first caller buffer is short.
+//! A writer's `shutdown()` waits for every write acknowledgement and then
+//! closes the remote handle, reporting a failed close; only then is the
+//! data committed.
 //!
 //! # Error mapping
 //!
@@ -130,9 +137,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// stderr tail.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 
-/// Bytes requested per pipelined read and written per pipelined write. Below
-/// every server's limit (OpenSSH without `limits` accepts 20480-byte reads;
-/// the client splits larger requests itself).
+/// Read chunk size and upper bound of a write chunk. The client splits reads
+/// as needed; writes discover a single-request limit before pipelining.
 const CHUNK: usize = 64 * 1024;
 
 /// Bytes a reader keeps requested ahead of the caller.
@@ -936,9 +942,13 @@ impl AsyncRead for SftpReader {
 /// One pipelined write; yields the number of bytes it carried.
 type WriteChunk = BoxFuture<'static, (usize, FsResult<()>)>;
 
-/// Streaming writer with write-behind: each `poll_write` sends one request
-/// and returns at once while up to `WRITE_BEHIND` bytes await
-/// acknowledgement. `shutdown` waits for all of them and closes the handle.
+/// The initial chunk, which discovers a safe request size and finishes alone.
+type WriteProbe = BoxFuture<'static, FsResult<usize>>;
+
+/// Streaming writer with write-behind. The first accepted chunk learns a
+/// safe request size before later writes are pipelined, one request each,
+/// with at most `WRITE_BEHIND` bytes awaiting acknowledgement. `shutdown`
+/// waits for all writes and closes the handle.
 struct SftpWriter {
     /// The remote handle; `None` once closing started.
     file: Option<File>,
@@ -946,6 +956,9 @@ struct SftpWriter {
     lost: LostSignal,
     /// Offset of the next write.
     offset: u64,
+    /// A payload size already acknowledged as one request.
+    chunk_size: usize,
+    probe: Option<WriteProbe>,
     pending: FuturesUnordered<WriteChunk>,
     /// Bytes sent and not yet acknowledged.
     in_flight: usize,
@@ -959,6 +972,8 @@ impl SftpWriter {
             path: path.to_path_buf(),
             lost,
             offset,
+            chunk_size: 0,
+            probe: None,
             pending: FuturesUnordered::new(),
             in_flight: 0,
             closing: None,
@@ -988,6 +1003,16 @@ impl SftpWriter {
             format!("{} was already closed for writing", self.path.display()),
         )
     }
+
+    /// Finishes the first accepted chunk before any later offsets are sent.
+    fn poll_probe(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(probe) = &mut self.probe {
+            let result = ready!(probe.poll_unpin(cx));
+            self.probe = None;
+            self.chunk_size = result.map_err(|error| self.lost.io_error(error))?;
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl AsyncWrite for SftpWriter {
@@ -1000,6 +1025,36 @@ impl AsyncWrite for SftpWriter {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        ready!(this.poll_probe(cx))?;
+        if this.chunk_size == 0 {
+            let Some(file) = &this.file else {
+                return Poll::Ready(Err(this.shut_down_error()));
+            };
+            let mut file = file_at(file, this.offset, &this.path)
+                .map_err(|error| this.lost.io_error(error))?;
+            let len = buf.len().min(CHUNK);
+            let data = buf[..len].to_vec();
+            let path = this.path.clone();
+            let lost = this.lost.clone();
+            // Accept the owned chunk now so cancelling a pending caller
+            // never consumes unreported bytes. Only this initial chunk may
+            // span multiple requests, and it finishes before later chunks.
+            this.probe = Some(
+                async move {
+                    let written = file
+                        .write(&data)
+                        .await
+                        .map_err(|error| lost.classify(&error, &path, "write"))?;
+                    file.write_all(&data[written..])
+                        .await
+                        .map_err(|error| lost.classify(&error, &path, "write"))?;
+                    Ok(written)
+                }
+                .boxed(),
+            );
+            this.offset += len as u64;
+            return Poll::Ready(Ok(len));
+        }
         // Wait for room before sending, so at most WRITE_BEHIND is unacked.
         ready!(this.poll_acknowledged(cx, WRITE_BEHIND - CHUNK))?;
         let Some(file) = &this.file else {
@@ -1009,7 +1064,9 @@ impl AsyncWrite for SftpWriter {
             Ok(file) => file,
             Err(error) => return Poll::Ready(Err(this.lost.io_error(error))),
         };
-        let len = buf.len().min(CHUNK);
+        // Each future must send one request, so later offsets cannot reach
+        // the server before an earlier chunk's remaining split requests.
+        let len = buf.len().min(this.chunk_size);
         let data = buf[..len].to_vec();
         let path = this.path.clone();
         let lost = this.lost.clone();
@@ -1034,12 +1091,15 @@ impl AsyncWrite for SftpWriter {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_acknowledged(cx, 0)
+        let this = self.get_mut();
+        ready!(this.poll_probe(cx))?;
+        this.poll_acknowledged(cx, 0)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        ready!(this.poll_acknowledged(cx, 0))?;
+        let mut this = self;
+        ready!(this.as_mut().poll_flush(cx))?;
+        let this = this.get_mut();
         if this.closing.is_none() {
             let Some(file) = this.file.take() else {
                 return Poll::Ready(Ok(()));
@@ -1452,6 +1512,28 @@ mod tests {
         )
         .await;
         assert_eq!(std::fs::read(&path).expect("local read"), b"short");
+    }
+
+    #[tokio::test]
+    async fn initial_chunk_survives_cancelled_next_write_and_flushes_before_larger_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("short-first.bin");
+        let fs = local_fs().await;
+        let data = pattern(3 * CHUNK + 7);
+        let mut writer = fs
+            .open_write(&path, WriteMode::Truncate { permissions: 0o600 })
+            .await
+            .expect("open_write");
+        writer.write_all(&data[..4093]).await.expect("short write");
+        // This runtime has not driven the client's response task since the
+        // initial chunk was accepted. Cancel the next write while it waits
+        // for that chunk; none of this second buffer may reach the file.
+        assert!(writer.write_all(b"cancelled").now_or_never().is_none());
+        writer.flush().await.expect("flush initial chunk");
+        assert_eq!(std::fs::read(&path).expect("flushed prefix"), data[..4093]);
+        writer.write_all(&data[4093..]).await.expect("larger write");
+        writer.shutdown().await.expect("shutdown commits");
+        assert_eq!(std::fs::read(&path).expect("complete file"), data);
     }
 
     #[tokio::test]

@@ -233,8 +233,7 @@ class Driver:
         for name in ("multi-a.txt", "multi-b.txt"):
             wait_for(lambda name=name: (self.right / name).exists(), "selected copy " + name)
             assert (self.right / name).read_bytes() == (self.left / name).read_bytes()
-        self.mouse(*self.row("multi-a.txt"), button=16)
-        self.mouse(*self.row("multi-b.txt"), button=16)
+        # Accepted transfers clear the source selection without another click.
         self.wait("selected", present=False)
         x, y = self.row("drag.txt")
         self.mouse(x, y, release=False)
