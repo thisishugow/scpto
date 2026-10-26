@@ -47,8 +47,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> HitMap {
     let layout = app.core.layout();
     let mut hits = HitMap::default();
 
-    // Panes, or the quick view in the non-focused pane.
-    let quick_side = app.preview.quick_view.then(|| app.core.focused().other());
+    // The quick view in the non-focused pane, while it has an entry to
+    // show; otherwise both panes are file lists.
+    let mut title = String::new();
+    let quick_side = match app.quick_preview_view(&mut title) {
+        Some((side, view)) => {
+            let area = pane_area(&layout, side);
+            preview::render(view, area, frame.buffer_mut());
+            hits.viewer = Some(ViewerHit {
+                area,
+                kind: ViewerKind::Preview,
+            });
+            Some(side)
+        }
+        None => None,
+    };
     for side in [PaneSide::Left, PaneSide::Right] {
         if Some(side) == quick_side {
             continue;
@@ -65,15 +78,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> HitMap {
         };
         hits.panes
             .push(pane::render(&view, area, frame.buffer_mut()));
-    }
-    let mut title = String::new();
-    if let Some((side, view)) = app.quick_preview_view(&mut title) {
-        let area = pane_area(&layout, side);
-        preview::render(view, area, frame.buffer_mut());
-        hits.viewer = Some(ViewerHit {
-            area,
-            kind: ViewerKind::Preview,
-        });
     }
 
     // Queue panel.
@@ -296,6 +300,35 @@ mod tests {
             hits.resolve(picker.rows.x, picker.rows.y),
             Some(ClickTarget::PickerRow(0))
         );
+    }
+
+    #[test]
+    fn quick_view_replaces_the_other_pane_only_while_it_shows_an_entry() {
+        let (mut app, effects) = app(Some((Endpoint::Local, Some("/r".into()))));
+        deliver(&mut app, &effects[1], vec![file("beta.txt", 1)]);
+        app.handle_action(Action::Resize {
+            width: 100,
+            height: 30,
+        });
+        // The focused left pane is still empty: both panes stay lists.
+        app.handle_action(Action::ToggleQuickView);
+        let (hits, _) = render(&mut app, 100, 30);
+        assert_eq!(hits.panes.len(), 2);
+        assert_eq!(hits.viewer, None);
+
+        // With an entry under the cursor the right pane is the quick view.
+        deliver(&mut app, &effects[0], vec![file("alpha.txt", 1)]);
+        let (hits, text) = render(&mut app, 100, 30);
+        assert_eq!(hits.panes.len(), 1);
+        assert_eq!(hits.panes[0].side, PaneSide::Left);
+        assert_eq!(
+            hits.viewer,
+            Some(ViewerHit {
+                area: app.core.layout().right,
+                kind: ViewerKind::Preview
+            })
+        );
+        assert!(text.contains("alpha.txt"));
     }
 
     #[test]
