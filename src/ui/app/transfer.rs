@@ -14,7 +14,11 @@
 //!   pushed onto [`TransferState::jobs`] at once (mode `None`, no items) so
 //!   the queue shows it while the engine expands it.
 //! - Drag and drop: `DragStart` records [`Drag`] with
-//!   `Pane::drag_sources`; `DragMove` updates its target and pointer;
+//!   `Pane::drag_sources`; `DragMove` updates its target and pointer. In
+//!   single-pane mode a `DragMove` onto the hidden pane's tab
+//!   (`DropTarget::Pane` of a pane `CoreState::pane_drawn` says is not on
+//!   screen) schedules a [`TAB_HOVER`] timer; when it fires with the drag
+//!   still there, that pane is focused (and so drawn) and the drag goes on;
 //!   `Drop` on the other pane (`DropTarget::Pane` → its directory,
 //!   `DropTarget::Folder` → that folder) copies; on a folder row of the
 //!   source pane it moves (same endpoint); `DropTarget::Invalid`, the
@@ -110,6 +114,11 @@
 //!     /// Status bar summary, for example `2 running, 1 failed`; empty when
 //!     /// the queue is idle.
 //!     pub fn transfer_summary(&self) -> String;
+//!     /// The collapsed queue panel's row.
+//!     pub fn queue_summary(&self) -> String;
+//!     /// `BgEvent::TimerFired` of a drag's tab hover; `None` for other
+//!     /// timers.
+//!     pub fn transfer_timer(&mut self, id: TimerId) -> Option<Vec<Effect>>;
 //! }
 //! ```
 //!
@@ -124,6 +133,7 @@
 //! [`DialogPurpose::QuitWhileRunning`]: super::dialog::DialogPurpose::QuitWhileRunning
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::core::StatusMessage;
 use super::dialog::{Checkbox, Dialog, DialogAnswer, DialogFocus, DialogPurpose};
@@ -136,7 +146,7 @@ use crate::transfer::model::{
 };
 use crate::ui::action::{
     Action, ClickTarget, CursorMove, DialogButton, DropTarget, Effect, PaneSide, QueueControl,
-    ScrollRegion,
+    ScrollRegion, TimerId,
 };
 use crate::ui::input::split_dropped_paths;
 use crate::ui::widgets::drag_label::DragLabelView;
@@ -226,7 +236,14 @@ pub struct Drag {
     pub column: u16,
     /// Pointer row, for the floating label.
     pub row: u16,
+    /// The hidden pane whose tab the pointer rests on (single-pane mode),
+    /// with the timer that switches to it after [`TAB_HOVER`].
+    pub hover: Option<(PaneSide, TimerId)>,
 }
+
+/// How long a drag rests on the hidden pane's tab before that pane is shown
+/// (plan 8.8).
+pub const TAB_HOVER: Duration = Duration::from_millis(400);
 
 impl QueueJob {
     /// An rsync sync (or a sync whose engine job has not been created): no
@@ -375,6 +392,7 @@ impl App {
                     target: DropTarget::Invalid,
                     column: 0,
                     row: 0,
+                    hover: None,
                 });
                 Ok(Vec::new())
             }
@@ -382,14 +400,7 @@ impl App {
                 target,
                 column,
                 row,
-            } => {
-                if let Some(drag) = &mut self.transfer.drag {
-                    drag.target = target;
-                    drag.column = column;
-                    drag.row = row;
-                }
-                Ok(Vec::new())
-            }
+            } => Ok(self.drag_moved(target, column, row)),
             Action::Drop { target, .. } => Ok(self.drop_drag(target)),
             Action::DragCancel => {
                 self.transfer.drag = None;
@@ -703,6 +714,45 @@ impl App {
         (in_side && self.drop_destination(drag, drag.target).is_some()).then_some(drag.target)
     }
 
+    /// `BgEvent::TimerFired` of a drag's tab hover: shows the hovered pane
+    /// when the drag still rests on its tab. `None` for other timers.
+    pub fn transfer_timer(&mut self, id: TimerId) -> Option<Vec<Effect>> {
+        let drag = self.transfer.drag.as_mut()?;
+        let (side, timer) = drag.hover?;
+        if timer != id {
+            return None;
+        }
+        drag.hover = None;
+        if drag.target == DropTarget::Pane(side) {
+            self.core.focus(side);
+        }
+        Some(Vec::new())
+    }
+
+    /// The collapsed queue panel's row, for example
+    /// `Queue: 2 running, 45% of 1.2 GiB`.
+    pub fn queue_summary(&self) -> String {
+        let summary = self.transfer_summary();
+        if summary.is_empty() {
+            return "Queue: no transfers".to_owned();
+        }
+        let (done, total) = self
+            .transfer
+            .jobs
+            .iter()
+            .filter(|job| job.outcome.is_none())
+            .map(job_bytes)
+            .fold((0, 0), |(done, total), (d, t)| (done + d, total + t));
+        if total == 0 {
+            return format!("Queue: {summary}");
+        }
+        format!(
+            "Queue: {summary}, {}% of {}",
+            done.saturating_mul(100) / total,
+            format_size(total)
+        )
+    }
+
     /// Status bar summary, for example `2 running, 1 failed`; empty when the
     /// queue is idle.
     pub fn transfer_summary(&self) -> String {
@@ -724,6 +774,43 @@ impl App {
             .map(|(count, word)| format!("{count} {word}"))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    // Drag and drop.
+
+    /// `DragMove`: records the target and pointer; resting on the hidden
+    /// pane's tab (the only place a `DropTarget::Pane` of an undrawn pane
+    /// comes from) schedules the switch to it.
+    fn drag_moved(&mut self, target: DropTarget, column: u16, row: u16) -> Vec<Effect> {
+        let hidden_tab = match target {
+            DropTarget::Pane(side) if !self.core.pane_drawn(side) => Some(side),
+            _ => None,
+        };
+        let Some(drag) = &self.transfer.drag else {
+            return Vec::new();
+        };
+        let keep_hover = drag.hover.filter(|&(side, _)| Some(side) == hidden_tab);
+        let (hover, effects) = match (keep_hover, hidden_tab) {
+            (Some(hover), _) => (Some(hover), Vec::new()),
+            (None, Some(side)) => {
+                let id = self.core.next_timer();
+                (
+                    Some((side, id)),
+                    vec![Effect::ScheduleTimer {
+                        id,
+                        after: TAB_HOVER,
+                    }],
+                )
+            }
+            (None, None) => (None, Vec::new()),
+        };
+        if let Some(drag) = &mut self.transfer.drag {
+            drag.target = target;
+            drag.column = column;
+            drag.row = row;
+            drag.hover = hover;
+        }
+        effects
     }
 
     // Building jobs.
@@ -1705,6 +1792,106 @@ mod tests {
     fn drop_on(app: &mut App, target: DropTarget) -> Vec<Effect> {
         let at = Instant::now();
         act(app, Action::Drop { target, at })
+    }
+
+    fn hover_timer(effects: &[Effect]) -> TimerId {
+        match effects {
+            [Effect::ScheduleTimer { id, after }] if *after == TAB_HOVER => *id,
+            other => panic!("expected the tab hover timer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resting_on_the_hidden_tab_shows_that_pane_for_the_drop() {
+        let mut app = app();
+        app.handle_action(Action::Resize {
+            width: 50,
+            height: 20,
+        });
+        drag_start(&mut app, PaneSide::Left, 1);
+        let moved = |target| Action::DragMove {
+            target,
+            column: 30,
+            row: 0,
+        };
+        let id = hover_timer(&act(&mut app, moved(DropTarget::Pane(PaneSide::Right))));
+        // Moving within the same tab keeps the pending switch.
+        assert!(act(&mut app, moved(DropTarget::Pane(PaneSide::Right))).is_empty());
+        // The tab of a drop-able hidden pane is highlighted.
+        assert_eq!(
+            app.drop_target(PaneSide::Right),
+            Some(DropTarget::Pane(PaneSide::Right))
+        );
+        app.handle_event(BgEvent::TimerFired {
+            id,
+            at: Instant::now(),
+        });
+        assert_eq!(app.core.focused(), PaneSide::Right);
+        assert!(app.core.pane_drawn(PaneSide::Right));
+        // The drag goes on in the pane now shown: drop on its folder row.
+        assert!(act(
+            &mut app,
+            moved(DropTarget::Folder {
+                side: PaneSide::Right,
+                index: 0
+            })
+        )
+        .is_empty());
+        let effects = drop_on(
+            &mut app,
+            DropTarget::Folder {
+                side: PaneSide::Right,
+                index: 0,
+            },
+        );
+        let request = submitted(&effects);
+        assert_eq!(request.kind, JobKind::Copy);
+        assert_eq!(
+            request.targets,
+            JobTargets::IntoDirectory {
+                sources: vec![PathBuf::from("/l/a.txt")],
+                directory: "/srv/www".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn leaving_the_hidden_tab_cancels_the_switch() {
+        let mut app = app();
+        app.handle_action(Action::Resize {
+            width: 50,
+            height: 20,
+        });
+        drag_start(&mut app, PaneSide::Left, 1);
+        let at = |target| Action::DragMove {
+            target,
+            column: 30,
+            row: 0,
+        };
+        let id = hover_timer(&act(&mut app, at(DropTarget::Pane(PaneSide::Right))));
+        assert!(act(&mut app, at(DropTarget::Pane(PaneSide::Left))).is_empty());
+        app.handle_event(BgEvent::TimerFired {
+            id,
+            at: Instant::now(),
+        });
+        assert_eq!(app.core.focused(), PaneSide::Left);
+        // Releasing on the hidden tab drops into that pane's directory.
+        let effects = drop_on(&mut app, DropTarget::Pane(PaneSide::Right));
+        assert_eq!(
+            submitted(&effects).targets,
+            JobTargets::IntoDirectory {
+                sources: vec![PathBuf::from("/l/a.txt")],
+                directory: "/srv".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn two_panes_side_by_side_need_no_tab_hover() {
+        let mut app = app();
+        drag_start(&mut app, PaneSide::Left, 1);
+        drag_move(&mut app, DropTarget::Pane(PaneSide::Right));
+        assert_eq!(app.transfer.drag.as_ref().and_then(|d| d.hover), None);
     }
 
     #[test]

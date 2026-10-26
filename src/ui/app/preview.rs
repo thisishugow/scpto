@@ -694,14 +694,9 @@ impl App {
         usize::from(height.saturating_sub(BORDER_ROWS))
     }
 
-    /// Text rows of the quick view: the non-focused pane's height minus the
-    /// border.
+    /// Text rows of the quick view: its layout height minus the border.
     fn quick_page(&self) -> usize {
-        let layout = self.core.layout();
-        let area = match self.core.focused().other() {
-            PaneSide::Left => layout.left,
-            PaneSide::Right => layout.right,
-        };
+        let area = self.core.layout().quick_view;
         usize::from(area.height.saturating_sub(BORDER_ROWS))
     }
 }

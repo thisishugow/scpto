@@ -10,8 +10,13 @@
 //!
 //! Areas per layer, matching how each feature pages:
 //!
-//! - panes and the queue panel: their `AppLayout` rectangles; the pane that
-//!   shows the quick view is recorded as `HitMap::viewer` instead of a pane;
+//! - panes and the queue panel: their `AppLayout` rectangles. Only panes
+//!   `CoreState::pane_drawn` reports are drawn (in single-pane mode, the
+//!   focused one, under a tab row recorded as `HitMap::tabs`); a pane under
+//!   the quick view (`AppLayout::quick_view`, recorded as `HitMap::viewer`)
+//!   is not drawn or recorded. A collapsed queue panel is one summary row;
+//! - below the minimum size (`CoreState::too_small`): only a centered
+//!   "Terminal too small" message and an empty `HitMap`;
 //! - the comparison view: every row above the status bar;
 //! - the full-screen preview and the help screen: the whole screen;
 //! - the picker and the dialog: centered in the whole screen by their
@@ -28,45 +33,69 @@
 //! pub fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) -> HitMap;
 //! ```
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Clear, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 
-use crate::ui::action::{InputMode, PaneSide};
+use crate::ui::action::{DropTarget, InputMode, PaneSide};
+use crate::ui::app::core::{AppLayout, MIN_HEIGHT, MIN_WIDTH};
 use crate::ui::app::App;
-use crate::ui::hit::{HitMap, ViewerHit, ViewerKind};
+use crate::ui::hit::{HitMap, QueueHit, TabHit, ViewerHit, ViewerKind};
 use crate::ui::widgets::format::format_size;
 use crate::ui::widgets::status_bar::StatusBarView;
+use crate::ui::widgets::text_input::{fit_end, sanitize};
 use crate::ui::widgets::{
     dialog, drag_label, help, pane, picker, preview, queue, status_bar, sync_view,
 };
 use crate::vfs::EntryKind;
 
+const TAB_FOCUSED: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Cyan)
+    .add_modifier(Modifier::BOLD);
+const TAB_UNFOCUSED: Style = Style::new().fg(Color::DarkGray);
+const TAB_DROP: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Yellow)
+    .add_modifier(Modifier::BOLD);
+const QUEUE_SUMMARY: Style = Style::new().add_modifier(Modifier::REVERSED);
+
 /// Draws one frame. `&mut` because image previews render statefully.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> HitMap {
     let screen = frame.area();
+    if app.core.too_small() {
+        too_small(screen, frame.buffer_mut());
+        return HitMap::default();
+    }
     let layout = app.core.layout();
     let mut hits = HitMap::default();
 
-    // The quick view in the non-focused pane, while it has an entry to
-    // show; otherwise both panes are file lists.
+    // The quick view, while it has an entry to show; it covers the
+    // non-focused pane or, when the panes are narrow, every pane.
     let mut title = String::new();
-    let quick_side = match app.quick_preview_view(&mut title) {
-        Some((side, view)) => {
-            let area = pane_area(&layout, side);
+    let quick_area = match app.quick_preview_view(&mut title) {
+        Some((_, view)) => {
+            let area = layout.quick_view;
             preview::render(view, area, frame.buffer_mut());
             hits.viewer = Some(ViewerHit {
                 area,
                 kind: ViewerKind::Preview,
             });
-            Some(side)
+            Some(area)
         }
         None => None,
     };
+    if let Some(area) = layout.tabs {
+        hits.tabs = tabs(app, area, frame.buffer_mut());
+    }
     for side in [PaneSide::Left, PaneSide::Right] {
-        if Some(side) == quick_side {
+        let area = pane_area(&layout, side);
+        if !app.core.pane_drawn(side) || quick_area.is_some_and(|quick| quick.intersects(area)) {
             continue;
         }
-        let area = pane_area(&layout, side);
         let pane = app.core.pane(side);
         let status = app.connection_status_text(&pane.endpoint);
         let view = pane::PaneView {
@@ -80,12 +109,24 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> HitMap {
             .push(pane::render(&view, area, frame.buffer_mut()));
     }
 
-    // Queue panel.
+    // Queue panel, or its summary row on short terminals.
     if let Some(area) = layout.queue {
-        let mut texts = Vec::new();
-        let mut rows = Vec::new();
-        let view = app.queue_view(&mut texts, &mut rows);
-        hits.queue = Some(queue::render(&view, area, frame.buffer_mut()));
+        if layout.queue_collapsed {
+            let summary = app.queue_summary();
+            Clear.render(area, frame.buffer_mut());
+            Line::styled(fit_end(&summary, area.width).into_owned(), QUEUE_SUMMARY)
+                .render(area, frame.buffer_mut());
+            hits.queue = Some(QueueHit {
+                area,
+                rows: Vec::new(),
+                buttons: Vec::new(),
+            });
+        } else {
+            let mut texts = Vec::new();
+            let mut rows = Vec::new();
+            let view = app.queue_view(&mut texts, &mut rows);
+            hits.queue = Some(queue::render(&view, area, frame.buffer_mut()));
+        }
     }
 
     // Status bar (under every overlay that covers the whole screen).
@@ -149,11 +190,83 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> HitMap {
     hits
 }
 
-fn pane_area(layout: &crate::ui::app::core::AppLayout, side: PaneSide) -> Rect {
+fn pane_area(layout: &AppLayout, side: PaneSide) -> Rect {
     match side {
         PaneSide::Left => layout.left,
         PaneSide::Right => layout.right,
     }
+}
+
+/// The single-pane tab row: one tab per pane (`1 <endpoint>`, with its
+/// connection status), the focused one highlighted and a tab the drag would
+/// drop into marked.
+fn tabs(app: &App, area: Rect, buf: &mut Buffer) -> Vec<TabHit> {
+    Clear.render(area, buf);
+    let left_width = area.width / 2;
+    [
+        (
+            PaneSide::Left,
+            Rect {
+                width: left_width,
+                ..area
+            },
+        ),
+        (
+            PaneSide::Right,
+            Rect {
+                x: area.x + left_width,
+                width: area.width - left_width,
+                ..area
+            },
+        ),
+    ]
+    .into_iter()
+    .map(|(side, tab)| {
+        let pane = app.core.pane(side);
+        let number = match side {
+            PaneSide::Left => 1,
+            PaneSide::Right => 2,
+        };
+        let mut label = format!(" {number} {}", sanitize(&pane.endpoint.to_string()));
+        if let Some(status) = app.connection_status_text(&pane.endpoint) {
+            label.push_str(&format!(" ({})", sanitize(&status)));
+        }
+        label.push(' ');
+        let style = if app.drop_target(side) == Some(DropTarget::Pane(side)) {
+            TAB_DROP
+        } else if app.core.focused() == side {
+            TAB_FOCUSED
+        } else {
+            TAB_UNFOCUSED
+        };
+        buf.set_style(tab, style);
+        Line::styled(fit_end(&label, tab.width).into_owned(), style).render(tab, buf);
+        TabHit { side, area: tab }
+    })
+    .collect()
+}
+
+/// The whole screen when it is below the minimum size.
+fn too_small(screen: Rect, buf: &mut Buffer) {
+    Clear.render(screen, buf);
+    let text = format!(
+        "Terminal too small: need at least {MIN_WIDTH}x{MIN_HEIGHT} (now {}x{})",
+        screen.width, screen.height
+    );
+    // Start about half the wrapped height above the middle; word wrapping
+    // may need a row more, which flows downwards.
+    let width = usize::from(screen.width.max(1));
+    let lines = u16::try_from(text.len().div_ceil(width)).unwrap_or(u16::MAX);
+    let top = screen.height.saturating_sub(lines) / 2;
+    let area = Rect {
+        y: screen.y + top,
+        height: screen.height - top,
+        ..screen
+    };
+    Paragraph::new(text)
+        .centered()
+        .wrap(Wrap { trim: true })
+        .render(area, buf);
 }
 
 /// `N selected, <size>` for the focused pane; the size counts the selected
@@ -200,7 +313,7 @@ mod tests {
     use crate::preview::Background;
     use crate::settings::Settings;
     use crate::state::PersistedState;
-    use crate::ui::action::{Action, BgEvent, ClickTarget, Effect};
+    use crate::ui::action::{Action, BgEvent, ClickModifiers, ClickTarget, Effect};
     use crate::vfs::{Endpoint, Entry};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -347,6 +460,68 @@ mod tests {
                 kind: ViewerKind::Help
             })
         );
+    }
+
+    #[test]
+    fn narrow_screens_show_the_focused_pane_under_tabs() {
+        let (mut app, effects) = app(Some((Endpoint::Local, Some("/r".into()))));
+        deliver(&mut app, &effects[0], vec![file("alpha.txt", 1)]);
+        deliver(&mut app, &effects[1], vec![file("beta.txt", 1)]);
+        let (hits, text) = render(&mut app, 50, 20);
+        assert_eq!(hits.panes.len(), 1);
+        assert_eq!(hits.panes[0].side, PaneSide::Left);
+        assert_eq!(hits.panes[0].area, Rect::new(0, 1, 50, 18));
+        assert!(
+            text.contains("alpha.txt") && !text.contains("beta.txt"),
+            "{text}"
+        );
+        let first_row = text.lines().next().expect("tab row");
+        assert!(first_row.contains(" 1 Local") && first_row.contains(" 2 Local"));
+        // A click on the second tab shows the right pane.
+        let tab = hits.tabs[1];
+        assert_eq!(
+            hits.resolve(tab.area.x, tab.area.y),
+            Some(ClickTarget::PaneArea(PaneSide::Right))
+        );
+        app.handle_action(Action::Click {
+            target: ClickTarget::PaneArea(PaneSide::Right),
+            modifiers: ClickModifiers::default(),
+            at: std::time::Instant::now(),
+        });
+        let (hits, text) = render(&mut app, 50, 20);
+        assert_eq!(hits.panes.len(), 1);
+        assert_eq!(hits.panes[0].side, PaneSide::Right);
+        assert!(
+            text.contains("beta.txt") && !text.contains("alpha.txt"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn short_screens_collapse_the_queue_to_a_summary_row() {
+        let (mut app, _) = app(Some((Endpoint::Local, Some("/r".into()))));
+        app.handle_action(Action::ToggleQueue);
+        let (hits, text) = render(&mut app, 90, 20);
+        let queue = hits.queue.expect("queue drawn");
+        assert_eq!(queue.area, Rect::new(0, 18, 90, 1));
+        assert!(text.contains("Queue: no transfers"), "{text}");
+        // Tall enough: a panel of at most a third of the rows.
+        let (hits, _) = render(&mut app, 90, 30);
+        assert_eq!(hits.queue.expect("queue drawn").area.height, 9);
+    }
+
+    #[test]
+    fn too_small_screens_show_only_a_message() {
+        let (mut app, _) = app(Some((Endpoint::Local, Some("/r".into()))));
+        let (hits, text) = render(&mut app, 30, 8);
+        assert_eq!(hits, HitMap::default());
+        let joined: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            joined.contains("Terminal too small: need at least 40x10 (now 30x8)"),
+            "{text}"
+        );
+        let (hits, _) = render(&mut app, 40, 10);
+        assert_eq!(hits.panes.len(), 1);
     }
 
     #[test]

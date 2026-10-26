@@ -7,9 +7,14 @@
 //! layout on its own, so a click always resolves against what is on screen.
 //!
 //! Layers are resolved top-down: dialog, picker, viewer, comparison view,
-//! queue panel, panes. A layer claims every point inside its `area`. The
-//! dialog and the picker are modal: while one is recorded, points outside it
-//! hit nothing.
+//! queue panel, pane tabs, panes. A layer claims every point inside its
+//! `area`. The dialog and the picker are modal: while one is recorded,
+//! points outside it hit nothing.
+//!
+//! In single-pane mode (plan 8.8) each pane has a tab in the tab row: a
+//! click on a tab is `ClickTarget::PaneArea` of its pane (which focuses and
+//! so shows it), and a drag released on a tab drops into that pane's
+//! directory (`DropTarget::Pane`).
 
 use ratatui::layout::{Position, Rect};
 
@@ -60,6 +65,15 @@ pub struct QueueHit {
     pub buttons: Vec<(Rect, QueueTarget, QueueControl)>,
 }
 
+/// A pane's tab in the single-pane tab row, as drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabHit {
+    /// The pane the tab stands for.
+    pub side: PaneSide,
+    /// The tab's cells.
+    pub area: Rect,
+}
+
 /// The open dialog as drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogHit {
@@ -96,6 +110,8 @@ pub struct HitMap {
     pub panes: Vec<PaneHit>,
     /// The queue panel.
     pub queue: Option<QueueHit>,
+    /// The tabs of the single-pane tab row.
+    pub tabs: Vec<TabHit>,
     /// The directory comparison view.
     pub sync_view: Option<ListHit>,
     /// The topmost viewer (full-screen preview, help, or quick view).
@@ -113,6 +129,7 @@ enum Layer<'a> {
     Viewer(&'a ViewerHit),
     SyncView(&'a ListHit),
     Queue(&'a QueueHit),
+    Tab(&'a TabHit),
     Pane(&'a PaneHit),
 }
 
@@ -127,6 +144,7 @@ impl HitMap {
             Layer::Viewer(_) => None,
             Layer::SyncView(list) => list_index(list, point).map(ClickTarget::SyncRow),
             Layer::Queue(queue) => find(&queue.rows, point).map(ClickTarget::QueueRow),
+            Layer::Tab(tab) => Some(ClickTarget::PaneArea(tab.side)),
             Layer::Pane(pane) => Some(match pane_index(pane, point) {
                 Some(index) => ClickTarget::PaneRow {
                     side: pane.side,
@@ -154,7 +172,7 @@ impl HitMap {
     /// The area the mouse wheel scrolls at (`column`, `row`), if any.
     pub fn scroll_region(&self, column: u16, row: u16) -> Option<ScrollRegion> {
         Some(match self.layer_at(Position::new(column, row))? {
-            Layer::Dialog(_) => return None,
+            Layer::Dialog(_) | Layer::Tab(_) => return None,
             Layer::Picker(_) => ScrollRegion::Picker,
             Layer::Viewer(viewer) => match viewer.kind {
                 ViewerKind::Preview => ScrollRegion::Preview,
@@ -177,6 +195,7 @@ impl HitMap {
                 },
                 _ => DropTarget::Pane(pane.side),
             },
+            Some(Layer::Tab(tab)) => DropTarget::Pane(tab.side),
             _ => DropTarget::Invalid,
         }
     }
@@ -196,6 +215,9 @@ impl HitMap {
         }
         if let Some(queue) = self.queue.as_ref().filter(|q| q.area.contains(point)) {
             return Some(Layer::Queue(queue));
+        }
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.area.contains(point)) {
+            return Some(Layer::Tab(tab));
         }
         self.panes
             .iter()
@@ -285,6 +307,40 @@ mod tests {
         );
         assert_eq!(map.drop_target(5, 3), DropTarget::Pane(PaneSide::Left));
         assert_eq!(map.drop_target(50, 3), DropTarget::Invalid);
+    }
+
+    #[test]
+    fn tabs_focus_on_click_and_take_drops() {
+        let map = HitMap {
+            panes: vec![left_pane()],
+            tabs: vec![
+                TabHit {
+                    side: PaneSide::Left,
+                    area: Rect::new(0, 0, 20, 1),
+                },
+                TabHit {
+                    side: PaneSide::Right,
+                    area: Rect::new(20, 0, 20, 1),
+                },
+            ],
+            ..HitMap::default()
+        };
+        // The tab row sits over the pane's top row.
+        assert_eq!(
+            map.resolve(25, 0),
+            Some(ClickTarget::PaneArea(PaneSide::Right))
+        );
+        assert_eq!(map.drop_target(25, 0), DropTarget::Pane(PaneSide::Right));
+        assert_eq!(map.drop_target(5, 0), DropTarget::Pane(PaneSide::Left));
+        assert_eq!(map.scroll_region(25, 0), None);
+        // Below the tabs the pane resolves as usual.
+        assert_eq!(
+            map.drop_target(5, 2),
+            DropTarget::Folder {
+                side: PaneSide::Left,
+                index: 100
+            }
+        );
     }
 
     #[test]

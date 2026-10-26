@@ -73,7 +73,9 @@
 //!   `Text` edits [`PickerList::filter`] (a digit typed while the filter is
 //!   empty selects tab 1-9 instead when the list has tabs), `MoveCursor`,
 //!   `Scroll { region: ScrollRegion::Picker }`, `Click` / `DoubleClick` on
-//!   `ClickTarget::PickerRow`, Enter picks, Esc closes. The rows shown are
+//!   `ClickTarget::PickerRow`, Enter picks, Esc closes. A filter ranks the
+//!   rows (exact, prefix, substring, then subsequence matches) and the
+//!   cursor starts on the best one. The rows shown are
 //!   computed from `items`, `active_tab`, and `filter` whenever they are
 //!   needed, so the connection feature may change `items` while the host
 //!   picker is open (resolved hostnames) without telling this feature.
@@ -765,10 +767,35 @@ fn fold(text: &str) -> String {
     text.nfc().collect::<String>().to_lowercase()
 }
 
-/// Whether every character of `needle` occurs in `haystack` in order.
-fn is_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut rest = haystack.chars();
-    needle.chars().all(|wanted| rest.any(|c| c == wanted))
+/// How well a filter matches a row's text; lower is better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchTier {
+    /// The whole text.
+    Exact,
+    /// The start of the text.
+    Prefix,
+    /// A contiguous run inside the text.
+    Substring,
+    /// Every character, in order, with gaps.
+    Subsequence,
+}
+
+/// The tier at which `needle` matches `haystack`, if it matches at all
+/// (both already folded).
+fn match_tier(needle: &str, haystack: &str) -> Option<MatchTier> {
+    if haystack == needle {
+        Some(MatchTier::Exact)
+    } else if haystack.starts_with(needle) {
+        Some(MatchTier::Prefix)
+    } else if haystack.contains(needle) {
+        Some(MatchTier::Substring)
+    } else {
+        let mut rest = haystack.chars();
+        needle
+            .chars()
+            .all(|wanted| rest.any(|c| c == wanted))
+            .then_some(MatchTier::Subsequence)
+    }
 }
 
 /// `cursor` and `first_visible` kept inside a list of `len` rows shown
@@ -785,22 +812,39 @@ fn clamp_view(cursor: usize, first_visible: usize, len: usize, page: usize) -> (
 
 impl PickerList {
     /// Indices into `items` of the rows shown for the active tab and the
-    /// filter, in display order.
+    /// filter. Without a filter they keep the order of `items`; with one,
+    /// the best matches come first (exact, then prefix, then substring, then
+    /// subsequence; a label match before a detail match of the same tier),
+    /// and rows that match equally well keep the order of `items`. Row 0 is
+    /// therefore what Enter picks right after typing a full alias.
     fn shown(&self) -> Vec<usize> {
         let filter = fold(&self.filter);
-        self.items
+        let in_tab = |item: &PickerItem| {
+            self.tabs.is_empty() || self.active_tab == 0 || item.tab == self.active_tab
+        };
+        if filter.is_empty() {
+            return (0..self.items.len())
+                .filter(|&index| in_tab(&self.items[index]))
+                .collect();
+        }
+        let mut ranked: Vec<((MatchTier, bool), usize)> = self
+            .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| {
-                self.tabs.is_empty() || self.active_tab == 0 || item.tab == self.active_tab
+            .filter(|(_, item)| in_tab(item))
+            .filter_map(|(index, item)| {
+                let label = match_tier(&filter, &fold(&item.label)).map(|tier| (tier, false));
+                let detail = match_tier(&filter, &fold(&item.detail)).map(|tier| (tier, true));
+                let best = match (label, detail) {
+                    (Some(label), Some(detail)) => label.min(detail),
+                    (label, detail) => label.or(detail)?,
+                };
+                Some((best, index))
             })
-            .filter(|(_, item)| {
-                filter.is_empty()
-                    || is_subsequence(&filter, &fold(&item.label))
-                    || is_subsequence(&filter, &fold(&item.detail))
-            })
-            .map(|(index, _)| index)
-            .collect()
+            .collect();
+        // Stable: equal ranks keep the order of `items`.
+        ranked.sort_by_key(|&(rank, _)| rank);
+        ranked.into_iter().map(|(_, index)| index).collect()
     }
 
     /// Re-applies the cursor invariants to the rows shown now.
@@ -2787,6 +2831,45 @@ mod tests {
             .into_iter()
             .map(|(label, _)| label)
             .collect()
+    }
+
+    #[test]
+    fn the_best_match_comes_first_and_enter_picks_it() {
+        let mut app = two_local();
+        host_picker(
+            &mut app,
+            vec![
+                host_item("Local", "", 0),
+                host_item("it-modern-sudonopw", "", 0),
+                host_item("it-modern-sudopw", "", 0),
+                host_item("web-staging1", "deploy@staging.example", 0),
+                host_item("web1", "deploy@web1.example", 0),
+                host_item("web10", "", 0),
+            ],
+            &[],
+        );
+        // A substring beats a subsequence that sorts earlier.
+        typing(&mut app, "modern-sudopw");
+        assert_eq!(labels(&app), ["it-modern-sudopw", "it-modern-sudonopw"]);
+        act(&mut app, Action::Text(TextEdit::Clear));
+        // Exact, then prefix, then the detail substring, then subsequence.
+        typing(&mut app, "web1");
+        assert_eq!(labels(&app), ["web1", "web10", "web-staging1"]);
+        act(&mut app, Action::Confirm);
+        match app.dialog.answer.take() {
+            Some(Answer::Picked { target, .. }) => {
+                assert_eq!(target, PickerTarget::Host("web1".into()));
+            }
+            _ => panic!("expected a host pick"),
+        }
+        // Equal matches keep the list order.
+        host_picker(
+            &mut app,
+            vec![host_item("b-web", "", 0), host_item("a-web", "", 0)],
+            &[],
+        );
+        typing(&mut app, "web");
+        assert_eq!(labels(&app), ["b-web", "a-web"]);
     }
 
     #[test]

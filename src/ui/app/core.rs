@@ -14,8 +14,8 @@
 //!
 //! # Behavior
 //!
-//! - Focus: Tab goes Left -> Right -> queue panel (only while it is visible)
-//!   -> Left. In the queue, Tab and Esc leave it; clicking a pane focuses
+//! - Focus: Tab goes Left -> Right -> queue panel (only while it is visible
+//!   as a panel, not collapsed to its summary row) -> Left. In the queue, Tab and Esc leave it; clicking a pane focuses
 //!   that pane. Hiding the queue panel while it has focus returns focus to
 //!   the pane focused before.
 //! - Filter: `/` starts typing a filter in the focused pane
@@ -38,6 +38,13 @@
 //!   is already bookmarked; `R` reveals the cursor entry; `t` opens a shell
 //!   in the focused pane's directory; `q` quits.
 //! - Status messages stay until replaced.
+//! - Layout (plan 8.8, `CoreState::layout`): below 60 columns one pane is
+//!   drawn at a time (the focused one) under a tab row; Tab or a click on
+//!   the other tab (`ClickTarget::PaneArea`) switches it. The queue panel
+//!   takes at most a third of the rows and is one summary row below 24
+//!   rows. Below 40x10 every action except `Quit` and `Resize` is ignored
+//!   and the state is kept for when the terminal grows. A resize that hides
+//!   the source pane of a drag ends the drag.
 //!
 //! Startup: the left pane lists its directory at once (a local path is
 //! always absolute, a remote one waits for `BgEvent::Connected`). When the
@@ -97,6 +104,12 @@
 //!     /// Screen areas for the current size and panel visibility; render
 //!     /// draws into exactly these so key paging and the screen agree.
 //!     pub fn layout(&self) -> AppLayout;
+//!     /// Plan 8.8: too small to draw anything but a message.
+//!     pub fn too_small(&self) -> bool;
+//!     /// Whether a pane's file list is on screen.
+//!     pub fn pane_drawn(&self, side: PaneSide) -> bool;
+//!     /// Focuses a pane (in single-pane mode, the pane drawn).
+//!     pub fn focus(&mut self, side: PaneSide);
 //!     /// List rows of a pane: its layout height minus
 //!     /// `widgets::pane::CHROME_ROWS`.
 //!     pub fn page_height(&self, side: PaneSide) -> usize;
@@ -112,8 +125,14 @@
 //! pub struct AppLayout {
 //!     pub left: Rect,
 //!     pub right: Rect,
+//!     /// Single-pane mode: the tab row.
+//!     pub tabs: Option<Rect>,
+//!     /// Where the quick view is drawn.
+//!     pub quick_view: Rect,
 //!     /// The queue panel when visible.
 //!     pub queue: Option<Rect>,
+//!     /// The queue panel is a one-row summary.
+//!     pub queue_collapsed: bool,
 //!     pub status_bar: Rect,
 //! }
 //!
@@ -212,7 +231,7 @@
 //! | `ShellExited` | core: an `Err` is an error status; `Ok` refreshes the focused pane (the shell may have changed files) |
 //! | `Revealed` | core: an `Err` is an error status |
 //! | `StateWriteFailed` | core (error status) |
-//! | `TimerFired { id, at }` | `connection_timer`, else `preview_timer` |
+//! | `TimerFired { id, at }` | `transfer_timer` (then `preview_cursor_moved`), else `connection_timer`, else `preview_timer` |
 //!
 //! Wiring points:
 //!
@@ -267,19 +286,38 @@ use crate::ui::pane::Pane;
 use crate::ui::widgets::pane::CHROME_ROWS;
 use crate::vfs::{Endpoint, Entry, Location};
 
-/// Smallest height of the queue panel when shown (border plus a few rows),
-/// limited by the screen.
-const QUEUE_MIN_ROWS: u16 = 5;
+/// Terminals narrower than this show one pane at a time (plan 8.8).
+pub const SINGLE_PANE_BELOW_WIDTH: u16 = 60;
+/// The smallest terminal scpto draws its interface in; below it only a
+/// "Terminal too small" message is drawn.
+pub const MIN_WIDTH: u16 = 40;
+/// See [`MIN_WIDTH`].
+pub const MIN_HEIGHT: u16 = 10;
+/// Terminals shorter than this collapse the queue panel to one summary row.
+const QUEUE_COLLAPSE_BELOW_HEIGHT: u16 = 24;
+/// The quick view is split off as the other pane only when both panes keep
+/// at least this many columns; otherwise it covers the whole pane area.
+const QUICK_VIEW_MIN_PANE_WIDTH: u16 = 40;
 
 /// Screen areas of one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppLayout {
-    /// The left pane.
+    /// The left pane. In single-pane mode both panes have the same area and
+    /// only the focused one is drawn.
     pub left: Rect,
     /// The right pane.
     pub right: Rect,
+    /// Single-pane mode: the one-row tab header above the pane, showing both
+    /// endpoints.
+    pub tabs: Option<Rect>,
+    /// Where the quick view is drawn while it shows an entry: the
+    /// non-focused pane when both panes keep enough columns, else the area
+    /// of every pane (in single-pane mode, the pane under the tabs).
+    pub quick_view: Rect,
     /// The queue panel when visible.
     pub queue: Option<Rect>,
+    /// The queue panel is a one-row summary (short terminals).
+    pub queue_collapsed: bool,
     /// The status bar (the last row).
     pub status_bar: Rect,
 }
@@ -323,6 +361,8 @@ pub struct CoreState {
     filtering: bool,
     width: u16,
     height: u16,
+    /// The last reported size is below [`MIN_WIDTH`] x [`MIN_HEIGHT`].
+    too_small: bool,
     status: Option<StatusMessage>,
     next_request: u64,
     next_job: u64,
@@ -348,6 +388,7 @@ impl CoreState {
             filtering: false,
             width: 0,
             height: 0,
+            too_small: false,
             status: None,
             next_request: 0,
             next_job: 0,
@@ -387,28 +428,79 @@ impl CoreState {
     }
 
     /// Screen areas for the current size and panel visibility; render draws
-    /// into exactly these so key paging and the screen agree. The status bar
-    /// is the last row; the queue panel, when visible, takes the bottom
-    /// third of the rest (at least 5 rows when there is room);
-    /// the panes split the remaining rows by width.
+    /// into exactly these so key paging and the screen agree (plan 8.8). The
+    /// status bar is the last row; the queue panel, when visible, takes the
+    /// bottom third of the rest, or one summary row on terminals shorter
+    /// than 24 rows; the panes share the remaining rows, side by side, or,
+    /// below 60 columns, one at a time under a tab row.
     pub fn layout(&self) -> AppLayout {
         let status_height = self.height.min(1);
         let body = self.height - status_height;
-        let queue_height = if self.queue_visible {
-            (body / 3).max(QUEUE_MIN_ROWS).min(body)
-        } else {
-            0
+        let queue_collapsed = self.queue_collapsed();
+        let queue_height = match (self.queue_visible, queue_collapsed) {
+            (false, _) => 0,
+            (true, true) => body.min(1),
+            (true, false) => body / 3,
         };
-        let panes = body - queue_height;
-        let left_width = self.width / 2;
+        let panes_height = body - queue_height;
+        let (left, right, tabs) = if self.single_pane() {
+            let tabs_height = panes_height.min(1);
+            let pane = Rect::new(0, tabs_height, self.width, panes_height - tabs_height);
+            (pane, pane, Some(Rect::new(0, 0, self.width, tabs_height)))
+        } else {
+            let left_width = self.width / 2;
+            (
+                Rect::new(0, 0, left_width, panes_height),
+                Rect::new(left_width, 0, self.width - left_width, panes_height),
+                None,
+            )
+        };
+        let quick_view = if left.width >= QUICK_VIEW_MIN_PANE_WIDTH
+            && right.width >= QUICK_VIEW_MIN_PANE_WIDTH
+            && tabs.is_none()
+        {
+            match self.focused.other() {
+                PaneSide::Left => left,
+                PaneSide::Right => right,
+            }
+        } else {
+            left.union(right)
+        };
         AppLayout {
-            left: Rect::new(0, 0, left_width, panes),
-            right: Rect::new(left_width, 0, self.width - left_width, panes),
+            left,
+            right,
+            tabs,
+            quick_view,
             queue: self
                 .queue_visible
-                .then(|| Rect::new(0, panes, self.width, queue_height)),
+                .then(|| Rect::new(0, panes_height, self.width, queue_height)),
+            queue_collapsed,
             status_bar: Rect::new(0, body, self.width, status_height),
         }
+    }
+
+    /// Single-pane mode: the terminal is narrower than
+    /// [`SINGLE_PANE_BELOW_WIDTH`], so only the focused pane is drawn.
+    fn single_pane(&self) -> bool {
+        self.width < SINGLE_PANE_BELOW_WIDTH
+    }
+
+    /// The last reported terminal size is below [`MIN_WIDTH`] x
+    /// [`MIN_HEIGHT`]: only a "too small" message is drawn and input other
+    /// than `Quit` and `Resize` is ignored.
+    pub fn too_small(&self) -> bool {
+        self.too_small
+    }
+
+    /// Whether a pane's file list is on screen in the current layout (both
+    /// are side by side; in single-pane mode only the focused one). The
+    /// quick view covering a pane does not count.
+    pub fn pane_drawn(&self, side: PaneSide) -> bool {
+        !self.too_small && (!self.single_pane() || side == self.focused)
+    }
+
+    fn queue_collapsed(&self) -> bool {
+        self.height < QUEUE_COLLAPSE_BELOW_HEIGHT
     }
 
     /// List rows of a pane: its layout height minus the pane chrome.
@@ -456,18 +548,36 @@ impl CoreState {
         }
     }
 
-    fn focus(&mut self, side: PaneSide) {
+    /// Focuses a pane, leaving the queue panel. In single-pane mode this is
+    /// also the pane drawn (for example after a drag hovered over its tab).
+    pub fn focus(&mut self, side: PaneSide) {
         self.focused = side;
         self.queue_focused = false;
     }
 
+    /// Tab: Left -> Right -> queue panel (only while it is drawn as a
+    /// panel, not as the collapsed summary row) -> Left.
     fn switch_focus(&mut self) {
+        let queue_focusable = self.queue_visible && !self.queue_collapsed();
         match (self.focused, self.queue_focused) {
             (_, true) => self.focus(PaneSide::Left),
             (PaneSide::Left, false) => self.focused = PaneSide::Right,
-            (PaneSide::Right, false) if self.queue_visible => self.queue_focused = true,
+            (PaneSide::Right, false) if queue_focusable => self.queue_focused = true,
             (PaneSide::Right, false) => self.focused = PaneSide::Left,
         }
+    }
+
+    /// Takes a new terminal size: re-derives the too-small state, leaves a
+    /// queue panel that collapsed to its summary row, and keeps every
+    /// cursor on screen.
+    fn resize(&mut self, width: u16, height: u16) {
+        self.width = width;
+        self.height = height;
+        self.too_small = width < MIN_WIDTH || height < MIN_HEIGHT;
+        if self.queue_collapsed() {
+            self.queue_focused = false;
+        }
+        self.reclamp_panes();
     }
 
     fn toggle_queue(&mut self) {
@@ -567,9 +677,23 @@ impl App {
     /// Handles one user action. Pure; returns the effects to execute.
     pub fn handle_action(&mut self, action: Action) -> Vec<Effect> {
         if let Action::Resize { width, height } = action {
-            self.core.width = width;
-            self.core.height = height;
-            self.core.reclamp_panes();
+            // A drag whose source pane disappears with the new layout ends.
+            let source_was_drawn = self
+                .transfer
+                .drag
+                .as_ref()
+                .is_some_and(|drag| self.core.pane_drawn(drag.side));
+            self.core.resize(width, height);
+            if let Some(drag) = &self.transfer.drag {
+                if source_was_drawn && !self.core.pane_drawn(drag.side) {
+                    self.transfer.drag = None;
+                }
+            }
+            return Vec::new();
+        }
+        // Plan 8.8: a too-small terminal draws only a message, so nothing
+        // but quitting may act on the hidden state.
+        if self.core.too_small && !matches!(action, Action::Quit) {
             return Vec::new();
         }
         let mut effects = match self.input_mode() {
@@ -811,10 +935,18 @@ impl App {
                 self.error_status(error);
                 Vec::new()
             }
-            BgEvent::TimerFired { id, at } => self
-                .connection_timer(id, at)
-                .or_else(|| self.preview_timer(id, at))
-                .unwrap_or_default(),
+            BgEvent::TimerFired { id, at } => match self.transfer_timer(id) {
+                // The drag switched panes: the quick view follows the cursor
+                // of the newly focused pane.
+                Some(mut effects) => {
+                    effects.extend(self.preview_cursor_moved());
+                    effects
+                }
+                None => self
+                    .connection_timer(id, at)
+                    .or_else(|| self.preview_timer(id, at))
+                    .unwrap_or_default(),
+            },
         }
     }
 
@@ -1606,20 +1738,129 @@ mod tests {
         assert_eq!(layout.left.height, 16);
         assert_eq!(app.core.page_height(PaneSide::Right), 13);
 
+        assert!(!layout.queue_collapsed);
+        // Wide enough for the quick view to take the other pane only.
+        assert_eq!(layout.quick_view, layout.right);
+
+        // Below 24 rows the queue is one summary row.
         app.handle_action(Action::Resize {
             width: 81,
-            height: 4,
+            height: 12,
         });
         let layout = app.core.layout();
-        assert_eq!(layout.queue, Some(Rect::new(0, 0, 81, 3)));
-        assert_eq!(layout.right, Rect::new(40, 0, 41, 0));
-        assert_eq!(app.core.page_height(PaneSide::Left), 0);
+        assert_eq!(layout.queue, Some(Rect::new(0, 10, 81, 1)));
+        assert!(layout.queue_collapsed);
+        assert_eq!(layout.right, Rect::new(40, 0, 41, 10));
+        assert_eq!(layout.tabs, None);
+        assert_eq!(app.core.page_height(PaneSide::Left), 7);
 
         app.handle_action(Action::Resize {
             width: 0,
             height: 0,
         });
         assert_eq!(app.core.layout().status_bar.height, 0);
+    }
+
+    #[test]
+    fn narrow_terminals_show_one_pane_under_tabs() {
+        let mut app = two_local();
+        app.handle_action(Action::Resize {
+            width: 70,
+            height: 30,
+        });
+        // Two panes of 35 columns: too narrow to split off the quick view.
+        let layout = app.core.layout();
+        assert_eq!(layout.tabs, None);
+        assert_eq!(layout.quick_view, Rect::new(0, 0, 70, 29));
+
+        app.handle_action(Action::Resize {
+            width: 50,
+            height: 20,
+        });
+        let layout = app.core.layout();
+        assert_eq!(layout.tabs, Some(Rect::new(0, 0, 50, 1)));
+        assert_eq!(layout.left, Rect::new(0, 1, 50, 18));
+        assert_eq!(layout.right, layout.left);
+        assert_eq!(layout.quick_view, layout.left);
+        assert_eq!(app.core.page_height(PaneSide::Right), 15);
+        assert!(app.core.pane_drawn(PaneSide::Left));
+        assert!(!app.core.pane_drawn(PaneSide::Right));
+        // Tab switches the pane shown.
+        app.handle_action(Action::SwitchFocus);
+        assert!(app.core.pane_drawn(PaneSide::Right));
+        assert!(!app.core.pane_drawn(PaneSide::Left));
+    }
+
+    #[test]
+    fn a_collapsed_queue_takes_no_focus() {
+        let mut app = two_local();
+        app.handle_action(Action::ToggleQueue);
+        app.handle_action(Action::SwitchFocus);
+        app.handle_action(Action::SwitchFocus);
+        assert!(app.core.queue_focused());
+        // Shrinking collapses the panel and gives focus back to the pane.
+        app.handle_action(Action::Resize {
+            width: 80,
+            height: 20,
+        });
+        assert!(!app.core.queue_focused());
+        assert_eq!(app.core.focused(), PaneSide::Right);
+        app.handle_action(Action::SwitchFocus);
+        assert!(!app.core.queue_focused());
+        assert_eq!(app.core.focused(), PaneSide::Left);
+    }
+
+    #[test]
+    fn a_too_small_terminal_ignores_input_but_quit() {
+        let mut app = two_local();
+        app.handle_action(Action::MoveCursor(CursorMove::Down));
+        app.handle_action(Action::Resize {
+            width: 30,
+            height: 8,
+        });
+        assert!(app.core.too_small());
+        assert!(app
+            .handle_action(Action::MoveCursor(CursorMove::Down))
+            .is_empty());
+        assert!(app.handle_action(Action::Open).is_empty());
+        assert!(app.handle_action(Action::Copy).is_empty());
+        assert!(app.handle_action(Action::SwitchFocus).is_empty());
+        assert_eq!(app.core.focused(), PaneSide::Left);
+        assert_eq!(cursor_name(&app, PaneSide::Left), "a");
+        // Growing again restores everything as it was.
+        app.handle_action(Action::Resize {
+            width: 160,
+            height: 45,
+        });
+        assert!(!app.core.too_small());
+        assert_eq!(cursor_name(&app, PaneSide::Left), "a");
+        app.handle_action(Action::Resize {
+            width: 40,
+            height: 9,
+        });
+        assert_eq!(app.handle_action(Action::Quit), [Effect::Quit]);
+    }
+
+    #[test]
+    fn resizing_away_a_drag_source_ends_the_drag() {
+        let mut app = two_local();
+        app.handle_action(Action::DragStart {
+            side: PaneSide::Left,
+            index: 1,
+            at: Instant::now(),
+        });
+        assert!(app.transfer.drag.is_some());
+        // Single-pane mode still draws the focused source pane.
+        app.handle_action(Action::Resize {
+            width: 50,
+            height: 20,
+        });
+        assert!(app.transfer.drag.is_some());
+        app.handle_action(Action::Resize {
+            width: 30,
+            height: 8,
+        });
+        assert!(app.transfer.drag.is_none());
     }
 
     #[test]
