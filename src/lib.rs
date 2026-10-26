@@ -21,6 +21,7 @@ pub mod session;
 pub mod settings;
 pub mod startup;
 pub mod state;
+pub mod sudo;
 pub mod sync;
 pub mod term;
 pub mod transfer;

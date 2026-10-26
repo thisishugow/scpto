@@ -60,6 +60,15 @@ pub enum Error {
         /// What prevented the preview.
         message: String,
     },
+    /// The state file (`state.json`, `partials.json`) exists but could not
+    /// be read or parsed. A missing file is not an error.
+    #[error("Cannot read {}: {message}", path.display())]
+    StateRead {
+        /// The state file path.
+        path: PathBuf,
+        /// The underlying reason.
+        message: String,
+    },
     /// The state file (`state.json`, `partials.json`) could not be written.
     #[error("Cannot save {}: {message}", path.display())]
     StateWrite {
@@ -223,39 +232,66 @@ impl ConnectError {
     }
 }
 
-/// Classified failure of the two-stage sudo sftp-server start (plan 7.4).
+/// Classified failure of the sudo sftp-server start (plan 8.5, `sudo.rs`).
+///
+/// Each class corresponds to one rule of the stderr classification. sudo's
+/// own text is never shown verbatim: its "not allowed to execute" line
+/// echoes the whole root wrapper command.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SudoError {
-    /// `sudo -n -v` reported that a password is required. This is a signal
-    /// to ask the user, not a final failure.
+    /// Stage 1 (`sudo -n`) reported `a password is required`. This is a
+    /// signal to ask the user and start stage 2, not a final failure.
     #[error("sudo requires a password")]
     PasswordRequired,
-    /// sudo rejected the password (`Sorry, try again`).
+    /// sudo rejected the password (`Sorry, try again.` or
+    /// `incorrect password attempt`). sudo is never retried with the same
+    /// child; the user is asked again.
     #[error("Incorrect sudo password")]
     WrongPassword,
-    /// The user is not in the sudoers file.
+    /// The user may not use sudo at all (`is not in the sudoers file`, or
+    /// `may not run sudo on` from `sudo -n -v`).
     #[error("Your account is not allowed to use sudo on this host")]
     NotInSudoers,
-    /// sudo is configured with `requiretty`, which an SFTP channel cannot
-    /// satisfy.
+    /// sudo requires a terminal (`must have a tty`, the `requiretty`
+    /// option), which an SFTP channel cannot provide.
     #[error(
         "sudo on this host requires a terminal (requiretty), which an SFTP \
          session cannot provide"
     )]
     RequiresTty,
-    /// sudo policy forbids running the sftp-server binary.
-    #[error("sudo does not allow running the sftp-server program on this host")]
+    /// sudo policy forbids the root `sh` wrapper (`is not allowed to
+    /// execute`). sudoers rules that allow only the sftp-server binary are
+    /// not supported.
+    #[error(
+        "sudo on this host does not allow running sh as root, which scpto's \
+         sudo mode requires"
+    )]
     NotAllowedToExecute,
-    /// No usable sftp-server binary was found on the host.
+    /// No usable sftp-server binary was found on the host, or the wrapper
+    /// reported `SCPTO-SUDO-NOSFTP`.
     #[error("sftp-server not found on the host")]
     SftpServerNotFound,
+    /// Neither the marker nor a known failure arrived within the start
+    /// timeout, typically because sudo asked for something other than the
+    /// password (for example a second factor).
+    #[error(
+        "sudo did not answer in time. Prompts other than the password, such as \
+         two-factor codes, are not supported"
+    )]
+    Timeout,
+    /// sudo wrote more than the pre-marker output limit to stderr without
+    /// reaching the marker or a known failure.
+    #[error("sudo printed unexpected output before starting sftp-server")]
+    UnexpectedOutput,
     /// The connection underneath failed before sudo could answer.
     #[error(transparent)]
     Connect(#[from] ConnectError),
-    /// Any other sudo failure.
+    /// Any other sudo failure, for example the child exiting before the
+    /// marker.
     #[error("sudo failed: {detail}")]
     Other {
-        /// The stderr excerpt from sudo.
+        /// The stderr excerpt, with sudo's lecture and any line echoing the
+        /// wrapper removed.
         detail: String,
     },
 }

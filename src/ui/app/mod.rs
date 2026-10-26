@@ -6,9 +6,12 @@
 //! tested independently.
 //!
 //! Inputs that exist before the first frame are passed to the `App`
-//! constructor rather than requested through `Effect`s: the host aliases
-//! discovered from `~/.ssh/config` and the persisted state (bookmarks and
-//! last directories per endpoint). Only changes to persisted state go out as
+//! constructor (`core.rs` documents its signature) rather than requested
+//! through `Effect`s: the settings, the host aliases discovered from the ssh
+//! configuration (`hosts::HostList`), the sshto groups (`groups::Groups`),
+//! the persisted state (`state::PersistedState`: bookmarks and last
+//! directories per endpoint), the terminal background, and the start
+//! endpoints of both panes. Only changes to persisted state go out as
 //! effects (`RememberDirectory`, `SaveBookmark`, `RemoveBookmark`).
 
 pub mod connection;

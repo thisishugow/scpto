@@ -14,13 +14,28 @@
 //! # Local endpoints
 //!
 //! [`Connections::fs`] serves `Endpoint::Local` with the local file system
-//! for either channel. [`Connections::spawn_remote`] and
-//! [`Connections::tools`] are for remote endpoints only: local tar runs in
-//! process (the `tar` crate) and local rsync is run and probed by the sync
-//! executor itself. Implementations reject `Endpoint::Local` there with an
-//! error, never a panic.
+//! for either channel. [`Connections::spawn_remote`],
+//! [`Connections::ssh_command`], and [`Connections::tools`] are for remote
+//! endpoints only: local tar runs in process (the `tar` crate) and local
+//! rsync is run and probed by the sync executor itself. Implementations
+//! reject `Endpoint::Local` there with an error, never a panic.
+//!
+//! # sudo endpoints
+//!
+//! There is one master connection per host alias; `sudo` is a property of
+//! the sftp-server child only. For `Endpoint::Remote { sudo: true, .. }`,
+//! [`Connections::spawn_remote`], [`Connections::ssh_command`], and
+//! [`Connections::tools`] behave exactly as for the same host without sudo:
+//! commands run as the login user over the same master.
+//!
+//! Whether a sudo endpoint's [`FsChannel::Browse`] and
+//! [`FsChannel::Transfer`] share one root sftp-server or each run their own
+//! is decided by the session. The sudo password is never retained after a
+//! start: when a second sudo channel needs a password, the session asks
+//! again through `BgEvent::SudoPasswordRequired`.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures_util::future::BoxFuture;
@@ -68,8 +83,60 @@ pub struct RemoteTools {
     /// `tar` is available (tar acceleration, plan 7.5 S8).
     pub tar: bool,
     /// `rsync --version` reports a real rsync 3.1 or newer (not openrsync),
-    /// so it may serve as an rsync sync peer (plan 7.5 S14).
+    /// so it may serve as an rsync sync peer (plan 7.5 S14). Decided by
+    /// [`rsync_version_ok`].
     pub rsync_ok: bool,
+}
+
+/// Whether `rsync --version` output comes from rsync 3.1 or newer. Its
+/// first line must read `rsync version <major>.<minor>...` (an optional `v`
+/// before the number is accepted), which excludes openrsync (`openrsync:
+/// protocol version 29`) and rsync 2.x. Shared by the session's remote
+/// probe and the sync executor's local probe.
+pub fn rsync_version_ok(version_output: &str) -> bool {
+    let Some(first_line) = version_output.lines().next() else {
+        return false;
+    };
+    let mut words = first_line.split_whitespace();
+    if words.next() != Some("rsync") || words.next() != Some("version") {
+        return false;
+    }
+    let Some(version) = words.next() else {
+        return false;
+    };
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = version.split('.');
+    let number = |part: Option<&str>| -> Option<u32> {
+        let digits: String = part?.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    match (number(parts.next()), number(parts.next())) {
+        (Some(major), Some(minor)) => (major, minor) >= (3, 1),
+        _ => false,
+    }
+}
+
+/// How scpto invokes the local OpenSSH client. Shared by the session (master
+/// and children), host discovery, and `ssh -G` resolution so that all of
+/// them see the same configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshClient {
+    /// The `ssh` program, looked up in `PATH` when it has no slash.
+    pub program: PathBuf,
+    /// An explicit configuration file. When set, every `ssh` invocation gets
+    /// `-F <file>` and host discovery reads this file instead of
+    /// `~/.ssh/config`. The product leaves it unset; integration tests point
+    /// it at a generated configuration.
+    pub config_file: Option<PathBuf>,
+}
+
+impl Default for SshClient {
+    fn default() -> Self {
+        SshClient {
+            program: PathBuf::from("ssh"),
+            config_file: None,
+        }
+    }
 }
 
 /// Ready-to-use handles to endpoints. Dyn-compatible: held as
@@ -99,6 +166,33 @@ pub trait Connections: Send + Sync {
         argv: &'a [String],
     ) -> BoxFuture<'a, Result<RemoteChild, Error>>;
 
+    /// The complete local `ssh` argv that reaches `endpoint`'s host through
+    /// its master connection, without the destination host and without a
+    /// remote command. The caller appends the host alias (and, for the shell,
+    /// the remote command quoted with the session's quoting helper).
+    ///
+    /// Shape, in this order: [`SshClient::program`]; `-F <file>` when
+    /// [`SshClient::config_file`] is set; `-o ControlPath=<path>`,
+    /// `-o ControlMaster=no`; then
+    ///
+    /// - `interactive == false` (rsync `-e`): the plan 7.3 common options
+    ///   `-o RemoteCommand=none -o RequestTTY=no -o ClearAllForwardings=yes
+    ///   -o PermitLocalCommand=no -o ForwardX11=no -o ForwardAgent=no`, then
+    ///   `-o BatchMode=yes`. The sync runner joins the argv with the
+    ///   session's quoting helper into one `-e` string; rsync appends the
+    ///   host and its server command itself.
+    /// - `interactive == true` (the `t` shell): only `-o RemoteCommand=none`
+    ///   and `-t`, so the remote shell gets a terminal and OpenSSH may prompt.
+    ///
+    /// Like [`Connections::spawn_remote`], it runs `ssh -O check` first and
+    /// rebuilds the master when it is gone, so the argv is usable right away.
+    /// `Endpoint::Local` fails with an error.
+    fn ssh_command<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        interactive: bool,
+    ) -> BoxFuture<'a, Result<Vec<String>, Error>>;
+
     /// The tools available on a remote endpoint, probed once per connection
     /// and cached.
     fn tools<'a>(&'a self, endpoint: &'a Endpoint) -> BoxFuture<'a, Result<RemoteTools, Error>>;
@@ -115,5 +209,36 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Arc<dyn Connections>>();
         assert_send_sync::<RemoteChild>();
+    }
+
+    #[test]
+    fn rsync_version_requires_real_rsync_3_1() {
+        assert!(rsync_version_ok(
+            "rsync  version 3.2.7  protocol version 31\nCopyright"
+        ));
+        assert!(rsync_version_ok(
+            "rsync  version v3.4.1  protocol version 32"
+        ));
+        assert!(rsync_version_ok(
+            "rsync  version 3.1.0  protocol version 31"
+        ));
+        assert!(!rsync_version_ok(
+            "rsync  version 3.0.9  protocol version 30"
+        ));
+        assert!(!rsync_version_ok(
+            "rsync  version 2.6.9  protocol version 29"
+        ));
+        assert!(!rsync_version_ok(
+            "openrsync: protocol version 29\nrsync version 2.6.9 compatible"
+        ));
+        assert!(!rsync_version_ok(""));
+        assert!(!rsync_version_ok("rsync  version"));
+    }
+
+    #[test]
+    fn ssh_client_defaults_to_path_lookup_without_config_file() {
+        let client = SshClient::default();
+        assert_eq!(client.program, PathBuf::from("ssh"));
+        assert_eq!(client.config_file, None);
     }
 }

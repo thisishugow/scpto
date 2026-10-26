@@ -15,7 +15,40 @@
 //!
 //! Settings are data: a `vpn` command runs only when the user presses "Run"
 //! in the VPN dialog, via `/bin/sh -c`.
+//!
+//! [`ConfigPath`] resolves both this file and sshto's group file (`groups`)
+//! with the same rules.
+//!
+//! # Public API (Wave 2 implements `parse` and `load`)
+//!
+//! ```text
+//! /// Parses settings text. Lines are split on `\n` (a trailing `\r` is
+//! /// dropped); empty lines and lines starting with `#` are skipped.
+//! /// `set|<key>|<value>` must name a key of `ALL_KEYS` with a valid value:
+//! /// `concurrency`, `tar-threshold`: integer >= 1; `show-hidden`: `true` or
+//! /// `false`; `mtime-tolerance`: integer >= 0; `reconnect-base-ms`,
+//! /// `reconnect-cap-ms`: integer >= 1 with cap >= base after the whole file;
+//! /// `keepalive-interval`: integer >= 1 (seconds). A later `set` of the same
+//! /// key wins. `vpn|<glob>|<command>` splits at the first two `|` only, so
+//! /// the command may contain `|`; glob and command must be non-empty. The
+//! /// first bad line fails with `ConfigError::Parse` (one-based line).
+//! pub fn parse(path: &Path, text: &str) -> Result<Settings, ConfigError>;
+//!
+//! /// Reads and parses the file. A missing file at a default location gives
+//! /// `Settings::default()`; a missing explicit file (or a dangling symlink,
+//! /// or any read error) is `ConfigError::Read`.
+//! pub fn load(location: &ConfigPath) -> Result<Settings, ConfigError>;
+//!
+//! impl Settings {
+//!     /// Wave 3 (vpn): the first rule whose glob (`pattern`, matched against
+//!     /// the lowercased value like sshto) matches the alias or, when known,
+//!     /// the resolved hostname.
+//!     pub fn vpn_rule(&self, alias: &str, hostname: Option<&str>) -> Option<&VpnRule>;
+//! }
+//! ```
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Environment variable naming an explicit settings file.
@@ -62,6 +95,44 @@ pub const ALL_KEYS: &[&str] = &[
     KEY_RECONNECT_CAP_MS,
     KEY_KEEPALIVE_INTERVAL,
 ];
+
+/// Where a configuration file is read from, and whether the user named it
+/// explicitly (an explicit file must exist; a default one may be missing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPath {
+    /// The file.
+    pub path: PathBuf,
+    /// Whether it came from the explicit environment variable.
+    pub explicit: bool,
+}
+
+impl ConfigPath {
+    /// Resolves `<explicit>` (the value of [`CONFIG_ENV`] or `SSHTO_CONFIG`;
+    /// empty counts as unset), else `$XDG_CONFIG_HOME/<app>/config` when that
+    /// value is an absolute path (the XDG spec ignores relative values), else
+    /// `<home>/.config/<app>/config`.
+    pub fn resolve(
+        explicit: Option<&OsStr>,
+        xdg_config_home: Option<&OsStr>,
+        home: &Path,
+        app: &str,
+    ) -> ConfigPath {
+        if let Some(path) = explicit.filter(|value| !value.is_empty()) {
+            return ConfigPath {
+                path: PathBuf::from(path),
+                explicit: true,
+            };
+        }
+        let base = xdg_config_home
+            .map(Path::new)
+            .filter(|value| value.is_absolute())
+            .map_or_else(|| home.join(".config"), Path::to_path_buf);
+        ConfigPath {
+            path: base.join(app).join("config"),
+            explicit: false,
+        }
+    }
+}
 
 /// A `vpn` rule: when a connection to a host matching `pattern` is
 /// unreachable, offer to run `command`.
@@ -143,6 +214,32 @@ mod tests {
         assert_eq!(settings.reconnect_base, Duration::from_secs(1));
         assert_eq!(settings.reconnect_cap, Duration::from_secs(30));
         assert_eq!(settings.keepalive_interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn config_path_prefers_explicit_then_absolute_xdg_then_home() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            ConfigPath::resolve(Some(OsStr::new("rel/cfg")), None, home, "scpto"),
+            ConfigPath {
+                path: "rel/cfg".into(),
+                explicit: true
+            }
+        );
+        let xdg = Some(OsStr::new("/x"));
+        assert_eq!(
+            ConfigPath::resolve(Some(OsStr::new("")), xdg, home, "scpto"),
+            ConfigPath {
+                path: "/x/scpto/config".into(),
+                explicit: false
+            }
+        );
+        for ignored in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
+            assert_eq!(
+                ConfigPath::resolve(None, ignored, home, "sshto").path,
+                PathBuf::from("/home/u/.config/sshto/config")
+            );
+        }
     }
 
     #[test]
