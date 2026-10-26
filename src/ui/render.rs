@@ -200,7 +200,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) -> HitMap {
     let mut tabs = Vec::new();
     let mut picker_rows = Vec::new();
     if let Some(view) = app.picker_view(&mut tabs, &mut picker_rows) {
-        hits.picker = Some(picker::render(&view, overlay, frame.buffer_mut()));
+        let (list, tabs) = picker::render(&view, overlay, frame.buffer_mut());
+        hits.picker = Some(list);
+        hits.picker_tabs = tabs;
     }
     let mut items = Vec::new();
     if let Some((view, place)) = app.menu_view(&mut items) {
@@ -590,6 +592,7 @@ mod tests {
                     screen,
                     buf,
                 )
+                .0
                 .area
             },
             |screen, buf| {
@@ -775,10 +778,23 @@ mod tests {
     #[test]
     fn the_startup_host_picker_is_modal() {
         let (mut app, _) = app(None);
+        app.groups = crate::groups::parse(
+            std::path::Path::new("groups"),
+            "group|prod\nmatch|prod|alias|web\n",
+        )
+        .unwrap();
+        app.connection_open_picker(PaneSide::Right);
         let (hits, text) = render(&mut app, 100, 30);
         let picker = hits.picker.clone().expect("picker drawn");
         assert!(text.contains("Local"));
         assert!(text.contains("web"));
+        assert!(!hits.picker_tabs.is_empty());
+        for &(area, index) in &hits.picker_tabs {
+            assert_eq!(
+                hits.resolve(area.x, area.y),
+                Some(ClickTarget::PickerTab(index))
+            );
+        }
         // Outside the modal picker nothing is hit.
         assert_eq!(hits.resolve(0, 0), None);
         assert_eq!(

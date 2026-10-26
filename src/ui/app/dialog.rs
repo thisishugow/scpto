@@ -100,6 +100,9 @@
 //!   computed from `items`, `active_tab`, and `filter` whenever they are
 //!   needed, so the connection feature may change `items` while the host
 //!   picker is open (resolved hostnames) without telling this feature.
+//!   `PickerSelectTab` selects a group and resets the cursor while keeping
+//!   the filter; digit shortcuts use that same action. Mouse tabs emit it
+//!   directly.
 //!   Picking a `PickerKind::Hosts` row closes the picker and puts
 //!   [`Answer::Picked`] into [`DialogState::answer`].
 //!
@@ -936,29 +939,12 @@ impl PickerList {
         self.first_visible = 0;
     }
 
-    /// Edits the filter at its end; a digit 1-9 typed while it is empty
-    /// selects that tab instead when the list has tabs.
+    /// Edits the filter at its end after tab shortcuts have been resolved.
     fn edit_filter(&mut self, edit: TextEdit) {
         match edit {
-            TextEdit::Insert(c) => {
-                let tab = c
-                    .to_digit(10)
-                    .filter(|_| self.filter.is_empty() && !self.tabs.is_empty())
-                    .and_then(|digit| usize::try_from(digit).ok())
-                    .and_then(|digit| digit.checked_sub(1));
-                match tab {
-                    Some(tab) => {
-                        if tab < self.tabs.len() {
-                            self.active_tab = tab;
-                            self.restart();
-                        }
-                    }
-                    None if c.is_control() => {}
-                    None => {
-                        self.filter.push(c);
-                        self.restart();
-                    }
-                }
+            TextEdit::Insert(c) if !c.is_control() => {
+                self.filter.push(c);
+                self.restart();
             }
             TextEdit::Backspace => {
                 if self.filter.pop().is_some() {
@@ -978,7 +964,8 @@ impl PickerList {
                 self.restart();
             }
             // The filter is edited at its end only.
-            TextEdit::DeleteForward
+            TextEdit::Insert(_)
+            | TextEdit::DeleteForward
             | TextEdit::Left
             | TextEdit::Right
             | TextEdit::Home
@@ -1712,7 +1699,21 @@ impl App {
         let Some(list) = self.dialog.picker.as_mut() else {
             return Vec::new();
         };
+        let action = match action {
+            Action::Text(TextEdit::Insert(c))
+                if list.filter.is_empty() && !list.tabs.is_empty() && matches!(c, '1'..='9') =>
+            {
+                Action::PickerSelectTab(c as usize - '1' as usize)
+            }
+            action => action,
+        };
         match action {
+            Action::PickerSelectTab(index) => {
+                if index < list.tabs.len() {
+                    list.active_tab = index;
+                    list.restart();
+                }
+            }
             Action::Text(edit) => list.edit_filter(edit),
             Action::Paste(text) => {
                 let clean: String = text.chars().filter(|c| !c.is_control()).collect();
@@ -3342,6 +3343,46 @@ mod tests {
     }
 
     #[test]
+    fn tab_selection_matches_digits_and_keeps_filters() {
+        let mut app = two_local();
+        let items: Vec<_> = (0..30)
+            .map(|index| host_item(&format!("web{index}"), "", 1))
+            .chain([host_item("db", "", 2)])
+            .collect();
+        for action in [
+            Action::Text(TextEdit::Insert('2')),
+            Action::PickerSelectTab(1),
+        ] {
+            host_picker(&mut app, items.clone(), &["All", "prod", "Other"]);
+            act(&mut app, Action::MoveCursor(CursorMove::End));
+            assert!(app.dialog.picker.as_ref().unwrap().first_visible > 0);
+            assert!(act(&mut app, action).is_empty());
+            let list = app.dialog.picker.as_ref().unwrap();
+            assert_eq!(list.active_tab, 1);
+            assert_eq!((list.cursor, list.first_visible), (0, 0));
+            assert_eq!(labels(&app).len(), 30);
+        }
+        typing(&mut app, "web");
+        act(&mut app, Action::MoveCursor(CursorMove::End));
+        act(&mut app, Action::PickerSelectTab(2));
+        let list = app.dialog.picker.as_ref().unwrap();
+        assert_eq!(list.filter, "web");
+        assert_eq!((list.cursor, list.first_visible), (0, 0));
+        assert!(labels(&app).is_empty());
+        act(&mut app, Action::PickerSelectTab(1));
+        assert_eq!(labels(&app).len(), 30);
+        act(&mut app, Action::PickerSelectTab(usize::MAX));
+        assert_eq!(app.dialog.picker.as_ref().unwrap().active_tab, 1);
+        assert!(app.dialog.answer.is_none());
+
+        // Mouse selection also reaches tabs without digit shortcuts.
+        host_picker(&mut app, vec![host_item("web", "", 9)], &["group"; 10]);
+        act(&mut app, Action::PickerSelectTab(9));
+        assert_eq!(app.dialog.picker.as_ref().unwrap().active_tab, 9);
+        assert_eq!(labels(&app), ["web"]);
+    }
+
+    #[test]
     fn without_tabs_digits_are_filter_text() {
         let mut app = two_local();
         host_picker(
@@ -3477,7 +3518,7 @@ mod tests {
                 // Render draws the picker above the button bar.
                 let screen = Rect::new(0, 0, width, height - 1);
                 let mut buf = Buffer::empty(screen);
-                let hit = picker::render(&view, screen, &mut buf);
+                let (hit, _) = picker::render(&view, screen, &mut buf);
                 assert_eq!(hit.row_count, page, "{width}x{height} tabs {tabs:?}");
             }
         }
