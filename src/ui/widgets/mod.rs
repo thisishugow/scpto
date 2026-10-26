@@ -6,6 +6,7 @@ pub mod drag_label;
 pub mod format;
 pub mod help;
 pub mod menu;
+pub(crate) mod overlay;
 pub mod pane;
 pub mod picker;
 pub mod preview;

@@ -9,7 +9,7 @@
 //!
 //! [`run`] is a single actor that owns the authoritative queue. Every piece
 //! of I/O (expansion, one item, a tar stream, a source-directory removal,
-//! discarding a partial) runs in its own task, fetches its handles from
+//! directory metadata, discarding a partial) runs in its own task, fetches its handles from
 //! `Connections::fs` on `FsChannel::Transfer` when it starts, and reports
 //! back to the actor, which alone changes item states and emits
 //! `TransferEvent`s. The actor counts running per-file items itself
@@ -43,6 +43,10 @@
 //!   their parent directory item is `Done`; when a directory item fails or
 //!   is canceled, its waiting descendants get the same outcome, and
 //!   retrying either one re-queues the other.
+//!   Once all items settle, known directory mtimes are restored deepest
+//!   first, before `JobFinished`. Metadata failures set item warnings;
+//!   retries repeat this pass after their new writes finish. Tar streams
+//!   preserve directory mtimes and report metadata warnings independently.
 //! - Per-file items wait for a `concurrency` slot; conflicts use the
 //!   destination's actual `lstat` (the object that would be replaced;
 //!   handles case-insensitive APFS), then NFC-normalized names from one
@@ -171,7 +175,8 @@ impl EngineConfig {
 /// `transfer::tar::upload` and `transfer::tar::download`, whose signatures
 /// these methods mirror.
 pub trait TarTransfer: Send + Sync {
-    /// Packs `sources` (absolute local paths) into remote `remote_dir`.
+    /// Packs `sources` into `remote_dir`, returning non-fatal timestamp
+    /// warnings paired with their destination paths.
     fn upload<'a>(
         &'a self,
         connections: &'a dyn Connections,
@@ -179,9 +184,10 @@ pub trait TarTransfer: Send + Sync {
         remote: &'a Endpoint,
         remote_dir: &'a Path,
         progress: &'a (dyn Fn(u64) + Send + Sync),
-    ) -> BoxFuture<'a, Result<(), Error>>;
+    ) -> BoxFuture<'a, Result<Vec<(PathBuf, Error)>, Error>>;
 
-    /// Unpacks `names` (entries of remote `remote_dir`) into `local_dir`.
+    /// Unpacks `names` into `local_dir`, returning non-fatal directory
+    /// timestamp warnings paired with their destination paths.
     fn download<'a>(
         &'a self,
         connections: &'a dyn Connections,
@@ -190,7 +196,7 @@ pub trait TarTransfer: Send + Sync {
         names: &'a [OsString],
         local_dir: &'a Path,
         progress: &'a (dyn Fn(u64) + Send + Sync),
-    ) -> BoxFuture<'a, Result<(), Error>>;
+    ) -> BoxFuture<'a, Result<Vec<(PathBuf, Error)>, Error>>;
 }
 
 /// Runs the engine until `commands` is closed (or `events` has no receiver)
@@ -320,6 +326,14 @@ enum TarTargets {
 /// Messages from tasks to the actor.
 #[derive(Debug)]
 enum Report {
+    DirectoryTimesRestored {
+        job: JobId,
+        warnings: Vec<(ItemId, Error)>,
+    },
+    TarWarnings {
+        job: JobId,
+        warnings: Vec<(PathBuf, Error)>,
+    },
     Expanded {
         job: JobId,
         result: Result<Expansion, Error>,
@@ -452,6 +466,8 @@ struct Job {
     /// Job-level tasks in flight (directory removals, discards).
     pending: usize,
     finished_reported: bool,
+    /// Cleared when a retry can change the destination tree again.
+    directory_times_restored: bool,
     names: Arc<NameIndex>,
     tar_control: Option<watch::Sender<Control>>,
     tar_cancel_requested: bool,
@@ -472,6 +488,8 @@ struct Slot {
     incomplete_children: usize,
     /// Move jobs: this item's source is gone.
     source_gone: bool,
+    /// Destination creation succeeded, even if later source cleanup failed.
+    directory_created: bool,
     discarding: bool,
 }
 
@@ -616,6 +634,7 @@ impl Engine {
             arrival: Control::Run,
             pending: 0,
             finished_reported: false,
+            directory_times_restored: false,
             names: Arc::default(),
             tar_control: None,
             tar_cancel_requested: false,
@@ -692,10 +711,19 @@ impl Engine {
 
     /// Marks an item `Queued` and offers it to the scheduler.
     async fn queue(&mut self, id: ItemId) -> Result<(), Closed> {
+        if self
+            .slots
+            .get(&id)
+            .is_some_and(|slot| slot.item.warning.is_some())
+            && !self.jobs[&self.slots[&id].item.job].tar_streamed
+        {
+            self.set_warning(id, None).await?;
+        }
         self.set_state(id, ItemState::Queued).await?;
         self.ready.push_back(id);
         if let Some(job) = self.job_of(id).and_then(|job| self.jobs.get_mut(&job)) {
             job.finished_reported = false;
+            job.directory_times_restored = false;
         }
         Ok(())
     }
@@ -964,6 +992,34 @@ impl Engine {
 
     async fn handle_report(&mut self, message: Report) -> Result<(), Closed> {
         match message {
+            Report::DirectoryTimesRestored { job, warnings } => {
+                self.jobs.get_mut(&job).expect("pending job exists").pending -= 1;
+                for (item, error) in warnings {
+                    self.set_warning(item, Some(error)).await?;
+                }
+                self.check_finished(job).await
+            }
+            Report::TarWarnings { job, warnings } => {
+                for (path, error) in warnings {
+                    // A source directory can gain entries after expansion.
+                    // Their warnings belong to its closest tracked ancestor.
+                    let item = self.jobs[&job]
+                        .items
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            let item = &self.slots[id].item;
+                            item.destination == path
+                                || (item.kind == ItemKind::Dir
+                                    && path.starts_with(&item.destination))
+                        })
+                        .max_by_key(|id| self.slots[id].item.destination.components().count());
+                    if let Some(item) = item {
+                        self.set_warning(item, Some(error)).await?;
+                    }
+                }
+                Ok(())
+            }
             Report::Expanded { job, result } => self.expanded(job, result).await,
             Report::Progress { item, bytes } => {
                 if matches!(self.state(item), Some(ItemState::Running { .. })) {
@@ -1055,6 +1111,7 @@ impl Engine {
                 mtime: found.mtime,
                 mode: found.mode,
                 state,
+                warning: None,
             };
             let parent = found.parent.map(|parent| ids[parent]);
             if let Some(parent) = parent {
@@ -1076,6 +1133,7 @@ impl Engine {
                     stop_request: None,
                     incomplete_children: 0,
                     source_gone: false,
+                    directory_created: false,
                     discarding: false,
                 },
             );
@@ -1120,6 +1178,9 @@ impl Engine {
         let job_id = slot.item.job;
         match outcome {
             Outcome::Done => {
+                if slot.item.kind == ItemKind::Dir {
+                    slot.directory_created = true;
+                }
                 self.set_state(id, ItemState::Done).await?;
                 self.item_done(id).await?;
             }
@@ -1288,6 +1349,10 @@ impl Engine {
                 _ => return Ok(()),
             }
         }
+        if job.tar.is_none() && !job.directory_times_restored {
+            self.restore_directory_times(job_id).await?;
+            return Ok(());
+        }
         self.jobs
             .get_mut(&job_id)
             .expect("checked above")
@@ -1297,6 +1362,66 @@ impl Engine {
             summary,
         })
         .await
+    }
+
+    async fn set_warning(&mut self, item: ItemId, warning: Option<Error>) -> Result<(), Closed> {
+        self.slots.get_mut(&item).expect("item exists").item.warning = warning.clone();
+        self.emit(TransferEvent::ItemWarning { item, warning })
+            .await
+    }
+
+    /// Restores directory timestamps only after all writes have settled.
+    /// Expansion captured the timestamps before a move could delete sources.
+    async fn restore_directory_times(&mut self, job_id: JobId) -> Result<(), Closed> {
+        let job = self.jobs.get_mut(&job_id).expect("job exists");
+        job.directory_times_restored = true;
+        job.pending += 1;
+        let endpoint = job.destination.clone();
+        let mut directories: Vec<(ItemId, PathBuf, i64)> = job
+            .items
+            .iter()
+            .map(|id| &self.slots[id])
+            .filter(|slot| slot.directory_created)
+            .map(|slot| &slot.item)
+            .filter_map(|item| {
+                item.mtime
+                    .map(|mtime| (item.id, item.destination.clone(), mtime))
+            })
+            .collect();
+        directories.sort_by_key(|(_, path, _)| std::cmp::Reverse(path.components().count()));
+        for (id, _, _) in &directories {
+            if self.slots[id].item.warning.is_some() {
+                self.set_warning(*id, None).await?;
+            }
+        }
+        let shared = self.shared.clone();
+        self.tasks.spawn(async move {
+            let mut warnings: Vec<(ItemId, Error)> = Vec::new();
+            if !directories.is_empty() {
+                match shared.connections.fs(&endpoint, FsChannel::Transfer).await {
+                    Ok(fs) => {
+                        for (id, path, mtime) in directories {
+                            if let Err(error) = fs.set_times(&path, mtime, mtime).await {
+                                warnings.push((id, error.into()));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for (id, _, _) in directories {
+                            warnings.push((id, error.clone()));
+                        }
+                    }
+                }
+            }
+            report(
+                &shared.reports,
+                Report::DirectoryTimesRestored {
+                    job: job_id,
+                    warnings,
+                },
+            );
+        });
+        Ok(())
     }
 
     // ----- per-file scheduling -----
@@ -1815,7 +1940,7 @@ impl TarPlan {
             }
         };
         let connections = &*shared.connections;
-        match &self.targets {
+        let warnings = match &self.targets {
             TarTargets::Upload {
                 remote,
                 sources,
@@ -1837,7 +1962,9 @@ impl TarPlan {
                     .download(connections, remote, remote_dir, names, directory, &progress)
                     .await
             }
-        }
+        }?;
+        report(&shared.reports, Report::TarWarnings { job, warnings });
+        Ok(())
     }
 }
 
@@ -2389,6 +2516,7 @@ mod tests {
         calls: Mutex<Vec<String>>,
         failure: Mutex<Option<Error>>,
         gate: Mutex<Option<Arc<Semaphore>>>,
+        warnings: Mutex<Vec<(PathBuf, Error)>>,
     }
 
     impl MockTar {
@@ -2417,13 +2545,14 @@ mod tests {
             remote: &'a Endpoint,
             remote_dir: &'a Path,
             progress: &'a (dyn Fn(u64) + Send + Sync),
-        ) -> BoxFuture<'a, Result<(), Error>> {
+        ) -> BoxFuture<'a, Result<Vec<(PathBuf, Error)>, Error>> {
             Box::pin(async move {
                 self.calls.lock().expect("lock").push(format!(
                     "upload {sources:?} to {remote}:{}",
                     remote_dir.display()
                 ));
-                self.finish(progress).await
+                self.finish(progress).await?;
+                Ok(std::mem::take(&mut *self.warnings.lock().expect("lock")))
             })
         }
 
@@ -2435,14 +2564,15 @@ mod tests {
             names: &'a [OsString],
             local_dir: &'a Path,
             progress: &'a (dyn Fn(u64) + Send + Sync),
-        ) -> BoxFuture<'a, Result<(), Error>> {
+        ) -> BoxFuture<'a, Result<Vec<(PathBuf, Error)>, Error>> {
             Box::pin(async move {
                 self.calls.lock().expect("lock").push(format!(
                     "download {names:?} from {remote}:{} to {}",
                     remote_dir.display(),
                     local_dir.display()
                 ));
-                self.finish(progress).await
+                self.finish(progress).await?;
+                Ok(std::mem::take(&mut *self.warnings.lock().expect("lock")))
             })
         }
     }
@@ -2453,6 +2583,7 @@ mod tests {
         seen: Vec<TransferEvent>,
         local: Arc<MemFs>,
         web: Arc<MemFs>,
+        sudo: Arc<MemFs>,
         partials: Arc<MemPartials>,
         tar: Arc<MockTar>,
         engine: JoinHandle<()>,
@@ -2494,7 +2625,7 @@ mod tests {
             fs: HashMap::from([
                 (Endpoint::Local, local.clone()),
                 (web(), web_fs.clone()),
-                (web_sudo(), sudo_fs),
+                (web_sudo(), sudo_fs.clone()),
             ]),
             tools: setup.tools,
         });
@@ -2516,6 +2647,7 @@ mod tests {
             seen: Vec::new(),
             local,
             web: web_fs,
+            sudo: sudo_fs,
             partials,
             tar,
             engine,
@@ -2756,6 +2888,148 @@ mod tests {
         assert!(is_newer(Some(12), Some(9), 2));
         assert!(!is_newer(None, Some(9), 0));
         assert!(!is_newer(Some(9), None, 0));
+    }
+
+    #[tokio::test]
+    async fn directory_mtimes_are_restored_deepest_first_after_every_file_in_each_direction() {
+        for direction in 0..3 {
+            let mut h = start(Setup::default());
+            let (source, destination) = match direction {
+                0 => (h.local.clone(), h.web.clone()),
+                1 => (h.web.clone(), h.local.clone()),
+                _ => (h.web.clone(), h.sudo.clone()),
+            };
+            source.add_dir("/tree");
+            source.add_dir("/tree/nested");
+            source.add_file("/tree/nested/file", b"contents", 300, 0o600);
+            source
+                .set_times(Path::new("/tree"), 100, 100)
+                .await
+                .expect("source time");
+            source
+                .set_times(Path::new("/tree/nested"), 200, 200)
+                .await
+                .expect("source time");
+            h.submit(
+                1,
+                JobKind::Copy,
+                source.endpoint().clone(),
+                destination.endpoint().clone(),
+                into_dir(&["/tree"], "/"),
+                None,
+            );
+            assert_eq!(h.finished(1).await, summary(3, 0, 0));
+            assert_eq!(destination.meta("/tree").expect("root").mtime, 100);
+            assert_eq!(destination.meta("/tree/nested").expect("nested").mtime, 200);
+            let calls = destination.calls();
+            let times: Vec<_> = calls
+                .iter()
+                .filter(|(op, _)| *op == Op::SetTimes)
+                .map(|(_, path)| path.clone())
+                .collect();
+            assert_eq!(
+                times,
+                ["/tree/nested/file", "/tree/nested", "/tree"].map(PathBuf::from)
+            );
+            let last_write = calls
+                .iter()
+                .rposition(|(op, _)| matches!(op, Op::Rename | Op::Mkdir | Op::OpenWrite))
+                .expect("write");
+            let first_directory_time = calls
+                .iter()
+                .position(|(op, path)| *op == Op::SetTimes && path == Path::new("/tree/nested"))
+                .expect("directory time");
+            assert!(last_write < first_directory_time);
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_mtime_failure_warns_after_a_failed_child_and_retry_clears_it() {
+        let mut h = start(Setup::default());
+        h.local.add_dir("/tree");
+        h.local.add_file("/tree/file", b"data", 300, 0o600);
+        h.local
+            .set_times(Path::new("/tree"), 100, 100)
+            .await
+            .expect("source time");
+        h.local.fail(
+            Op::OpenRead,
+            "/tree/file",
+            FsError::PermissionDenied {
+                path: "/tree/file".into(),
+            },
+            true,
+        );
+        let warning = FsError::PermissionDenied {
+            path: "/tree".into(),
+        };
+        h.web.fail(Op::SetTimes, "/tree", warning.clone(), true);
+        h.copy_up(1, &["/tree"], "/");
+        assert_eq!(h.finished(1).await, summary(1, 0, 1));
+        let root = h.item("/tree").id;
+        assert!(h.seen.iter().any(|event| matches!(event, TransferEvent::ItemWarning { item, warning: Some(Error::Fs(error)) } if *item == root && *error == warning)));
+        assert_eq!(h.states()[Path::new("/tree")], ItemState::Done);
+        h.send(TransferCommand::Retry(QueueTarget::Job(JobId(1))));
+        assert_eq!(h.finished(1).await, summary(2, 0, 0));
+        assert_eq!(h.web.meta("/tree").expect("root").mtime, 100);
+        assert!(matches!(
+            h.seen.iter().rev().find(
+                |event| matches!(event, TransferEvent::ItemWarning { item, .. } if *item == root)
+            ),
+            Some(TransferEvent::ItemWarning { warning: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn directory_mtimes_survive_source_deletion_and_cleanup_failure_on_moves() {
+        for cleanup_fails in [false, true] {
+            let mut h = start(Setup::default());
+            h.local.add_dir("/tree");
+            h.local.add_dir("/tree/empty");
+            h.local.add_file("/tree/file", b"data", 300, 0o600);
+            h.local
+                .set_times(Path::new("/tree"), 100, 100)
+                .await
+                .expect("source time");
+            h.local
+                .set_times(Path::new("/tree/empty"), 200, 200)
+                .await
+                .expect("source time");
+            if cleanup_fails {
+                h.local.fail(
+                    Op::RemoveDir,
+                    "/tree",
+                    FsError::PermissionDenied {
+                        path: "/tree".into(),
+                    },
+                    false,
+                );
+            }
+            h.submit(
+                1,
+                JobKind::Move,
+                Endpoint::Local,
+                web(),
+                into_dir(&["/tree"], "/"),
+                None,
+            );
+            assert_eq!(
+                h.finished(1).await,
+                if cleanup_fails {
+                    summary(2, 0, 1)
+                } else {
+                    summary(3, 0, 0)
+                }
+            );
+            assert_eq!(h.local.exists("/tree"), cleanup_fails);
+            assert!(!h.local.exists("/tree/empty"));
+            assert!(!h.local.exists("/tree/file"));
+            assert_eq!(h.web.meta("/tree").expect("root").mtime, 100);
+            assert_eq!(
+                h.web.meta("/tree/empty").expect("empty directory").mtime,
+                200
+            );
+        }
     }
 
     #[tokio::test]
@@ -3350,6 +3624,51 @@ mod tests {
         assert_eq!(h.finished(1).await, summary(3, 0, 0));
         assert_eq!(h.mode(1), TransferMode::Tar);
         assert_eq!(h.tar.calls(), vec![r#"upload ["/src"] to web:/dst"#]);
+    }
+
+    #[tokio::test]
+    async fn tar_directory_warning_reaches_its_item_without_failing_or_restoring_twice() {
+        for upload in [false, true] {
+            let mut h = start(tar_setup());
+            let (source, destination) = if upload {
+                (h.local.clone(), h.web.clone())
+            } else {
+                (h.web.clone(), h.local.clone())
+            };
+            add_two_files(&source, "/tree");
+            let warnings: Vec<(PathBuf, Error)> = ["/tree", "/tree/added-after-expansion"]
+                .into_iter()
+                .map(|path| {
+                    (
+                        path.into(),
+                        FsError::PermissionDenied { path: path.into() }.into(),
+                    )
+                })
+                .collect();
+            *h.tar.warnings.lock().expect("lock") = warnings.clone();
+            h.submit(
+                1,
+                JobKind::Copy,
+                source.endpoint().clone(),
+                destination.endpoint().clone(),
+                into_dir(&["/tree"], "/"),
+                None,
+            );
+            assert_eq!(h.finished(1).await, summary(3, 0, 0));
+            let root = h.item("/tree").id;
+            assert_eq!(h.mode(1), TransferMode::Tar);
+            for (_, warning) in warnings {
+                assert!(h.seen.contains(&TransferEvent::ItemWarning {
+                    item: root,
+                    warning: Some(warning)
+                }));
+            }
+            assert_eq!(h.states()[Path::new("/tree")], ItemState::Done);
+            assert!(!destination
+                .calls()
+                .iter()
+                .any(|(op, _)| *op == Op::SetTimes));
+        }
     }
 
     #[tokio::test]

@@ -52,7 +52,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Padding, Widget};
+use ratatui::widgets::{Block, Padding, Widget};
 
 use crate::ui::action::DialogButton;
 use crate::ui::hit::DialogHit;
@@ -160,7 +160,7 @@ pub fn render(
         Constraint::Length(height),
     );
 
-    Clear.render(area, buf);
+    crate::ui::widgets::overlay::clear(area, buf);
     let block = Block::bordered()
         .title(format!(" {} ", view.title))
         .padding(Padding::horizontal(1));

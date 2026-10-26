@@ -42,7 +42,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Widget};
+use ratatui::widgets::{Block, Widget};
 
 use crate::ui::hit::ListHit;
 
@@ -98,7 +98,7 @@ pub fn render(view: &PickerView<'_>, screen: Rect, buf: &mut Buffer) -> ListHit 
         .min(chrome + MAX_LIST_ROWS);
     let area = screen.centered(Constraint::Length(width), Constraint::Length(height));
 
-    Clear.render(area, buf);
+    crate::ui::widgets::overlay::clear(area, buf);
     let block = Block::bordered()
         .title(format!(" {} ", view.title))
         .title_bottom(Line::raw(format!(" {} ", count_label(view.rows.len()))).right_aligned());

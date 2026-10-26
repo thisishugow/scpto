@@ -431,7 +431,7 @@ impl App {
         );
         self.core
             .set_status(StatusMessage::info(format!("Started {label}")));
-        self.transfer.jobs.push(QueueJob {
+        self.transfer_add_job(QueueJob {
             id: job,
             kind: JobKind::Copy,
             mode: None,

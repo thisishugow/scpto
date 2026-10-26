@@ -57,7 +57,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -186,7 +185,7 @@ pub async fn resolve(client: &SshClient, alias: &str) -> Result<ResolvedHost, Er
     if !output.status.success() {
         return Err(Error::CommandFailed {
             program: RESOLVE_PROGRAM.to_owned(),
-            status: exit_status(output.status),
+            status: output.status.into(),
             stderr: stderr_tail(&output.stderr),
         });
     }
@@ -348,15 +347,6 @@ fn split_keyword(line: &str) -> (&str, &str) {
     let (keyword, rest) = line.split_at(end);
     let rest = rest.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
     (keyword, rest.strip_prefix('=').unwrap_or(rest))
-}
-
-/// Maps a finished process's status. On Unix a process that has no exit
-/// code was terminated by a signal.
-fn exit_status(status: std::process::ExitStatus) -> ExitStatus {
-    match status.code() {
-        Some(code) => ExitStatus::Code(code),
-        None => ExitStatus::Signal(libc::WTERMSIG(status.into_raw())),
-    }
 }
 
 /// The last [`STDERR_TAIL_LINES`] non-empty lines of `stderr`.
@@ -790,17 +780,26 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn signal_deaths_are_reported_as_signals() {
-        let status = std::process::Command::new("/bin/sh")
-            .args(["-c", "kill -9 $$"])
-            .status()
-            .unwrap();
-        assert_eq!(exit_status(status), ExitStatus::Signal(9));
-        let status = std::process::Command::new("/bin/sh")
-            .args(["-c", "exit 3"])
-            .status()
-            .unwrap();
-        assert_eq!(exit_status(status), ExitStatus::Code(3));
+    #[tokio::test]
+    async fn resolve_reports_exit_codes_and_signal_deaths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("exit-status");
+        for (script, expected) in [
+            ("#!/bin/sh\nkill -9 $$\n", ExitStatus::Signal(9)),
+            ("#!/bin/sh\nexit 3\n", ExitStatus::Code(3)),
+        ] {
+            write(&program, script);
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            let client = SshClient {
+                program: program.clone(),
+                config_file: None,
+            };
+            assert!(matches!(
+                resolve(&client, "box").await.unwrap_err(),
+                Error::CommandFailed { status, .. } if status == expected
+            ));
+        }
     }
 }

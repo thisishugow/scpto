@@ -122,6 +122,8 @@ pub struct Item {
     pub mode: Option<u32>,
     /// Current state.
     pub state: ItemState,
+    /// A non-fatal metadata warning; transferred data remains successful.
+    pub warning: Option<Error>,
 }
 
 /// Why an item was skipped.
@@ -337,6 +339,13 @@ pub enum TransferEvent {
         item: ItemId,
         /// The new state.
         state: ItemState,
+    },
+    /// An item's non-fatal metadata warning changed independently of its state.
+    ItemWarning {
+        /// The item.
+        item: ItemId,
+        /// The warning, or `None` after a retry clears it.
+        warning: Option<Error>,
     },
     /// An item's destination path changed (Rename choice).
     ItemRenamed {

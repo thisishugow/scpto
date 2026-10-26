@@ -466,6 +466,7 @@ fn browse_key(key: Key) -> Option<Action> {
         Key::Named(KeyCode::Backspace | KeyCode::Left) | Key::Char('h') => Action::Parent,
         Key::Named(KeyCode::Insert) | Key::Char(' ') => Action::ToggleSelect,
         Key::Ctrl('a') => Action::SelectAll,
+        Key::Ctrl('r') => Action::Refresh,
         Key::Char('*') => Action::InvertSelection,
         Key::Char('c') => Action::Copy,
         Key::Char('m') => Action::Move,
@@ -528,6 +529,7 @@ fn picker_key(key: Key) -> Option<Action> {
 fn dialog_key(key: Key) -> Option<Action> {
     Some(match key {
         Key::Named(KeyCode::Enter) => Action::Confirm,
+        Key::Ctrl('r') => Action::Refresh,
         Key::Named(KeyCode::Esc) | Key::Ctrl('c') => Action::Cancel,
         Key::Named(KeyCode::Tab | KeyCode::Right | KeyCode::Down) => {
             Action::DialogFocus(FocusStep::Next)
@@ -717,6 +719,13 @@ mod tests {
             modifiers: ClickModifiers::default(),
             at,
         })
+    }
+
+    #[test]
+    fn refresh_is_available_in_browse_and_menus_but_not_queue() {
+        assert_eq!(map(InputMode::Browse, ctrl('r')), Some(Action::Refresh));
+        assert_eq!(map(InputMode::Dialog, ctrl('r')), Some(Action::Refresh));
+        assert_eq!(map(InputMode::Queue, ctrl('r')), None);
     }
 
     #[test]

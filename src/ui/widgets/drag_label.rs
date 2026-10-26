@@ -59,6 +59,7 @@ pub fn render(view: &DragLabelView, screen: Rect, buf: &mut Buffer) {
     } else {
         row + 1
     };
+    crate::ui::widgets::overlay::clear(Rect::new(x, y, width, 1), buf);
     buf.set_stringn(x, y, &label, usize::from(width), LABEL);
 }
 

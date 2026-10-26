@@ -312,6 +312,8 @@ pub enum Action {
     Open,
     /// Backspace / Left / h: go to the parent directory.
     Parent,
+    /// Ctrl+R: refresh the focused pane, keeping surviving cursor and selections.
+    Refresh,
     /// Space / Insert: toggle selection (or a sync entry) and move down.
     ToggleSelect,
     /// Ctrl+A: select all.
@@ -768,6 +770,15 @@ pub enum BgEvent {
     // Transfers and sync.
     /// An engine event.
     Transfer(TransferEvent),
+    /// The engine command channel accepted or rejected a submitted job.
+    TransferSubmitted {
+        /// The submitted job.
+        job: JobId,
+        /// Whether the command reached the engine channel.
+        result: Result<(), FsError>,
+    },
+    /// A queue control could not reach the stopped transfer engine.
+    TransferCommandFailed(FsError),
     /// A comparison finished.
     Compared {
         /// Correlation id.

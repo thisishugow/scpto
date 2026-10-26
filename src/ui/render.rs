@@ -34,11 +34,11 @@
 //!
 //! - browse and filter: `c` Copy, `m` Move, `n` Mkdir, `d` Delete, `r`
 //!   Rename, `v` Preview, `i` Quick view (highlighted while on), `s` Sort,
-//!   `o` Host, `=` Compare, `Q` Queue, `?` Help, `q` Quit; while typing a
+//!   `o` Host, `=` Compare, `Q` Queue, `?` Help, `q` Quit, Ctrl+R Refresh; while typing a
 //!   filter, Enter Keep and Esc Clear come first;
 //! - dialog: Enter OK, Tab Next, Esc Cancel; menu: Enter Run, Esc Close;
 //! - picker: Enter Pick, Esc Close, and Del Remove in the bookmark list;
-//! - viewer: PgUp, PgDn, `m` Markdown (preview only), Esc Close;
+//! - viewer: PgUp, PgDn, `m` Markdown (Markdown text only), Esc Close;
 //! - queue: Space Pause, `c` Cancel, `r` Retry, `d` Discard, `R` Retry
 //!   failed, `C` Clear done, Tab Leave, `Q` Hide;
 //! - comparison view: Space Select, `>` Copy right, `<` Copy left, `?`
@@ -380,6 +380,7 @@ fn bar_buttons(app: &App) -> Vec<BarButton<'static>> {
                 button("Q", "Queue", Action::ToggleQueue, 13),
                 button("?", "Help", Action::Help, 4),
                 button("q", "Quit", Action::Quit, 6),
+                button("^R", "Refresh", Action::Refresh, u8::MAX),
             ]);
             buttons
         }
@@ -412,7 +413,20 @@ fn bar_buttons(app: &App) -> Vec<BarButton<'static>> {
                 button("PgUp", "Up", Action::MoveCursor(CursorMove::PageUp), 1),
                 button("PgDn", "Down", Action::MoveCursor(CursorMove::PageDown), 1),
             ];
-            if app.preview.help.is_none() {
+            if app.preview.help.is_none()
+                && app.preview.full.as_ref().is_some_and(|viewer| {
+                    matches!(
+                        viewer.content,
+                        crate::ui::app::preview::ViewerContent::Text { .. }
+                    ) && crate::preview::is_markdown(
+                        viewer
+                            .location
+                            .path
+                            .file_name()
+                            .unwrap_or(viewer.location.path.as_os_str()),
+                    )
+                })
+            {
                 buttons.push(button("m", "Markdown", Action::ToggleMarkdown, 2));
             }
             buttons.push(button("Esc", "Close", Action::Cancel, 0));
@@ -527,6 +541,207 @@ mod tests {
     }
 
     #[test]
+    fn popups_clear_wide_glyphs_straddling_their_left_edges() {
+        let screen = Rect::new(0, 0, 100, 30);
+        let popup_renderers: [fn(Rect, &mut Buffer) -> Rect; 4] = [
+            |screen, buf| {
+                menu::render(
+                    &menu::MenuView {
+                        title: "Menu",
+                        items: &[menu::MenuItemView {
+                            key: "v",
+                            label: "Preview",
+                            checked: None,
+                        }],
+                        cursor: 0,
+                        anchor: (11, 4),
+                    },
+                    screen,
+                    buf,
+                )
+                .area
+            },
+            |screen, buf| {
+                dialog::render(
+                    &dialog::DialogView {
+                        title: "Dialog",
+                        message: "A message",
+                        field: None,
+                        checkbox: None,
+                        buttons: &[],
+                    },
+                    screen,
+                    buf,
+                )
+                .0
+                .area
+            },
+            |screen, buf| {
+                picker::render(
+                    &picker::PickerView {
+                        title: "Picker",
+                        filter: "",
+                        tabs: &[],
+                        active_tab: 0,
+                        rows: &[],
+                        cursor: 0,
+                        first_visible: 0,
+                    },
+                    screen,
+                    buf,
+                )
+                .area
+            },
+            |screen, buf| {
+                drag_label::render(
+                    &drag_label::DragLabelView {
+                        count: 1,
+                        column: 10,
+                        row: 4,
+                    },
+                    screen,
+                    buf,
+                );
+                Rect::new(11, 4, 10, 1)
+            },
+        ];
+        for draw in popup_renderers {
+            let mut buf = Buffer::empty(screen);
+            let area = draw(screen, &mut buf);
+            let popup = buf.clone();
+            buf.reset();
+            for y in area.top()..area.bottom() {
+                buf.set_string(area.x - 4, y, "a\u{4e2d}\u{6587}", Style::default());
+                // The second glyph straddles the edge; the first stays visible.
+            }
+            let background = buf.clone();
+            draw(screen, &mut buf);
+            for y in area.top()..area.bottom() {
+                assert_eq!(buf[(area.x - 1, y)].symbol(), " ", "{area:?}, row {y}");
+                assert_eq!(buf[(area.x - 3, y)], background[(area.x - 3, y)]);
+                assert_eq!(
+                    buf[(area.x, y)],
+                    popup[(area.x, y)],
+                    "popup left edge at row {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_button_is_available_and_is_dropped_first() {
+        let (mut app, _) = app(Some((Endpoint::Local, Some("/r".into()))));
+        let (wide, text) = render(&mut app, 200, 30);
+        assert!(text
+            .lines()
+            .last()
+            .expect("bar row")
+            .contains("[^R Refresh]"));
+        assert!(wide
+            .bar
+            .iter()
+            .any(|(_, action)| *action == Action::Refresh));
+        let buttons = bar_buttons(&app);
+        let full_width: u16 = buttons
+            .iter()
+            .map(|button| {
+                crate::ui::widgets::text_input::cell_width(button.key)
+                    + crate::ui::widgets::text_input::cell_width(button.label)
+                    + 4
+            })
+            .sum::<u16>()
+            - 1;
+        let (narrow, _) = render(&mut app, full_width - 1, 30);
+        let expected: Vec<_> = wide
+            .bar
+            .iter()
+            .map(|(_, action)| action)
+            .filter(|action| **action != Action::Refresh)
+            .collect();
+        assert_eq!(
+            narrow
+                .bar
+                .iter()
+                .map(|(_, action)| action)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn markdown_button_is_only_available_for_loaded_markdown_text() {
+        use crate::ui::app::preview::{Viewer, ViewerContent};
+        use crate::vfs::Location;
+        let (mut app, _) = app(Some((Endpoint::Local, Some("/r".into()))));
+        let image = ratatui_image::picker::Picker::halfblocks()
+            .new_resize_protocol(image::DynamicImage::new_rgb8(1, 1));
+        let image =
+            ratatui_image::thread::ThreadProtocol::new(app.preview.resize.clone(), Some(image));
+        for (name, content, expected) in [
+            (
+                "readme.md",
+                ViewerContent::Text {
+                    bytes: b"# Heading".to_vec(),
+                    truncated: false,
+                    text: "Heading".into(),
+                },
+                true,
+            ),
+            (
+                "notes.txt",
+                ViewerContent::Text {
+                    bytes: b"notes".to_vec(),
+                    truncated: false,
+                    text: "notes".into(),
+                },
+                false,
+            ),
+            ("photo.png", ViewerContent::Image(image), false),
+            ("readme.md", ViewerContent::Loading, false),
+            (
+                "readme.md",
+                ViewerContent::Failed("read failed".into()),
+                false,
+            ),
+            ("data.md", ViewerContent::Binary(file("data.md", 1)), false),
+        ] {
+            app.preview.full = Some(Viewer {
+                location: Location {
+                    endpoint: Endpoint::Local,
+                    path: name.into(),
+                },
+                content,
+                scroll: 0,
+                rendered: false,
+            });
+            let (hits, text) = render(&mut app, 100, 30);
+            assert_eq!(
+                hits.bar
+                    .iter()
+                    .any(|(_, action)| *action == Action::ToggleMarkdown),
+                expected,
+                "{name}: {text}"
+            );
+            assert_eq!(text.contains("[m Markdown]"), expected, "{name}");
+        }
+        let viewer = app.preview.full.as_mut().expect("viewer");
+        viewer.location.path = "README.MARKDOWN".into();
+        viewer.content = ViewerContent::Text {
+            bytes: b"# Heading".to_vec(),
+            truncated: false,
+            text: "Heading".into(),
+        };
+        viewer.rendered = true;
+        assert!(bar_buttons(&app)
+            .iter()
+            .any(|button| button.action == Action::ToggleMarkdown));
+        app.handle_action(Action::Help);
+        assert!(!bar_buttons(&app)
+            .iter()
+            .any(|button| button.action == Action::ToggleMarkdown));
+    }
+
+    #[test]
     fn both_panes_status_and_selection_are_drawn_and_recorded() {
         let (mut app, effects) = app(Some((Endpoint::Local, Some("/r".into()))));
         deliver(&mut app, &effects[0], vec![file("alpha.txt", 2048)]);
@@ -638,11 +853,11 @@ mod tests {
         assert!(
             last.starts_with(
                 "[c Copy] [m Move] [n Mkdir] [d Delete] [r Rename] [v Preview] \
-                 [i Quick view] [s Sort] [o Host] [= Compare] [Q Queue] [? Help] [q Quit]"
+                 [i Quick view] [s Sort] [o Host] [= Compare] [Q Queue] [? Help] [q Quit] [^R Refresh]"
             ),
             "{last}"
         );
-        assert_eq!(hits.bar.len(), 13);
+        assert_eq!(hits.bar.len(), 14);
         assert!(!text.contains("F5"), "{text}");
         // Narrower terminals keep the most important buttons, then shorten
         // them to their keys.

@@ -190,7 +190,17 @@ impl Syncer {
             &request.comparison,
             &request.paths,
         ));
-        self.settle(job, || forward(&self.engine, submit));
+        self.settle(job, || {
+            if let Err(error) = forward(&self.engine, submit) {
+                report(
+                    &self.events,
+                    BgEvent::SyncFinished {
+                        job,
+                        result: Err(error.into()),
+                    },
+                );
+            }
+        });
     }
 
     /// The remote endpoint when the sync may run via rsync: exactly one side
@@ -275,7 +285,11 @@ impl Syncer {
                 },
             );
         } else {
-            forward(&self.engine, TransferCommand::Cancel(QueueTarget::Job(job)));
+            if let Err(error) =
+                forward(&self.engine, TransferCommand::Cancel(QueueTarget::Job(job)))
+            {
+                report(&self.events, BgEvent::TransferCommandFailed(error));
+            }
         }
     }
 }
