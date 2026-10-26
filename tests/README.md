@@ -44,8 +44,8 @@ SCPTO_IT=1 python3 tests/verify.py
 
 Requires Python 3.8+, tmux, cargo, and ssh on PATH. The driver builds the binary,
 creates its own tmux server, isolates HOME and XDG directories in a temporary
-root, and creates an SSH Include config and wrapper. It never depends on the
-coordinator's scratchpad. The optional VPN command and editor are temporary
+root, and creates an SSH Include config and wrapper. It never touches the
+user's own SSH configuration. The optional VPN command and editor are temporary
 interactive stubs; neither invokes a real VPN or user editor.
 
 The local round verifies navigation, the parent row, sorting by menu/header,

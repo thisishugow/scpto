@@ -27,11 +27,11 @@
 
 Read each affected module's `//!` contract and Public API section before editing. App state emits effects; executors perform I/O; rendering builds the hit map consumed by input.
 
-## Frozen contracts and ownership
+## Shared contracts
 
-Contract changes go through the coordinator. Do not independently change `Cargo.toml`, `src/main.rs`, `src/lib.rs` module declarations, any `mod.rs`, the error enums in `src/error.rs`, the `Fs`/entry/endpoint types in `src/vfs/mod.rs`, `src/transfer/model.rs`, `src/ui/action.rs`, `src/connections.rs`, or the key list in `src/settings.rs`.
+Treat these as shared contracts and change them deliberately, in a focused commit that updates every caller and its tests: `Cargo.toml`, `src/main.rs`, `src/lib.rs` module declarations, any `mod.rs`, the error enums in `src/error.rs`, the `Fs`/entry/endpoint types in `src/vfs/mod.rs`, `src/transfer/model.rs`, `src/ui/action.rs`, `src/connections.rs`, the key list in `src/settings.rs`, the `HitMap`, the `Pane` API, the persisted-state/partials API, and the widget view structs.
 
-The shared `HitMap`, `Pane` API, persisted-state/partials API, and widget view structs are contracts too. Keep feature logic in its existing app/effect/widget files. `startup.rs`, `ui/runtime.rs`, and `ui/render.rs` integration is coordinated. If a task needs a contract change, report the exact need instead of bypassing the contract. Touch only assigned files; preserve others' work. Do not commit, push, merge, create branches, or manage worktrees during coordinator-owned tasks.
+Keep feature logic in its existing app/effect/widget files; `startup.rs`, `ui/runtime.rs`, and `ui/render.rs` only wire features together. Keep changes scoped to the task and preserve unrelated work.
 
 ## Checks
 

@@ -57,7 +57,7 @@ The language scan must exit 1 and the SVG parse must exit 0. Keep the SVG under 
 
 All code, comments, test data, documentation, and commit messages are English. The sole exception is [README.zh-TW.md](README.zh-TW.md), a faithful Traditional Chinese mirror of [README.md](README.md). Express non-ASCII test data with escapes; do not embed literal CJK names in source or fixtures.
 
-Every public item needs a doc comment. Use crossterm only through `ratatui::crossterm`. Prefer existing dependencies and direct implementations; fix root causes without compatibility layers, dead code, duplicated helpers, or swallowed errors. Keep the letter-based interface free of function-key bindings. See [AGENTS.md](AGENTS.md) for the module map, frozen contracts, and security requirements.
+Every public item needs a doc comment. Use crossterm only through `ratatui::crossterm`. Prefer existing dependencies and direct implementations; fix root causes without compatibility layers, dead code, duplicated helpers, or swallowed errors. Keep the letter-based interface free of function-key bindings. See [AGENTS.md](AGENTS.md) for the module map, shared contracts, and security requirements.
 
 Never commit personal SSH configuration, private keys, passwords, tokens, real host inventories, or screenshots containing them. Use fictional hosts and documentation IP ranges. Group rules are data; VPN commands run only after the user chooses Run.
 
@@ -65,6 +65,6 @@ Never commit personal SSH configuration, private keys, passwords, tokens, real h
 
 Use a short, imperative English subject describing the behavior, following the repository's style: `Fix ...`, `Add ...`, or `Document ...`. Keep commits focused; explain the reason and material limitations in the body when needed. Describe validation in the change request and update both READMEs and the changelog when behavior changes.
 
-For agent co-authorship, use `Co-Authored-By: Debussy <debussy@colosscious.com>`; do not use model names. In coordinated tasks, leave changes for the coordinator to commit and respect the assigned file scope.
+For agent co-authorship, use `Co-Authored-By: Debussy <debussy@colosscious.com>`; do not use model names.
 
 Contributions are provided under the project's [MIT license](LICENSE).
