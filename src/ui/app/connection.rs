@@ -120,8 +120,6 @@ use super::dialog::{
 use super::App;
 use crate::error::{ConnectError, Error, SudoError};
 use crate::hosts::ResolvedHost;
-use crate::pattern::Pattern;
-use crate::settings::VpnRule;
 use crate::sudo::PASSWORD_MAX_LEN;
 use crate::transfer::model::TransferCommand;
 use crate::ui::action::{Action, DialogButton, Effect, PaneSide, Secret, TimerId};
@@ -690,7 +688,7 @@ impl App {
             .resolved
             .get(host)
             .map(|resolved| resolved.hostname.as_str());
-        let Some(rule) = vpn_rule(&self.settings.vpn_rules, host, hostname) else {
+        let Some(rule) = self.settings.vpn_rule(host, hostname) else {
             return;
         };
         let command = rule.command.clone();
@@ -817,21 +815,6 @@ fn whole_seconds_up(duration: Duration) -> u64 {
     duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
 }
 
-/// The first `vpn` rule, in file order, whose glob matches the alias or the
-/// resolved hostname, both compared lowercased like sshto (the semantics
-/// documented for `Settings::vpn_rule`).
-fn vpn_rule<'a>(rules: &'a [VpnRule], alias: &str, hostname: Option<&str>) -> Option<&'a VpnRule> {
-    let alias = alias.to_ascii_lowercase();
-    let hostname = hostname.map(str::to_ascii_lowercase);
-    rules.iter().find(|rule| {
-        let pattern = Pattern::new(&rule.pattern.to_ascii_lowercase());
-        pattern.matches(&alias)
-            || hostname
-                .as_deref()
-                .is_some_and(|name| pattern.matches(name))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -841,7 +824,7 @@ mod tests {
     use crate::groups::{self, Groups};
     use crate::hosts::HostList;
     use crate::preview::Background;
-    use crate::settings::Settings;
+    use crate::settings::{Settings, VpnRule};
     use crate::state::PersistedState;
     use crate::transfer::model::{JobId, JobKind, JobSummary};
     use crate::ui::action::BgEvent;
@@ -1695,29 +1678,6 @@ mod tests {
         assert!(app.dialog.stack.is_empty());
         assert!(!app.connection.endpoints.contains_key(&gone));
         assert_eq!(app.connection.countdown, None);
-    }
-
-    #[test]
-    fn vpn_rule_matches_alias_or_hostname_case_insensitively_first_wins() {
-        let rules = vec![
-            VpnRule {
-                pattern: "nadi-*".into(),
-                command: "first".into(),
-                line: 1,
-            },
-            VpnRule {
-                pattern: "*.LAB".into(),
-                command: "second".into(),
-                line: 2,
-            },
-        ];
-        let command = |alias: &str, hostname: Option<&str>| {
-            vpn_rule(&rules, alias, hostname).map(|rule| rule.command.as_str())
-        };
-        assert_eq!(command("NADI-gpu", Some("x.lab")), Some("first"));
-        assert_eq!(command("box", Some("x.Lab")), Some("second"));
-        assert_eq!(command("box", None), None);
-        assert_eq!(command("box", Some("x.example")), None);
     }
 
     #[test]

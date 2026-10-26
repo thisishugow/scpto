@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::ConfigError;
+use crate::pattern::Pattern;
 
 /// Environment variable naming an explicit settings file.
 pub const CONFIG_ENV: &str = "SCPTO_CONFIG";
@@ -186,6 +187,23 @@ pub const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// `ServerAliveCountMax` of master connections (not configurable).
 pub const KEEPALIVE_COUNT_MAX: u32 = 3;
+
+impl Settings {
+    /// The first `vpn` rule, in file order, whose glob matches the alias or,
+    /// when known, the resolved hostname; both are compared lowercased like
+    /// sshto.
+    pub fn vpn_rule(&self, alias: &str, hostname: Option<&str>) -> Option<&VpnRule> {
+        let alias = alias.to_ascii_lowercase();
+        let hostname = hostname.map(str::to_ascii_lowercase);
+        self.vpn_rules.iter().find(|rule| {
+            let pattern = Pattern::new(&rule.pattern.to_ascii_lowercase());
+            pattern.matches(&alias)
+                || hostname
+                    .as_deref()
+                    .is_some_and(|name| pattern.matches(name))
+        })
+    }
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -322,6 +340,34 @@ pub fn load(location: &ConfigPath) -> Result<Settings, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vpn_rule_matches_alias_or_hostname_case_insensitively_first_wins() {
+        let settings = Settings {
+            vpn_rules: vec![
+                VpnRule {
+                    pattern: "nadi-*".into(),
+                    command: "first".into(),
+                    line: 1,
+                },
+                VpnRule {
+                    pattern: "*.LAB".into(),
+                    command: "second".into(),
+                    line: 2,
+                },
+            ],
+            ..Settings::default()
+        };
+        let command = |alias: &str, hostname: Option<&str>| {
+            settings
+                .vpn_rule(alias, hostname)
+                .map(|rule| rule.command.as_str())
+        };
+        assert_eq!(command("NADI-gpu", Some("x.lab")), Some("first"));
+        assert_eq!(command("box", Some("x.Lab")), Some("second"));
+        assert_eq!(command("box", None), None);
+        assert_eq!(command("box", Some("x.example")), None);
+    }
 
     #[test]
     fn defaults_match_the_plan() {

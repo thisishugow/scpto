@@ -1264,8 +1264,8 @@ mod tests {
         // the left.
         app.preview_action(Action::ToggleQuickView)
             .expect("claimed");
-        app.handle_action(Action::SwitchFocus);
-        let effects = app.preview_cursor_moved();
+        // Core runs the quick view follow-up after every browse action.
+        let effects = app.handle_action(Action::SwitchFocus);
         assert!(matches!(effects.last(), Some(Effect::ScheduleTimer { .. })));
         let (side, view) = app.quick_preview_view(&mut title).expect("quick view");
         assert_eq!(side, PaneSide::Left);

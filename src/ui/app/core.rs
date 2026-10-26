@@ -10,8 +10,7 @@
 //! implement features: transfers, dialogs, connections, sync, edit, and
 //! preview handle their own actions and events in their modules, and core
 //! routes to them by input mode and event kind as specified in "Wave 3
-//! routing" below (until that wiring lands, the arms that do not belong to
-//! core return no effects).
+//! routing" below.
 //!
 //! # Behavior
 //!
@@ -43,8 +42,8 @@
 //! Startup: the left pane lists its directory at once (a local path is
 //! always absolute, a remote one waits for `BgEvent::Connected`). When the
 //! right pane is not given it starts as `Local` in the same directory as a
-//! local left pane; opening the host picker on it is the connection
-//! feature's (wired in Wave 3). A pane given without a path opens the
+//! local left pane, and the host picker opens on it (wiring point 1). A pane
+//! given without a path opens the
 //! endpoint's remembered last directory when one exists, else its home
 //! (from `BgEvent::Connected`; a local pane without a path connects `Local`
 //! to learn it). An endpoint is connected once, however many panes show it.
@@ -251,6 +250,7 @@ use std::path::PathBuf;
 
 use ratatui::layout::Rect;
 
+use super::dialog::{Answer, DialogPurpose, PickerKind};
 use super::App;
 use crate::error::FsError;
 use crate::groups::Groups;
@@ -260,8 +260,8 @@ use crate::settings::Settings;
 use crate::state::PersistedState;
 use crate::transfer::model::JobId;
 use crate::ui::action::{
-    Action, BgEvent, ClickModifiers, ClickTarget, Effect, InputMode, PaneSide, RequestId,
-    ScrollRegion, TimerId,
+    Action, BgEvent, ClickModifiers, ClickTarget, DialogButton, Effect, InputMode, PaneSide,
+    RequestId, ScrollRegion, TextEdit, TimerId,
 };
 use crate::ui::pane::Pane;
 use crate::ui::widgets::pane::CHROME_ROWS;
@@ -501,6 +501,7 @@ impl App {
         right: Option<(Endpoint, Option<PathBuf>)>,
     ) -> (App, Vec<Effect>) {
         let (left_endpoint, left_dir) = left;
+        let open_picker = right.is_none();
         let (right_endpoint, right_dir) = right.unwrap_or_else(|| {
             let dir = left_dir.clone().filter(|_| left_endpoint.is_local());
             (Endpoint::Local, dir)
@@ -531,16 +532,33 @@ impl App {
         }
         let mut effects = app.start_pane(PaneSide::Left, left_dir);
         effects.extend(app.start_pane(PaneSide::Right, right_dir));
-        effects.extend(app.hosts.aliases.iter().cloned().map(Effect::ResolveHost));
+        let resolve: Vec<Effect> = app
+            .hosts
+            .aliases
+            .iter()
+            .filter(|alias| !app.groups.is_excluded(alias))
+            .cloned()
+            .map(Effect::ResolveHost)
+            .collect();
+        effects.extend(resolve);
+        if open_picker {
+            effects.extend(app.connection_open_picker(PaneSide::Right));
+        }
         (app, effects)
     }
 
     /// How `ui/input.rs` must interpret the next key.
     pub fn input_mode(&self) -> InputMode {
-        if self.core.filtering {
-            InputMode::Filter
+        if let Some(mode) = self
+            .dialog_input_mode()
+            .or_else(|| self.preview_input_mode())
+            .or_else(|| self.sync_input_mode())
+        {
+            mode
         } else if self.core.queue_focused {
             InputMode::Queue
+        } else if self.core.filtering {
+            InputMode::Filter
         } else {
             InputMode::Browse
         }
@@ -554,60 +572,40 @@ impl App {
             self.core.reclamp_panes();
             return Vec::new();
         }
-        match self.input_mode() {
-            InputMode::Browse => self.browse_action(action),
-            InputMode::Filter => self.filter_action(action),
-            InputMode::Queue => self.queue_action(action),
-            // Modes of dialogs, pickers, viewers, and the comparison view
-            // belong to their features; core never reports them yet.
-            InputMode::TextField
-            | InputMode::Dialog
-            | InputMode::Picker
-            | InputMode::Viewer
-            | InputMode::SyncView => Vec::new(),
-        }
+        let mut effects = match self.input_mode() {
+            InputMode::Browse => {
+                let mut effects = self.browse_chain(action);
+                effects.extend(self.preview_cursor_moved());
+                effects
+            }
+            InputMode::Filter => {
+                let mut effects = self.filter_action(action);
+                effects.extend(self.preview_cursor_moved());
+                effects
+            }
+            InputMode::Queue => self
+                .transfer_action(action)
+                .or_else(|action| self.preview_action(action))
+                .unwrap_or_else(|action| self.queue_action(action)),
+            InputMode::TextField | InputMode::Dialog | InputMode::Picker => {
+                self.dialog_action(action).unwrap_or_default()
+            }
+            InputMode::Viewer => self.preview_action(action).unwrap_or_default(),
+            InputMode::SyncView => self
+                .sync_action(action)
+                .or_else(|action| self.preview_action(action))
+                .unwrap_or_default(),
+        };
+        effects.extend(self.route_answer());
+        self.forget_disconnected(&effects);
+        effects
     }
 
     /// Handles one background result. Pure; returns follow-up effects.
     pub fn handle_event(&mut self, event: BgEvent) -> Vec<Effect> {
-        match event {
-            BgEvent::Listed {
-                request, result, ..
-            } => self.listed(request, result),
-            BgEvent::Connected { endpoint, home } => self.connected(endpoint, home),
-            BgEvent::Reconnected(endpoint) => self.refresh_endpoint(&endpoint),
-            BgEvent::ConnectFailed { endpoint, error } => {
-                self.core.connecting.remove(&endpoint);
-                self.error_status(format!("{endpoint}: {error}"));
-                Vec::new()
-            }
-            BgEvent::Disconnected { endpoint, error } => {
-                self.error_status(format!("Lost connection to {endpoint}: {error}"));
-                Vec::new()
-            }
-            BgEvent::StateWriteFailed(error) => {
-                self.error_status(error);
-                Vec::new()
-            }
-            // Owned by the connection, transfer, sync, preview, and edit
-            // features.
-            BgEvent::InteractiveAuthRequired { .. }
-            | BgEvent::SudoPasswordRequired(_)
-            | BgEvent::Reconnecting { .. }
-            | BgEvent::HostResolved { .. }
-            | BgEvent::VpnFinished { .. }
-            | BgEvent::FsOpFinished { .. }
-            | BgEvent::DroppedPathsChecked { .. }
-            | BgEvent::Transfer(_)
-            | BgEvent::Compared { .. }
-            | BgEvent::SyncFinished { .. }
-            | BgEvent::PreviewLoaded { .. }
-            | BgEvent::ImageResized(_)
-            | BgEvent::EditFinished { .. }
-            | BgEvent::ShellExited { .. }
-            | BgEvent::Revealed { .. }
-            | BgEvent::TimerFired { .. } => Vec::new(),
-        }
+        let effects = self.route_event(event);
+        self.forget_disconnected(&effects);
+        effects
     }
 
     /// For features (host picker, bookmark jump, sudo): shows `endpoint` in
@@ -630,7 +628,9 @@ impl App {
             self.core.filtering = false;
         }
         self.core.pane_mut(side).set_endpoint(endpoint);
-        self.start_pane(side, dir)
+        let mut effects = self.start_pane(side, dir);
+        effects.extend(self.connection_release_unused());
+        effects
     }
 
     /// For features (after file operations): re-lists a pane's directory
@@ -643,6 +643,179 @@ impl App {
             .map(|location| Effect::ListDir { request, location })
             .into_iter()
             .collect()
+    }
+
+    // Routing.
+
+    /// The `Browse` chain: every feature in turn, then core.
+    fn browse_chain(&mut self, action: Action) -> Vec<Effect> {
+        self.transfer_action(action)
+            .or_else(|action| self.dialog_action(action))
+            .or_else(|action| self.connection_action(action))
+            .or_else(|action| self.preview_action(action))
+            .or_else(|action| self.edit_action(action))
+            .or_else(|action| self.sync_action(action))
+            .unwrap_or_else(|action| self.browse_action(action))
+    }
+
+    /// Routes the answer a dialog or picker left in `DialogState::answer`
+    /// to the feature that owns it.
+    fn route_answer(&mut self) -> Vec<Effect> {
+        let Some(answer) = self.dialog.answer.take() else {
+            return Vec::new();
+        };
+        match answer {
+            Answer::Dialog(answer) => match answer.purpose {
+                DialogPurpose::Conflict { .. }
+                | DialogPurpose::TarConflict { .. }
+                | DialogPurpose::FinderDrop { .. } => self.transfer_dialog_answer(answer),
+                DialogPurpose::SudoPassword { .. } | DialogPurpose::Vpn { .. } => {
+                    self.connection_dialog_answer(answer)
+                }
+                DialogPurpose::ConfirmSync { .. } => self.sync_dialog_answer(answer),
+                DialogPurpose::EditConflict { .. } | DialogPurpose::EditUploadFailed { .. } => {
+                    self.edit_dialog_answer(answer)
+                }
+                DialogPurpose::QuitWhileRunning => match answer.button {
+                    DialogButton::Yes => vec![Effect::Quit],
+                    _ => Vec::new(),
+                },
+                // The dialog feature answers its own purposes and never
+                // leaves them here.
+                DialogPurpose::MakeDir { .. }
+                | DialogPurpose::Rename { .. }
+                | DialogPurpose::Chmod { .. }
+                | DialogPurpose::Delete { .. }
+                | DialogPurpose::TrashFailed { .. }
+                | DialogPurpose::Notice => Vec::new(),
+            },
+            Answer::Picked {
+                kind: PickerKind::Hosts { side },
+                target,
+            } => self.connection_picked(side, target),
+            // Bookmark picks are the dialog feature's own.
+            Answer::Picked {
+                kind: PickerKind::Bookmarks { .. },
+                ..
+            } => Vec::new(),
+        }
+    }
+
+    /// Wiring point 3: an endpoint the connection feature disconnects is
+    /// forgotten, so showing it again connects it again.
+    fn forget_disconnected(&mut self, effects: &[Effect]) {
+        for effect in effects {
+            if let Effect::Disconnect(endpoint) = effect {
+                self.core.homes.remove(endpoint);
+                self.core.connecting.remove(endpoint);
+            }
+        }
+    }
+
+    fn route_event(&mut self, event: BgEvent) -> Vec<Effect> {
+        match event {
+            BgEvent::Listed {
+                request, result, ..
+            } => {
+                let mut effects = self.listed(request, result);
+                effects.extend(self.preview_cursor_moved());
+                effects
+            }
+            BgEvent::Connected { endpoint, home } => {
+                let mut effects = self.connected(endpoint.clone(), home);
+                effects.extend(self.connection_connected(&endpoint));
+                effects
+            }
+            BgEvent::ConnectFailed { endpoint, error } => {
+                self.core.connecting.remove(&endpoint);
+                self.error_status(format!("{endpoint}: {error}"));
+                self.connection_failed(&endpoint, &error)
+            }
+            BgEvent::InteractiveAuthRequired { endpoint, error } => {
+                self.connection_interactive_auth(endpoint, error)
+            }
+            BgEvent::SudoPasswordRequired(endpoint) => {
+                self.connection_sudo_password_required(endpoint)
+            }
+            BgEvent::Disconnected { endpoint, error } => {
+                self.error_status(format!("Lost connection to {endpoint}: {error}"));
+                self.connection_disconnected(&endpoint, &error)
+            }
+            BgEvent::Reconnecting {
+                endpoint,
+                attempt,
+                delay,
+                error,
+            } => self.connection_reconnecting(endpoint, attempt, delay, error),
+            BgEvent::Reconnected(endpoint) => {
+                let mut effects = self.refresh_endpoint(&endpoint);
+                effects.extend(self.connection_reconnected(&endpoint));
+                effects
+            }
+            BgEvent::HostResolved { alias, result } => self.connection_host_resolved(alias, result),
+            BgEvent::VpnFinished { endpoint, result } => {
+                self.connection_vpn_finished(endpoint, result)
+            }
+            BgEvent::FsOpFinished {
+                request,
+                endpoint,
+                op,
+                failures,
+            } => self.dialog_fs_op_finished(request, endpoint, op, failures),
+            BgEvent::DroppedPathsChecked {
+                text,
+                paths,
+                all_exist,
+            } => self.transfer_dropped_paths_checked(text, paths, all_exist),
+            BgEvent::Transfer(event) => {
+                let mut effects = self.transfer_event(event);
+                self.sync_jobs_settled();
+                effects.extend(self.connection_release_unused());
+                effects
+            }
+            BgEvent::Compared { request, result } => self.sync_compared(request, result),
+            BgEvent::SyncFinished { job, result } => {
+                let mut effects = self.sync_finished(job, result);
+                effects.extend(self.connection_release_unused());
+                effects
+            }
+            BgEvent::PreviewLoaded {
+                request,
+                location,
+                result,
+            } => self.preview_loaded(request, location, result),
+            BgEvent::ImageResized(resized) => {
+                self.preview_image_resized(resized);
+                Vec::new()
+            }
+            BgEvent::EditFinished { location, result } => {
+                let mut effects = self.edit_finished(location, result);
+                effects.extend(self.connection_release_unused());
+                effects
+            }
+            BgEvent::ShellExited { result } => match result {
+                Err(error) => {
+                    self.error_status(error);
+                    Vec::new()
+                }
+                // The shell may have changed files.
+                Ok(()) => self.refresh(self.core.focused),
+            },
+            BgEvent::Revealed { result, .. } => {
+                if let Err(error) = result {
+                    self.error_status(error);
+                }
+                Vec::new()
+            }
+            BgEvent::StateWriteFailed(error) => {
+                self.error_status(error);
+                Vec::new()
+            }
+            BgEvent::TimerFired { id, at } => self
+                .connection_timer(id, at)
+                .or_else(|| self.preview_timer(id, at))
+                .unwrap_or_default(),
+        }
     }
 
     // Actions.
@@ -674,7 +847,7 @@ impl App {
                     .into_iter()
                     .collect();
             }
-            Action::Quit => return vec![Effect::Quit],
+            Action::Quit => return self.transfer_quit_requested(),
             Action::Click {
                 target, modifiers, ..
             } => self.click(target, modifiers),
@@ -721,6 +894,12 @@ impl App {
         let page = self.core.page_height(side);
         match action {
             Action::Text(edit) => self.core.pane_mut(side).edit_filter(edit, page),
+            Action::Paste(text) => {
+                let pane = self.core.pane_mut(side);
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    pane.edit_filter(TextEdit::Insert(c), page);
+                }
+            }
             Action::MoveCursor(movement) => self.core.pane_mut(side).move_cursor(movement, page),
             Action::Confirm => self.core.filtering = false,
             Action::Cancel => {
@@ -729,7 +908,7 @@ impl App {
             }
             other => {
                 self.core.filtering = false;
-                return self.browse_action(other);
+                return self.browse_chain(other);
             }
         }
         Vec::new()
@@ -814,15 +993,13 @@ impl App {
         }
     }
 
-    /// Enters the cursor row when it is enterable; previewing a file is the
-    /// preview feature's.
+    /// Enters the cursor row when it is enterable, else previews it.
     fn open(&mut self, side: PaneSide) -> Vec<Effect> {
         let pane = self.core.pane(side);
-        if !pane
-            .cursor_entry()
-            .is_some_and(|entry| entry.is_enterable())
-        {
-            return Vec::new();
+        match pane.cursor_entry() {
+            None => return Vec::new(),
+            Some(entry) if !entry.is_enterable() => return self.preview_open(side),
+            Some(_) => {}
         }
         match pane.path_of(pane.cursor) {
             Some(path) => vec![self.list(side, path, None)],
@@ -842,12 +1019,11 @@ impl App {
             return Vec::new();
         };
         let label = describe(&location);
-        if self.persisted.bookmarks.contains(&location) {
+        if !self.persisted.add_bookmark(location.clone()) {
             self.core
                 .set_status(StatusMessage::info(format!("Already bookmarked: {label}")));
             return Vec::new();
         }
-        self.persisted.bookmarks.push(location.clone());
         self.core
             .set_status(StatusMessage::info(format!("Bookmarked {label}")));
         vec![Effect::SaveBookmark(location)]
@@ -879,7 +1055,7 @@ impl App {
     /// remote that is not connected yet.
     fn start_pane(&mut self, side: PaneSide, dir: Option<PathBuf>) -> Vec<Effect> {
         let endpoint = self.core.pane(side).endpoint.clone();
-        let start = dir.or_else(|| self.last_directory(&endpoint));
+        let start = dir.or_else(|| self.persisted.last_directory(&endpoint).map(PathBuf::from));
         let home = self.core.homes.get(&endpoint).cloned();
         let ready = endpoint.is_local() || home.is_some();
         match start.clone().or(home) {
@@ -891,6 +1067,7 @@ impl App {
                 {
                     Vec::new()
                 } else {
+                    self.connection_connecting(&endpoint);
                     vec![Effect::Connect(endpoint)]
                 }
             }
@@ -918,7 +1095,7 @@ impl App {
                 let Some(location) = self.core.pane(side).location() else {
                     return Vec::new();
                 };
-                self.remember_directory(location.clone());
+                self.persisted.remember_directory(location.clone());
                 vec![Effect::RememberDirectory(location)]
             }
             Err(error) => {
@@ -966,23 +1143,6 @@ impl App {
         effects
     }
 
-    // Persisted state mirror.
-
-    fn last_directory(&self, endpoint: &Endpoint) -> Option<PathBuf> {
-        self.persisted
-            .last_directories
-            .iter()
-            .find(|location| location.endpoint == *endpoint)
-            .map(|location| location.path.clone())
-    }
-
-    /// Mirrors `Effect::RememberDirectory`: one entry per endpoint.
-    fn remember_directory(&mut self, location: Location) {
-        let directories = &mut self.persisted.last_directories;
-        directories.retain(|known| known.endpoint != location.endpoint);
-        directories.push(location);
-    }
-
     fn error_status(&mut self, text: impl Display) {
         self.core.set_status(StatusMessage::error(text.to_string()));
     }
@@ -1002,8 +1162,8 @@ fn describe(location: &Location) -> String {
 mod tests {
     use super::*;
     use crate::error::{ConfigError, ConnectError, FsError};
+    use crate::transfer::model::TransferCommand;
     use crate::ui::action::CursorMove;
-    use crate::ui::action::TextEdit;
     use crate::vfs::EntryKind;
     use std::time::Instant;
 
@@ -1126,7 +1286,8 @@ mod tests {
         assert_eq!(effects[2], Effect::ResolveHost("db".into()));
         assert_eq!(effects[3], Effect::ResolveHost("web".into()));
         assert!(app.core.pane(PaneSide::Left).show_hidden);
-        assert_eq!(app.input_mode(), InputMode::Browse);
+        // Without a right endpoint the host picker opens (wiring point 1).
+        assert_eq!(app.input_mode(), InputMode::Picker);
         assert_eq!(app.core.focused(), PaneSide::Left);
         assert_eq!(app.background, Background::Light);
     }
@@ -1254,8 +1415,12 @@ mod tests {
         let remembered = deliver(&mut app, &effects[0], vec![file("inner")]);
         assert_eq!(remembered, [Effect::RememberDirectory(local("/l/sub"))]);
 
-        // Open on a file is the preview feature's.
-        assert!(app.handle_action(Action::Open).is_empty());
+        // Open on a file previews it.
+        assert!(matches!(
+            app.handle_action(Action::Open).as_slice(),
+            [Effect::LoadPreview { location, .. }] if *location == local("/l/sub/inner")
+        ));
+        app.handle_action(Action::Cancel);
 
         let effects = app.handle_action(Action::Parent);
         assert_eq!(list_dir(&effects[0]).1, local("/l"));
@@ -1574,7 +1739,11 @@ mod tests {
         app.handle_action(Action::MoveCursor(CursorMove::Down));
         app.handle_action(Action::ToggleSelect);
         let effects = app.handle_event(BgEvent::Reconnected(Endpoint::Local));
-        assert_eq!(effects.len(), 2);
+        assert_eq!(effects.len(), 3);
+        assert_eq!(
+            effects[2],
+            Effect::Transfer(TransferCommand::EndpointReconnected(Endpoint::Local))
+        );
         let remembered = deliver(
             &mut app,
             &effects[0],
