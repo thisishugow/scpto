@@ -1,0 +1,1 @@
+//! Directory comparison view widget.

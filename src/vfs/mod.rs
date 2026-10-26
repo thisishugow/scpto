@@ -1,0 +1,291 @@
+//! Virtual file system: one `Fs` trait over local and SFTP endpoints.
+//!
+//! # Async style
+//!
+//! Methods return [`BoxFuture`] instead of using native `async fn` in the
+//! trait. Native `async fn` makes a trait dyn-incompatible (E0038), and the
+//! transfer engine, effect executors, and sessions all hold endpoints as
+//! `Arc<dyn Fs>` so that local and remote implementations are interchangeable
+//! at run time. Implementations write `Box::pin(async move { ... })`.
+//!
+//! # Paths
+//!
+//! All paths are absolute `PathBuf`s in the endpoint's own namespace (remote
+//! paths are POSIX paths on the server). File names are `OsString` because
+//! Unix names are arbitrary bytes and must round-trip unchanged.
+
+pub mod local;
+pub mod sftp;
+
+use std::ffi::OsString;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+
+use futures_util::future::BoxFuture;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+pub use crate::error::FsError;
+
+/// Result type of every `Fs` operation.
+pub type FsResult<T> = Result<T, FsError>;
+
+/// Streaming reader returned by [`Fs::open_read`].
+pub type FsReader = Pin<Box<dyn AsyncRead + Send>>;
+
+/// Streaming writer returned by [`Fs::open_write`]. Callers must call
+/// `shutdown()` and check its result; only then is the data committed.
+pub type FsWriter = Pin<Box<dyn AsyncWrite + Send>>;
+
+/// Where a pane or a transfer side points: the local machine, or a remote
+/// host alias from `~/.ssh/config`, optionally running sftp-server via sudo.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Endpoint {
+    /// The local machine.
+    Local,
+    /// A remote SSH host.
+    Remote {
+        /// The ssh alias (as typed in `~/.ssh/config` or on the command line).
+        host: String,
+        /// Whether sftp-server runs through sudo.
+        sudo: bool,
+    },
+}
+
+impl Endpoint {
+    /// Whether this is the local machine.
+    pub fn is_local(&self) -> bool {
+        matches!(self, Endpoint::Local)
+    }
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Endpoint::Local => f.write_str("Local"),
+            Endpoint::Remote { host, sudo: false } => f.write_str(host),
+            Endpoint::Remote { host, sudo: true } => write!(f, "{host} [sudo]"),
+        }
+    }
+}
+
+/// A directory or file on a specific endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Location {
+    /// The endpoint the path belongs to.
+    pub endpoint: Endpoint,
+    /// Absolute path on that endpoint.
+    pub path: PathBuf,
+}
+
+/// Non-regular, non-directory, non-symlink file types. They are listed but
+/// never transferred (plan 7.5 S15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SpecialKind {
+    /// Named pipe.
+    Fifo,
+    /// Unix domain socket.
+    Socket,
+    /// Block device.
+    BlockDevice,
+    /// Character device.
+    CharDevice,
+    /// The server did not report a recognizable type.
+    Unknown,
+}
+
+/// What kind of object an [`Entry`] is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EntryKind {
+    /// Regular file.
+    File,
+    /// Directory.
+    Dir,
+    /// Symbolic link (never followed by transfers).
+    Symlink {
+        /// The link target exactly as stored in the link.
+        target: PathBuf,
+        /// Whether the target resolves to a directory; the listing shows such
+        /// links as enterable. `false` for dangling links.
+        target_is_dir: bool,
+    },
+    /// FIFO, socket, device, or unknown.
+    Special(SpecialKind),
+}
+
+/// One directory entry or stat result.
+///
+/// Attributes are `Option` because the SFTP protocol allows a server to omit
+/// them; implementations never invent values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Entry {
+    /// File name (last path component).
+    pub name: OsString,
+    /// Object kind.
+    pub kind: EntryKind,
+    /// Size in bytes.
+    pub size: Option<u64>,
+    /// Modification time in whole seconds since the Unix epoch.
+    pub mtime: Option<i64>,
+    /// Permission bits (`mode & 0o7777`).
+    pub mode: Option<u32>,
+}
+
+impl Entry {
+    /// Whether opening this entry navigates into a directory (directories
+    /// and symlinks to directories).
+    pub fn is_enterable(&self) -> bool {
+        match &self.kind {
+            EntryKind::Dir => true,
+            EntryKind::Symlink { target_is_dir, .. } => *target_is_dir,
+            EntryKind::File | EntryKind::Special(_) => false,
+        }
+    }
+}
+
+/// How [`Fs::open_write`] opens its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Create the file, or truncate it if it exists.
+    Truncate,
+    /// Open an existing file and write starting at `offset`, used to resume
+    /// a `.scpto-part` file. Bytes before `offset` are kept.
+    Resume {
+        /// Byte offset where writing starts.
+        offset: u64,
+    },
+}
+
+/// Optional features an endpoint supports, queried once per connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    /// `rename` atomically replaces an existing target
+    /// (`posix-rename@openssh.com` on SFTP; always true locally). When false,
+    /// `rename` onto an existing target deletes the target first and is not
+    /// atomic (plan 7.5 S14).
+    pub posix_rename: bool,
+    /// `copy_within` is available (`copy-data` extension on SFTP).
+    pub copy_within: bool,
+    /// `symlink` is available.
+    pub symlink: bool,
+    /// `trash` is available (local endpoint only).
+    pub trash: bool,
+}
+
+/// File system operations on one endpoint. Dyn-compatible: held as
+/// `Arc<dyn Fs>`.
+pub trait Fs: Send + Sync {
+    /// The endpoint this file system serves.
+    fn endpoint(&self) -> &Endpoint;
+
+    /// Features this endpoint supports.
+    fn capabilities(&self) -> Capabilities;
+
+    /// The user's home directory on this endpoint (the initial directory of a
+    /// newly connected pane).
+    fn home(&self) -> BoxFuture<'_, FsResult<PathBuf>>;
+
+    /// Resolves `path` to an absolute path without `.`/`..` or symlinks.
+    fn canonicalize<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<PathBuf>>;
+
+    /// Lists a directory, excluding `.` and `..`. Entries describe the
+    /// objects themselves (lstat); for symlinks the implementation also
+    /// resolves `target_is_dir`. Order is unspecified.
+    fn list<'a>(&'a self, dir: &'a Path) -> BoxFuture<'a, FsResult<Vec<Entry>>>;
+
+    /// Stat that follows symlinks.
+    fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<Entry>>;
+
+    /// Stat that does not follow symlinks.
+    fn lstat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<Entry>>;
+
+    /// Creates one directory; the parent must exist.
+    fn mkdir<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Renames `from` to `to`, replacing an existing non-directory `to`.
+    /// See [`Capabilities::posix_rename`] for atomicity.
+    fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Permanently removes a file or symlink.
+    fn remove_file<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Permanently removes an empty directory.
+    fn remove_dir<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Moves a file or directory tree to the system trash. Fails with
+    /// [`FsError::Unsupported`] when [`Capabilities::trash`] is false and with
+    /// [`FsError::TrashFailed`] when the trash backend refuses.
+    fn trash<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Sets permission bits.
+    fn chmod<'a>(&'a self, path: &'a Path, mode: u32) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Sets access and modification times (seconds since the Unix epoch).
+    fn set_times<'a>(
+        &'a self,
+        path: &'a Path,
+        atime: i64,
+        mtime: i64,
+    ) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Reads a symlink's target without following it.
+    fn read_link<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<PathBuf>>;
+
+    /// Creates a symlink at `link` pointing to `target`.
+    fn symlink<'a>(&'a self, target: &'a Path, link: &'a Path) -> BoxFuture<'a, FsResult<()>>;
+
+    /// Opens a file for streaming reads starting at `offset`.
+    fn open_read<'a>(&'a self, path: &'a Path, offset: u64) -> BoxFuture<'a, FsResult<FsReader>>;
+
+    /// Opens a file for streaming writes.
+    fn open_write<'a>(
+        &'a self,
+        path: &'a Path,
+        mode: WriteMode,
+    ) -> BoxFuture<'a, FsResult<FsWriter>>;
+
+    /// Copies a file to another path on the same endpoint without moving the
+    /// data through scpto. Fails with [`FsError::Unsupported`] when
+    /// [`Capabilities::copy_within`] is false.
+    fn copy_within<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, FsResult<()>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn fs_handle_is_dyn_compatible_and_shareable() {
+        // Compiles only while `Fs` stays dyn-compatible and `Arc<dyn Fs>`
+        // can cross threads.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Arc<dyn Fs>>();
+    }
+
+    #[test]
+    fn endpoint_display_marks_sudo() {
+        let remote = Endpoint::Remote {
+            host: "web".into(),
+            sudo: true,
+        };
+        assert_eq!(remote.to_string(), "web [sudo]");
+        assert_eq!(Endpoint::Local.to_string(), "Local");
+    }
+
+    #[test]
+    fn symlinks_to_directories_are_enterable() {
+        let entry = Entry {
+            name: "link".into(),
+            kind: EntryKind::Symlink {
+                target: "/srv".into(),
+                target_is_dir: true,
+            },
+            size: Some(4),
+            mtime: Some(0),
+            mode: Some(0o777),
+        };
+        assert!(entry.is_enterable());
+    }
+}

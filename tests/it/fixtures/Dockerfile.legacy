@@ -1,0 +1,9 @@
+FROM alpine:3.9
+RUN apk add --no-cache openssh-server openssh-sftp-server rsync tar sudo bash
+COPY sudoers /etc/sudoers.d/scpto
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod 0440 /etc/sudoers.d/scpto && chmod 0755 /entrypoint.sh
+# Path of the real sftp-server binary in this image (verified by up.sh).
+ENV SFTP_SERVER=/usr/lib/ssh/sftp-server
+EXPOSE 22
+ENTRYPOINT ["/entrypoint.sh"]
