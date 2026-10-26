@@ -23,6 +23,9 @@ where
             write!(std::io::stdout(), "{}", cli::USAGE)?;
             Ok(ExitCode::SUCCESS)
         }
+        Ok(cli::Invocation::Launch(_)) => {
+            anyhow::bail!("the interactive interface is not part of this build yet")
+        }
         Err(error) => {
             write!(std::io::stderr(), "scpto: {error}\n\n{}", cli::USAGE)?;
             Ok(ExitCode::from(cli::USAGE_EXIT_CODE))

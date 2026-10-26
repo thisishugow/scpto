@@ -446,12 +446,11 @@ fn civil_from_days(days: i64) -> Option<(i64, i64, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
     use super::*;
-    use crate::ui::pane::Sort;
+    use crate::ui::action::RequestId;
     use crate::ui::widgets::text_input::testing::{lines, row_text};
     use crate::vfs::Endpoint;
 
@@ -465,21 +464,16 @@ mod tests {
         }
     }
 
+    /// Builds a pane listed at `/srv/www` through the real loading path, so
+    /// the entries are sorted the way the app shows them.
     fn pane(entries: Vec<Entry>) -> Pane {
-        let visible = (0..entries.len()).collect();
-        Pane {
-            endpoint: Endpoint::Local,
-            cwd: Some(PathBuf::from("/srv/www")),
-            entries,
-            visible,
-            cursor: 0,
-            scroll: 0,
-            selection: HashSet::new(),
-            filter: String::new(),
-            sort: Sort::default(),
-            show_hidden: false,
-            pending: None,
-        }
+        let mut pane = Pane::new(Endpoint::Local, false);
+        pane.begin_list(RequestId(1), PathBuf::from("/srv/www"), None);
+        let applied = pane
+            .finish_list(RequestId(1), Ok(entries))
+            .expect("listing applies");
+        assert!(applied);
+        pane
     }
 
     fn sample() -> Pane {
@@ -534,10 +528,10 @@ mod tests {
             [
                 format!("\u{250c} Local {}\u{2510}", h.repeat(21)),
                 format!("{v}/srv/www                    {v}"),
-                format!("{v}  src/                      {v}"),
                 format!("{v}  current/                  {v}"),
-                format!("{v}  latest.log@               {v}"),
+                format!("{v}  src/                      {v}"),
                 format!("{v}  Cargo.toml         1.5 KiB{v}"),
+                format!("{v}  latest.log@               {v}"),
                 format!("{v}  pipe|                     {v}"),
                 format!("{v}                            {v}"),
                 format!("\u{2514} 5 items {}\u{2518}", h.repeat(19)),
@@ -558,12 +552,12 @@ mod tests {
         let (buf, _) = draw(&view(&pane), 50, 9);
         let expected_time = format_local_mtime(1_700_000_000).expect("representable");
         assert_eq!(
-            row_text(&buf, 5),
+            row_text(&buf, 4),
             format!("\u{2502}  Cargo.toml            1.5 KiB {expected_time}\u{2502}")
         );
         // Rows without a time leave the column blank.
         assert_eq!(
-            row_text(&buf, 2),
+            row_text(&buf, 3),
             format!("\u{2502}  src/{}\u{2502}", " ".repeat(42))
         );
     }
@@ -595,10 +589,10 @@ mod tests {
         pane.selection.insert(OsString::from("gone"));
         let (buf, _) = draw(&view(&pane), 30, 9);
         assert_eq!(
-            row_text(&buf, 5),
+            row_text(&buf, 4),
             "\u{2502}* Cargo.toml         1.5 KiB\u{2502}"
         );
-        assert_eq!(buf[(3, 5)].fg, Color::Yellow);
+        assert_eq!(buf[(3, 4)].fg, Color::Yellow);
         assert_eq!(
             row_text(&buf, 8),
             format!(
@@ -736,11 +730,11 @@ mod tests {
             row_text(&buf, 2),
             "\u{2502}  a_very_long_di\u{2026}/\u{2502}"
         );
+        assert_eq!(row_text(&buf, 3), "\u{2502}  tab?name        \u{2502}");
         assert_eq!(
-            row_text(&buf, 3),
+            row_text(&buf, 4),
             "\u{2502}  \u{4e2d}\u{6587}\u{6a94}\u{6848}\u{540d}\u{7a31}\u{5f88}\u{2026} \u{2502}"
         );
-        assert_eq!(row_text(&buf, 4), "\u{2502}  tab?name        \u{2502}");
     }
 
     #[test]

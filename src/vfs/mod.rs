@@ -32,10 +32,17 @@ pub use crate::error::FsError;
 pub type FsResult<T> = Result<T, FsError>;
 
 /// Streaming reader returned by [`Fs::open_read`].
+///
+/// Reader and writer errors carry their class: an implementation that knows
+/// the [`FsError`] puts it inside the `io::Error` (its `get_ref()` downcasts
+/// to `FsError`), so a caller recovers `FsError::Disconnected` and does not
+/// fail the item as a plain I/O error. An `io::Error` without an inner
+/// `FsError` is classified with `FsError::from_io`.
 pub type FsReader = Pin<Box<dyn AsyncRead + Send>>;
 
 /// Streaming writer returned by [`Fs::open_write`]. Callers must call
 /// `shutdown()` and check its result; only then is the data committed.
+/// Errors carry their class as described on [`FsReader`].
 pub type FsWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
 /// Where a pane or a transfer side points: the local machine, or a remote

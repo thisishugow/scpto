@@ -153,12 +153,8 @@ use crate::ui::action::{
     ScrollRegion, TimerId,
 };
 use crate::ui::pane::Pane;
+use crate::ui::widgets::pane::CHROME_ROWS;
 use crate::vfs::{Endpoint, Entry, Location};
-
-/// Rows of a pane's area that are not list rows (top border, path line,
-/// bottom border). Must equal `widgets::pane::CHROME_ROWS`, which draws
-/// them.
-const PANE_CHROME_ROWS: u16 = 3;
 
 /// Smallest height of the queue panel when shown (border plus a few rows),
 /// limited by the screen.
@@ -311,7 +307,7 @@ impl CoreState {
             PaneSide::Left => layout.left,
             PaneSide::Right => layout.right,
         };
-        usize::from(area.height.saturating_sub(PANE_CHROME_ROWS))
+        usize::from(area.height.saturating_sub(CHROME_ROWS))
     }
 
     /// A new request id; ids are never reused.
