@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="192" viewBox="0 0 480 192" role="img" aria-labelledby="title desc">
+  <title id="title">scpto</title>
+  <desc id="desc">A ball arcs from one file pane to another, like a pass between teammates. Pick files. Pass them over.</desc>
+  <rect width="480" height="192" rx="24" fill="#101c2d"/>
+  <g transform="translate(24 32)">
+    <rect width="152" height="128" rx="28" fill="#192b40" stroke="#30445a" stroke-width="2"/>
+    <g fill="#101c2d" stroke="#65849c" stroke-width="2">
+      <rect x="14" y="70" width="48" height="44" rx="6"/>
+      <rect x="90" y="70" width="48" height="44" rx="6"/>
+    </g>
+    <path d="M24 84h20m-20 12h28M100 84h20m-20 12h14" fill="none" stroke="#64c8f0" stroke-width="4" stroke-linecap="round"/>
+    <path d="M38 64Q76-6 114 64" fill="none" stroke="#6ee7b7" stroke-width="3" stroke-linecap="round" stroke-dasharray="2 9" opacity="0.5"/>
+    <circle cx="56" cy="38" r="6" fill="#6ee7b7" opacity="0.2"/>
+    <circle cx="72" cy="30" r="9" fill="#6ee7b7" opacity="0.4"/>
+    <circle cx="94" cy="35" r="14" fill="#6ee7b7"/>
+    <path d="M84 26c8 3 13 11 12 23M86 45c4-9 11-14 21-15" fill="none" stroke="#101c2d" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+  </g>
+  <text x="193" y="108" fill="#f1f6fc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="76" font-weight="700" letter-spacing="-4">scp<tspan fill="#6ee7b7">to</tspan></text>
+  <text x="196" y="143" fill="#a6b9ce" font-family="-apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif" font-size="19">Pick files. Pass them over.</text>
+</svg>

@@ -1,0 +1,5 @@
+sudopw ALL=(ALL) ALL
+sudonopw ALL=(ALL) NOPASSWD: ALL
+sudotty ALL=(ALL) ALL
+Defaults:sudotty requiretty
+limited ALL=(ALL) /bin/true

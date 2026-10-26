@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify release tag
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import tomllib
+
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          if os.environ['GITHUB_REF_NAME'] != f'v{version}':
+              raise SystemExit('Release tag must equal v + Cargo.toml version')
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install Rust target
+        run: rustup target add "$TARGET"
+      - name: Build binary
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Package binary
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import sys
+          import tomllib
+
+          sys.path.insert(0, 'tools')
+          from package import write_archive
+
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          target = os.environ['TARGET']
+          files = [(Path('target') / target / 'release' / 'scpto', 'scpto', 0o755)]
+          files += [(Path(name), name, 0o644) for name in (
+              'README.md', 'README.zh-TW.md', 'LICENSE', 'CHANGELOG.md'
+          )]
+          Path('dist').mkdir()
+          write_archive(Path(f'dist/scpto-{version}-{target}.tar.gz'), files)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Verify binaries, build source archive, checksums and Formula
+        run: |
+          python3 tools/package.py source-release --binary-dir dist
+          mv source-release/*.tar.gz source-release/SHA256SUMS dist/
+          mv source-release/Formula/scpto.rb dist/
+          ruby -c dist/scpto.rb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish draft GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --draft --title "$GITHUB_REF_NAME" --generate-notes

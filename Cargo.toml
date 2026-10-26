@@ -1,0 +1,45 @@
+[package]
+name = "scpto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Dual-pane terminal file transfer over SFTP"
+
+[dependencies]
+anyhow = "1.0.104"
+# Direct dependency only to enable `event-stream` on the single crossterm that
+# ratatui uses; code always goes through the `ratatui::crossterm` re-export.
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# getuid for the ControlPath directory and kill(pid, 0) liveness checks when
+# cleaning stale per-process directories. Signals use tokio::signal instead.
+libc = "0.2"
+openssh-sftp-client = "0.15.10"
+ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
+# Default features are off: `chafa-dyn` links libchafa and breaks musl builds.
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+shell-words = "1.1.1"
+# Pure-Rust regex engine (no oniguruma) so musl builds stay self-contained.
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-themes", "regex-fancy"] }
+tar = "0.4.46"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+trash = "5.2.9"
+# Without `highlight-code`, which would pull syntect with oniguruma.
+tui-markdown = { version = "0.3.12", default-features = false }
+# bat's syntax set; `syntect-fancy` keeps the pure-Rust regex engine.
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
+unicode-normalization = "0.1"
+zeroize = "1.9.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
