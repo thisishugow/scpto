@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: cargo test --locked
+
+  doc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Check source policy
+        run: |
+          expect_no_matches() {
+            local status=0
+            rg -n "$@" || status=$?
+            if [ "$status" -ne 1 ]; then
+              echo "Policy check failed (ripgrep exit $status)" >&2
+              return 1
+            fi
+          }
+          expect_no_matches '[\x{4e00}-\x{9fff}]' src tests Cargo.toml
+          expect_no_matches 'TODO|FIXME|todo!|unimplemented!|allow\(dead_code\)|allow\(unused' src tests
+      - name: Check dependency policy
+        shell: python
+        run: |
+          import re
+          import subprocess
+
+          # Resolve the full graph first so a resolution error cannot pass as absence.
+          tree = subprocess.check_output(
+              ['cargo', 'tree', '--locked', '--prefix', 'none'], text=True
+          )
+          for name in ('chafa', 'onig'):
+              result = subprocess.run(
+                  ['cargo', 'tree', '--locked', '-i', name],
+                  capture_output=True, text=True,
+              )
+              expected = f'package ID specification `{name}` did not match any packages'
+              if result.returncode != 101 or expected not in result.stderr:
+                  raise SystemExit(f'{name} must be absent:\n{result.stdout}{result.stderr}')
+          for name in ('crossterm', 'ratatui'):
+              versions = set(re.findall(rf'^{name} v(\S+)', tree, re.MULTILINE))
+              if len(versions) != 1:
+                  raise SystemExit(f'Expected one {name} version, found {sorted(versions)}')
+
+  musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install musl tools and target
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCPTO_IT: '1'
+      SCPTO_EXPECT_COPY_DATA: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install integration tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y rsync tmux
+          rsync --version | grep -E '^rsync +version +3\.'
+      - name: Start SSH fixtures
+        run: tests/it/fixtures/up.sh
+      - run: cargo test --locked -- --include-ignored
+      - run: cargo test --test it
+      - run: python3 tests/verify.py
+      - name: Stop SSH fixtures
+        if: always()
+        run: tests/it/fixtures/down.sh
