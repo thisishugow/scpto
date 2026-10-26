@@ -55,4 +55,10 @@ Subsystem sftp ${SFTP_SERVER}
 CONF
 
 mkdir -p /run/sshd
+# Modern sshd penalizes the unauthenticated connections used by ssh-keyscan.
+# Inspect supported settings so OpenSSH 7.9 never sees an unknown directive.
+sshd_settings=$(/usr/sbin/sshd -T)
+if [[ "$sshd_settings" == *$'\npersourcepenalties '* ]]; then
+    echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config
+fi
 exec /usr/sbin/sshd -D -e
