@@ -364,6 +364,7 @@ mod tests {
     use super::*;
     use crate::ui::action::ClickTarget;
     use crate::ui::hit::HitMap;
+    use crate::ui::widgets::text_input::MASK_LEN;
 
     fn row_text(buf: &Buffer, y: u16) -> String {
         (buf.area.x..buf.area.right())
@@ -636,10 +637,14 @@ mod tests {
         let field_x = hit.area.x + 2;
         assert_eq!(
             text_at(&buf, Rect::new(field_x, field_y, MIN_CONTENT_WIDTH, 1)),
-            format!("*******{}", " ".repeat(usize::from(MIN_CONTENT_WIDTH) - 7))
+            format!(
+                "{}{}",
+                "*".repeat(MASK_LEN),
+                " ".repeat(usize::from(MIN_CONTENT_WIDTH) - MASK_LEN)
+            )
         );
         assert!(!(0..24).any(|y| row_text(&buf, y).contains("hunter2")));
-        assert_eq!(caret, Some(Position::new(field_x + 7, field_y)));
+        assert_eq!(caret, Some(Position::new(field_x + 8, field_y)));
         // The field spans the content width and nothing else.
         assert_eq!(buf[(field_x, field_y)].bg, ratatui::style::Color::DarkGray);
         assert_eq!(

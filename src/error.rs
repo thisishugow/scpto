@@ -47,6 +47,9 @@ pub enum Error {
         /// The last lines of its stderr, possibly empty.
         stderr: String,
     },
+    /// The user canceled the operation (for example an rsync sync).
+    #[error("Canceled")]
+    Canceled,
     /// A tar archive was malformed or contained an unsafe entry.
     #[error("Archive error: {message}")]
     Archive {
@@ -67,6 +70,22 @@ pub enum Error {
         /// The state file path.
         path: PathBuf,
         /// The underlying reason.
+        message: String,
+    },
+    /// `state.json` could not be parsed. It was moved to `backup` and scpto
+    /// continues with an empty state (plan 2.6); the next save writes a
+    /// fresh file.
+    #[error(
+        "{} is damaged ({message}); it was kept as {} and scpto starts without bookmarks or remembered directories",
+        path.display(),
+        backup.display()
+    )]
+    StateCorrupt {
+        /// The state file path.
+        path: PathBuf,
+        /// Where the damaged file was moved.
+        backup: PathBuf,
+        /// The parser's message.
         message: String,
     },
     /// The state file (`state.json`, `partials.json`) could not be written.
@@ -96,6 +115,20 @@ impl fmt::Display for ExitStatus {
             ExitStatus::NotStarted => f.write_str("could not be started"),
             ExitStatus::Code(code) => write!(f, "exit status {code}"),
             ExitStatus::Signal(signal) => write!(f, "killed by signal {signal}"),
+        }
+    }
+}
+
+impl From<std::process::ExitStatus> for ExitStatus {
+    /// How a finished child ended: its exit code, else the signal that
+    /// terminated it. A waited-for child always has one of the two; the raw
+    /// wait status is kept as the code otherwise, so nothing is invented.
+    fn from(status: std::process::ExitStatus) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        match (status.code(), status.signal()) {
+            (Some(code), _) => ExitStatus::Code(code),
+            (None, Some(signal)) => ExitStatus::Signal(signal),
+            (None, None) => ExitStatus::Code(status.into_raw()),
         }
     }
 }
@@ -412,6 +445,16 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_exit_status_converts_to_code_or_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = |raw| ExitStatus::from(std::process::ExitStatus::from_raw(raw));
+        assert_eq!(status(0), ExitStatus::Code(0));
+        assert_eq!(status(2 << 8), ExitStatus::Code(2));
+        assert_eq!(status(255 << 8), ExitStatus::Code(255));
+        assert_eq!(status(9), ExitStatus::Signal(9));
+    }
 
     #[test]
     fn io_errors_are_classified_by_kind() {

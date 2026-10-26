@@ -46,6 +46,21 @@
 //!   `--from0`, so such entries are written with a leading `/`, which rsync
 //!   strips (a leading `./` would make rsync also copy the source root's
 //!   attributes onto the destination root).
+//! - Destination-only selections: a selected path that exists only on the
+//!   destination side of the direction is "extraneous". With
+//!   `delete_extraneous` off (the default) it is left alone: rsync gets
+//!   `--ignore-missing-args` (without it, rsync fails the whole run with
+//!   exit 23 for such a path) and the engine job has no pair for it. With
+//!   `delete_extraneous` on, it is deleted from the destination (a directory
+//!   with everything beneath it): rsync gets `--delete-missing-args --force`
+//!   (`--force` lets it remove non-empty directories), verified against
+//!   rsync 3.1.3 and 3.5.0. `--delete` is not used: it acts only on
+//!   directories rsync recurses into, and `--files-from` turns off the
+//!   recursion `-a` implies, so it would delete nothing. On the engine path
+//!   the sync executor deletes [`extraneous`] with `vfs::remove_tree` on
+//!   the destination's Transfer channel before it submits the engine job;
+//!   a failed deletion ends the sync with `BgEvent::SyncFinished` carrying
+//!   the error, and no job is submitted.
 //! - The child runs with `process_group(0)` and `kill_on_drop`; cancel drops
 //!   the future, which kills rsync's whole process group (rsync and its ssh).
 //! - Engine path: a `JobRequest` with `JobTargets::Pairs` of
@@ -80,16 +95,20 @@
 //!     left: &Location,
 //!     right: &Location,
 //!     paths: &[PathBuf],
+//!     delete_extraneous: bool,
 //! ) -> Result<(), Error>;
 //!
 //! /// The engine job for a sync. `comparison` supplies the source kinds.
 //! pub fn engine_job(job: JobId, direction: SyncDirection, comparison: &Comparison, paths: &[PathBuf]) -> JobRequest;
+//!
+//! /// Engine path with `delete_extraneous`: the absolute destination paths
+//! /// to delete, outermost first, none beneath another.
+//! pub fn extraneous(direction: SyncDirection, comparison: &Comparison, paths: &[PathBuf]) -> Vec<PathBuf>;
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -368,7 +387,9 @@ pub async fn local_rsync_ok() -> bool {
 }
 
 /// Runs rsync to completion, copying `paths` (relative to both directories)
-/// from the source to the destination side of `direction`. `ssh` is
+/// from the source to the destination side of `direction`; selected paths
+/// missing on the source are deleted from the destination when
+/// `delete_extraneous`, else ignored. `ssh` is
 /// `Connections::ssh_command(remote, false)` for the remote side. Fails with
 /// `Error::CommandFailed` when rsync cannot be started or does not succeed.
 /// Dropping the future kills rsync and its ssh.
@@ -378,9 +399,10 @@ pub async fn run_rsync(
     left: &Location,
     right: &Location,
     paths: &[PathBuf],
+    delete_extraneous: bool,
 ) -> Result<(), Error> {
     let mut child = Command::new("rsync")
-        .args(rsync_args(ssh, direction, left, right))
+        .args(rsync_args(ssh, direction, left, right, delete_extraneous))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -412,14 +434,9 @@ pub async fn run_rsync(
     }
     let stderr = stderr_tail(&output.stderr);
     if !output.status.success() {
-        let status = match (output.status.code(), output.status.signal()) {
-            (Some(code), _) => ExitStatus::Code(code),
-            (None, Some(signal)) => ExitStatus::Signal(signal),
-            (None, None) => unreachable!("a finished process has a code or a signal"),
-        };
         return Err(Error::CommandFailed {
             program: "rsync".into(),
-            status,
+            status: output.status.into(),
             stderr,
         });
     }
@@ -465,21 +482,30 @@ fn rsync_args(
     direction: SyncDirection,
     left: &Location,
     right: &Location,
+    delete_extraneous: bool,
 ) -> Vec<OsString> {
     let (source, destination) = match direction {
         SyncDirection::LeftToRight => (left, right),
         SyncDirection::RightToLeft => (right, left),
     };
-    vec![
+    let mut args: Vec<OsString> = vec![
         "-a".into(),
         "-s".into(),
         "--from0".into(),
         "--files-from=-".into(),
+    ];
+    if delete_extraneous {
+        args.extend(["--delete-missing-args".into(), "--force".into()]);
+    } else {
+        args.push("--ignore-missing-args".into());
+    }
+    args.extend([
         "-e".into(),
         rsync_rsh(ssh).into(),
         rsync_location(source),
         rsync_location(destination),
-    ]
+    ]);
+    args
 }
 
 /// Encodes an argv for rsync's `-e` parser: every word in single quotes,
@@ -590,6 +616,53 @@ pub fn engine_job(
         targets: JobTargets::Pairs(pairs),
         preset: Some(ConflictChoice::Overwrite),
     }
+}
+
+/// The destination paths a sync with `delete_extraneous` deletes on the
+/// engine path: every selected path that `comparison` lists as present on
+/// the destination side of `direction` only, as an absolute destination
+/// path. Paths beneath another selected extraneous directory are left out
+/// (deleting the directory removes them), and the result is sorted.
+pub fn extraneous(
+    direction: SyncDirection,
+    comparison: &Comparison,
+    paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let destination = match direction {
+        SyncDirection::LeftToRight => &comparison.right,
+        SyncDirection::RightToLeft => &comparison.left,
+    };
+    let by_path: HashMap<&Path, &ComparisonEntry> = comparison
+        .entries
+        .iter()
+        .map(|entry| (entry.relative.as_path(), entry))
+        .collect();
+    let mut relative: Vec<&Path> = paths
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| {
+            by_path.get(path).is_some_and(|entry| {
+                let (source, destination) = match direction {
+                    SyncDirection::LeftToRight => (&entry.left, &entry.right),
+                    SyncDirection::RightToLeft => (&entry.right, &entry.left),
+                };
+                source.is_none() && destination.is_some()
+            })
+        })
+        .collect();
+    // Sorted, a directory comes right before the paths beneath it.
+    relative.sort();
+    relative.dedup();
+    let mut outermost: Vec<&Path> = Vec::new();
+    for path in relative {
+        if !outermost.last().is_some_and(|dir| path.starts_with(dir)) {
+            outermost.push(path);
+        }
+    }
+    outermost
+        .into_iter()
+        .map(|path| destination.path.join(path))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1101,6 +1174,34 @@ mod tests {
     }
 
     #[test]
+    fn extraneous_lists_outermost_destination_only_selections() {
+        let paths: Vec<PathBuf> = ["a.txt", "d", "d/b.txt", "link", "r.txt", "unknown"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let comparison = sample_comparison();
+        // Left to right: only `r.txt` is missing on the source.
+        assert_eq!(
+            extraneous(SyncDirection::LeftToRight, &comparison, &paths),
+            [PathBuf::from("/r/r.txt")]
+        );
+        // Right to left: `d` and everything beneath it, as one deletion.
+        assert_eq!(
+            extraneous(SyncDirection::RightToLeft, &comparison, &paths),
+            [PathBuf::from("/l/d"), PathBuf::from("/l/link")]
+        );
+        // A child selected without its directory is deleted on its own.
+        assert_eq!(
+            extraneous(
+                SyncDirection::RightToLeft,
+                &comparison,
+                &[PathBuf::from("d/b.txt")]
+            ),
+            [PathBuf::from("/l/d/b.txt")]
+        );
+    }
+
+    #[test]
     fn rsync_needs_one_local_side_a_plain_remote_and_both_rsyncs() {
         let ok = RemoteTools {
             tar: true,
@@ -1204,7 +1305,7 @@ mod tests {
         let local = location(Endpoint::Local, "/Users/me/site");
         let server = location(remote(), "/var/www/");
         let expected_rsh = OsString::from("'ssh' '-o' 'BatchMode=yes'");
-        let up = rsync_args(&ssh, SyncDirection::LeftToRight, &local, &server);
+        let up = rsync_args(&ssh, SyncDirection::LeftToRight, &local, &server, false);
         assert_eq!(
             up,
             vec![
@@ -1212,17 +1313,24 @@ mod tests {
                 "-s".into(),
                 "--from0".into(),
                 "--files-from=-".into(),
+                "--ignore-missing-args".into(),
                 "-e".into(),
                 expected_rsh,
                 "/Users/me/site/".into(),
                 "web:/var/www/".into(),
             ]
         );
-        let down = rsync_args(&ssh, SyncDirection::RightToLeft, &local, &server);
+        let down = rsync_args(&ssh, SyncDirection::RightToLeft, &local, &server, false);
         assert_eq!(
-            down[6..],
+            down[7..],
             [OsString::from("web:/var/www/"), "/Users/me/site/".into()]
         );
+        let deleting = rsync_args(&ssh, SyncDirection::LeftToRight, &local, &server, true);
+        assert_eq!(
+            deleting[4..6],
+            [OsString::from("--delete-missing-args"), "--force".into()]
+        );
+        assert!(!deleting.contains(&OsString::from("--ignore-missing-args")));
         let v6 = location(
             Endpoint::Remote {
                 host: "fe80::1".into(),
@@ -1281,6 +1389,7 @@ mod tests {
             &missing,
             &destination,
             &[PathBuf::from("a.txt")],
+            false,
         )
         .await
         .expect_err("the source does not exist");

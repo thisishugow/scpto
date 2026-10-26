@@ -30,11 +30,10 @@
 //! `process_group(0)`, `kill_on_drop(true)`) from the argv of
 //! `Connections::ssh_command(endpoint, false)` plus `--`, the host alias, and
 //! the remote command. Every word of the remote command is single-quoted by
-//! this module's private quoting function, which follows plan 7.3 exactly
-//! (`'` → `'\''`, a word containing a newline is rejected). It duplicates the
-//! session's quoting helper only because that helper is not part of the
-//! frozen contract yet. The wrapper is a fixed string without single quotes;
-//! `$0` is the quoted sftp-server path.
+//! `connections::join_command`, the crate's one plan 7.3 quoting helper; its
+//! newline rejection (`Error::NewlineInPath`) becomes `SudoError::Other`.
+//! The wrapper is a fixed string without single quotes; `$0` is the quoted
+//! sftp-server path.
 //!
 //! # Reading stderr
 //!
@@ -136,7 +135,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -148,7 +146,7 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, timeout_at, Instant};
 use zeroize::Zeroizing;
 
-use crate::connections::{Connections, RemoteChild, StderrTail};
+use crate::connections::{join_command, Connections, RemoteChild, StderrTail};
 use crate::error::{ConnectError, Error, ExitStatus, SudoError};
 use crate::ui::action::Secret;
 use crate::vfs::Endpoint;
@@ -399,31 +397,7 @@ fn stage_command(stage: SudoStage, sftp_server: &str) -> Result<String, SudoErro
     let mut words = vec!["env", "LC_ALL=C"];
     words.extend_from_slice(sudo);
     words.extend_from_slice(&["sh", "-c", WRAPPER, sftp_server]);
-    join_words(&words)
-}
-
-/// Single-quotes one word for the remote POSIX shell exactly as plan 7.3
-/// specifies: `'` becomes `'\''`, and a word containing a newline is
-/// rejected.
-fn quote_word(word: &str) -> Result<String, SudoError> {
-    if word.contains('\n') {
-        return Err(SudoError::Other {
-            detail: format!(
-                "{} contains a newline and cannot be used in a remote command",
-                word.escape_debug()
-            ),
-        });
-    }
-    Ok(format!("'{}'", word.replace('\'', r"'\''")))
-}
-
-/// Quotes every word and joins them with single spaces.
-fn join_words(words: &[&str]) -> Result<String, SudoError> {
-    let quoted = words
-        .iter()
-        .map(|word| quote_word(word))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(quoted.join(" "))
+    join_command(&words).map_err(sudo_error)
 }
 
 /// The exact bytes written to stage 2's stdin: the password and `\n`, in a
@@ -472,15 +446,6 @@ fn sudo_error(error: Error) -> SudoError {
         other => SudoError::Other {
             detail: other.to_string(),
         },
-    }
-}
-
-/// How a child process ended, in the crate's terms.
-fn exit_status(status: std::process::ExitStatus) -> ExitStatus {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => ExitStatus::Code(code),
-        (None, Some(signal)) => ExitStatus::Signal(signal),
-        (None, None) => ExitStatus::NotStarted,
     }
 }
 
@@ -593,7 +558,7 @@ fn accept_probe_output(probe: &ProbeOutput, candidates: &[String]) -> Result<Pat
                 .map(|line| line.chars().take(DETAIL_LINE_CHARS).collect::<String>())
                 .collect::<Vec<_>>()
                 .join("; ");
-            let status = exit_status(probe.status);
+            let status = ExitStatus::from(probe.status);
             Err(SudoError::Other {
                 detail: if stderr.is_empty() {
                     format!("the sftp-server probe failed ({status})")
@@ -826,7 +791,7 @@ fn quotable(line: &str, secret: Option<&str>) -> bool {
 /// The error for a child whose stderr closed before the marker.
 async fn closed_error(mut child: SudoChild, lines: Vec<String>) -> SudoError {
     let status = match timeout(EXIT_WAIT, child.child.wait()).await {
-        Ok(Ok(status)) => exit_status(status).to_string(),
+        Ok(Ok(status)) => ExitStatus::from(status).to_string(),
         Ok(Err(error)) => format!("exit status unknown: {error}"),
         Err(_elapsed) => "still running".to_owned(),
     };
@@ -898,9 +863,9 @@ async fn sudoers_check(
     endpoint: &Endpoint,
     limit: Duration,
 ) -> SudoError {
-    let command = match join_words(&VALIDATE_WORDS) {
+    let command = match join_command(&VALIDATE_WORDS) {
         Ok(command) => command,
-        Err(error) => return error,
+        Err(error) => return sudo_error(error),
     };
     let mut child = match spawn_child(connections, endpoint, &command).await {
         Ok(child) => child,
@@ -921,6 +886,7 @@ async fn sudoers_check(
 mod tests {
     use super::*;
 
+    use crate::connections::quote;
     use std::future::Future;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1148,11 +1114,11 @@ mod tests {
     }
 
     #[test]
-    fn quoting_follows_plan_7_3() {
-        assert_eq!(quote_word("plain").unwrap(), "'plain'");
-        assert_eq!(quote_word("").unwrap(), "''");
-        assert_eq!(quote_word("it's").unwrap(), r"'it'\''s'");
-        assert!(matches!(quote_word("a\nb"), Err(SudoError::Other { .. })));
+    fn a_newline_in_the_sftp_server_path_is_a_sudo_error() {
+        assert!(matches!(
+            stage_command(SudoStage::NoPassword, "/usr/lib/a\nb"),
+            Err(SudoError::Other { detail }) if detail.contains("newline")
+        ));
     }
 
     #[test]
@@ -1167,7 +1133,7 @@ mod tests {
             format!("'env' 'LC_ALL=C' 'sudo' '-k' '-S' '-p' '' 'sh' '-c' '{WRAPPER}' '{path}'")
         );
         assert_eq!(
-            join_words(&VALIDATE_WORDS).unwrap(),
+            join_command(&VALIDATE_WORDS).unwrap(),
             "'env' 'LC_ALL=C' 'sudo' '-n' '-v'"
         );
         // A quote in the path cannot break out of its word.
@@ -1202,6 +1168,7 @@ mod tests {
 
     #[test]
     fn probe_output_accepts_only_an_exact_candidate() {
+        use std::os::unix::process::ExitStatusExt;
         use std::process::ExitStatus as StdStatus;
         let candidates = candidate_list(None);
         let probe = |code: i32, stdout: &[u8]| ProbeOutput {
@@ -1364,7 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage1_passes_the_exact_command_and_hands_off_after_the_marker() {
-        let expected = quote_word(&stage_command(SudoStage::NoPassword, PATH).unwrap()).unwrap();
+        let expected = quote(&stage_command(SudoStage::NoPassword, PATH).unwrap()).unwrap();
         let stage1 = format!(
             "[ \"$1\" = -- ] && [ \"$2\" = box ] && [ \"$3\" = {expected} ] || exit 9; \
              echo 'sudo: some warning' >&2; echo SCPTO-SUDO-OK >&2; echo post-marker-note >&2; exec cat"
@@ -1383,7 +1350,7 @@ mod tests {
              printf '\\n%s\\n%s\\n\\n    %s\\n    %s\\n    %s\\n\\n%s\\n' \
              '{}' '{}' '{}' '{}' '{}' '{}' >&2; \
              printf 'SCPTO-SUDO-OK\\r\\n' >&2; exec cat",
-            quote_word(UNIT_PASSWORD).unwrap(),
+            quote(UNIT_PASSWORD).unwrap(),
             LECTURE_LINES[0],
             LECTURE_LINES[1],
             LECTURE_LINES[2],
@@ -1418,7 +1385,7 @@ mod tests {
         let flag = flags.path().join("precheck");
         let precheck = format!(
             "touch {}; echo 'sudo: a password is required' >&2; exit 1",
-            quote_word(flag.to_str().unwrap()).unwrap()
+            quote(flag.to_str().unwrap()).unwrap()
         );
         let fake = Fake::sudo(NEED_PW, &precheck, "exit 97");
         let result = with_timeout(start_fake(&fake, None)).await;
@@ -1438,10 +1405,7 @@ mod tests {
     async fn requiretty_fails_in_stage1_without_the_sudoers_check() {
         let flags = tempfile::tempdir().unwrap();
         let flag = flags.path().join("precheck");
-        let precheck = format!(
-            "touch {}; exit 1",
-            quote_word(flag.to_str().unwrap()).unwrap()
-        );
+        let precheck = format!("touch {}; exit 1", quote(flag.to_str().unwrap()).unwrap());
         let stage1 = "echo 'sudo: sorry, you must have a tty to run sudo' >&2; exit 1";
         let fake = Fake::sudo(stage1, &precheck, "exit 97");
         let result = with_timeout(start_fake(&fake, None)).await;
@@ -1463,7 +1427,7 @@ mod tests {
         );
         let stage2 = format!(
             "IFS= read -r pw; printf '%s\\n' {} >&2; exec sleep 30",
-            quote_word(&echoed).unwrap()
+            quote(&echoed).unwrap()
         );
         let fake = Fake::sudo("exit 98", "exit 97", &stage2);
         let result = with_timeout(start_fake(&fake, Some(UNIT_PASSWORD))).await;
@@ -1809,8 +1773,7 @@ mod tests {
             ) -> BoxFuture<'a, Result<RemoteChild, Error>> {
                 Box::pin(async move {
                     self.check().await?;
-                    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let command = join_words(&words).map_err(Error::Sudo)?;
+                    let command = join_command(argv)?;
                     let mut args = self.mux_argv();
                     let program = args.remove(0);
                     args.extend(["--".to_owned(), self.host.clone(), command]);
@@ -1974,8 +1937,8 @@ mod tests {
             let path = located(h).await;
             let cmd = format!(
                 "env LC_ALL=C sudo -S -p '' -v && env LC_ALL=C sudo -S -p '' sh -c {} {}; exit $?",
-                quote_word(WRAPPER).unwrap(),
-                quote_word(path.to_str().unwrap()).unwrap()
+                quote(WRAPPER).unwrap(),
+                quote(path.to_str().unwrap()).unwrap()
             );
             assert_broken_stream(h.stage(&cmd, Some(two_password_lines())).await).await;
         }
@@ -2016,7 +1979,7 @@ mod tests {
             let path = located(h).await;
             let cmd = format!(
                 "sudo -S -p '' -v && printf 'SCPTO-SUDO-OK\\n' >&2 && exec sudo -n {}",
-                quote_word(path.to_str().unwrap()).unwrap()
+                quote(path.to_str().unwrap()).unwrap()
             );
             let started = h.stage(&cmd, Some(password_line(&pw()).unwrap())).await;
             let (child, tail) = assert_broken_stream(started).await;

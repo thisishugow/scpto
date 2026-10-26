@@ -33,6 +33,15 @@
 //! is decided by the session. The sudo password is never retained after a
 //! start: when a second sudo channel needs a password, the session asks
 //! again through `BgEvent::SudoPasswordRequired`.
+//!
+//! # Quoting (plan 7.3)
+//!
+//! [`quote`] and [`join_command`] are the crate's only POSIX shell quoting
+//! helper, used for every remote command string: the session's
+//! [`Connections::spawn_remote`] and probes, sudo's stage commands, and the
+//! `t` shell. Each word is wrapped in single quotes with every `'` written
+//! as `'\''`; a word containing `\n` fails with `Error::NewlineInPath`.
+//! rsync's `-e` string is not a shell command and is encoded by `sync`.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -43,6 +52,27 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use crate::error::Error;
 use crate::vfs::{Endpoint, Fs};
+
+/// Quotes one word for a remote POSIX shell: wrapped in single quotes, with
+/// every `'` written as `'\''`. A word containing a newline is rejected with
+/// [`Error::NewlineInPath`] (plan 7.3).
+pub fn quote(word: &str) -> Result<String, Error> {
+    if word.contains('\n') {
+        return Err(Error::NewlineInPath {
+            path: PathBuf::from(word),
+        });
+    }
+    Ok(format!("'{}'", word.replace('\'', r"'\''")))
+}
+
+/// Quotes every word with [`quote`] and joins them with single spaces.
+pub fn join_command(words: &[impl AsRef<str>]) -> Result<String, Error> {
+    let quoted = words
+        .iter()
+        .map(|word| quote(word.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(quoted.join(" "))
+}
 
 /// Which of a remote endpoint's two SFTP channels to use (plan 7.3 S17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -157,9 +187,8 @@ pub trait Connections: Send + Sync {
     /// `BatchMode=yes` and `ControlMaster=no`, after `ssh -O check`, spawned
     /// with `process_group(0)`, piped stdin and stdout, `kill_on_drop`, and
     /// stderr drained into [`RemoteChild::stderr`]. Callers pass raw words;
-    /// the implementation quotes each with the session's single quoting
-    /// helper, so an argument containing a newline fails with
-    /// `Error::NewlineInPath`.
+    /// the implementation quotes each with [`join_command`], so an argument
+    /// containing a newline fails with `Error::NewlineInPath`.
     fn spawn_remote<'a>(
         &'a self,
         endpoint: &'a Endpoint,
@@ -169,7 +198,7 @@ pub trait Connections: Send + Sync {
     /// The complete local `ssh` argv that reaches `endpoint`'s host through
     /// its master connection, without the destination host and without a
     /// remote command. The caller appends the host alias (and, for the shell,
-    /// the remote command quoted with the session's quoting helper).
+    /// the remote command quoted with [`join_command`]).
     ///
     /// Shape, in this order: [`SshClient::program`]; `-F <file>` when
     /// [`SshClient::config_file`] is set; `-o ControlPath=<path>`,
@@ -178,9 +207,9 @@ pub trait Connections: Send + Sync {
     /// - `interactive == false` (rsync `-e`): the plan 7.3 common options
     ///   `-o RemoteCommand=none -o RequestTTY=no -o ClearAllForwardings=yes
     ///   -o PermitLocalCommand=no -o ForwardX11=no -o ForwardAgent=no`, then
-    ///   `-o BatchMode=yes`. The sync runner joins the argv with the
-    ///   session's quoting helper into one `-e` string; rsync appends the
-    ///   host and its server command itself.
+    ///   `-o BatchMode=yes`. The sync runner encodes the argv for rsync's
+    ///   own `-e` parser (not a shell); rsync appends the host and its
+    ///   server command itself.
     /// - `interactive == true` (the `t` shell): only `-o RemoteCommand=none`
     ///   and `-t`, so the remote shell gets a terminal and OpenSSH may prompt.
     ///
@@ -201,6 +230,60 @@ pub trait Connections: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|line| (*line).to_string()).collect()
+    }
+
+    #[test]
+    fn quote_wraps_words_in_single_quotes() {
+        assert_eq!(quote("plain").unwrap(), "'plain'");
+        assert_eq!(quote("").unwrap(), "''");
+        assert_eq!(quote("a b").unwrap(), "'a b'");
+        assert_eq!(quote("it's").unwrap(), r"'it'\''s'");
+        assert_eq!(quote("$HOME `x` \"y\"").unwrap(), "'$HOME `x` \"y\"'");
+        assert_eq!(quote("\u{7a7a}\u{767d}").unwrap(), "'\u{7a7a}\u{767d}'");
+    }
+
+    #[test]
+    fn quote_rejects_newlines() {
+        assert_eq!(
+            quote("a\nb"),
+            Err(Error::NewlineInPath {
+                path: PathBuf::from("a\nb")
+            })
+        );
+        // A carriage return alone is an ordinary byte for the shell.
+        assert_eq!(quote("a\rb").unwrap(), "'a\rb'");
+    }
+
+    #[test]
+    fn join_command_quotes_every_word() {
+        let words = lines(&["tar", "-C", "/srv/my dir", "-xf", "-"]);
+        assert_eq!(
+            join_command(&words).unwrap(),
+            "'tar' '-C' '/srv/my dir' '-xf' '-'"
+        );
+        assert_eq!(join_command(&[] as &[String]).unwrap(), "");
+        assert!(matches!(
+            join_command(&lines(&["ok", "bad\nname"])),
+            Err(Error::NewlineInPath { .. })
+        ));
+    }
+
+    #[test]
+    fn quoted_words_survive_a_real_shell() {
+        let words = lines(&["printf", "%s|", "a b", "it's", "$HOME", "\\", "*"]);
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(join_command(&words).unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "a b|it's|$HOME|\\|*|"
+        );
+    }
 
     #[test]
     fn connections_handle_is_dyn_compatible_and_shareable() {

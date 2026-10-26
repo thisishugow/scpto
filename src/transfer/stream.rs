@@ -10,11 +10,18 @@
 //!
 //! - The part file is the final destination with `.scpto-part` appended to
 //!   its file name, in the same directory.
-//! - When the source mode is known, the part file is chmodded to
-//!   `part_mode` (the source's `mode & 0o777` plus owner read and write,
-//!   so a read-only source can still be resumed) right after it is opened
-//!   and before the first byte is written, for both a fresh and a resumed
-//!   part. Group and other bits never exceed the source's.
+//! - The part mode is `part_mode`: the source's `mode & 0o777` plus owner
+//!   read and write (so a read-only source can still be resumed), or
+//!   `0o600` when the source mode is unknown. Group and other bits never
+//!   exceed the source's.
+//! - A fresh part (`resume_from == 0`) is created with the part mode
+//!   (`WriteMode::Truncate { permissions }`), so it is restricted from the
+//!   moment it exists. A part left behind by an earlier attempt is removed
+//!   first: its inode may be open in another process, and creating a new
+//!   one is the only way the new data never reaches that descriptor.
+//! - A resumed part already exists, so creation bits do not apply: it is
+//!   chmodded to the part mode before it is opened, which narrows a part
+//!   whose source became more private since the part was started.
 //! - `resume_from > 0` opens the part file with `WriteMode::Resume` and the
 //!   source with `open_read(source, resume_from)`; `0` truncates. Deciding
 //!   whether resuming is allowed (the `partials.json` record) is the
@@ -33,9 +40,9 @@
 //! - `copy_within` path: when both sides are the same endpoint and
 //!   `capabilities().copy_within`, the server copies the whole file to the
 //!   part path (`resume_from` does not apply), which is then renamed as
-//!   above; progress jumps to `size` at the end. When the source mode is
-//!   known, the part is first created empty and chmodded to `part_mode`:
-//!   the server's copy truncates the existing file, which keeps its mode.
+//!   above; progress jumps to `size` at the end. The part is first created
+//!   empty as a fresh part (above): the server's copy truncates the
+//!   existing file, which keeps its mode.
 //! - Errors are returned unchanged; `FsError::Disconnected` lets the engine
 //!   park the item as `WaitingForReconnect`.
 
@@ -47,7 +54,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
 use crate::error::FsError;
-use crate::vfs::{Fs, WriteMode};
+use crate::vfs::{Fs, FsWriter, WriteMode};
 
 /// Suffix appended to the destination file name while a copy is running.
 pub const PART_SUFFIX: &str = ".scpto-part";
@@ -72,9 +79,9 @@ pub fn part_path(destination: &Path) -> PathBuf {
 /// Permission bits of a part file whose source has permission bits
 /// `source_mode`: the source's `mode & 0o777` with owner read and write
 /// added, so the part can be reopened for resume even when the source is
-/// read-only.
-fn part_mode(source_mode: u32) -> u32 {
-    (source_mode & 0o777) | 0o600
+/// read-only; `0o600` when the source mode is unknown.
+fn part_mode(source_mode: Option<u32>) -> u32 {
+    source_mode.map_or(0o600, |mode| (mode & 0o777) | 0o600)
 }
 
 /// What [`copy_file`] copies.
@@ -115,9 +122,11 @@ pub async fn copy_file(
 
     let same_endpoint = spec.source.endpoint() == spec.destination.endpoint();
     if same_endpoint && spec.destination.capabilities().copy_within {
-        if let Some(mode) = spec.mode {
-            create_restricted_part(spec.destination, &part, mode).await?;
-        }
+        create_fresh_part(spec.destination, &part, spec.mode)
+            .await?
+            .shutdown()
+            .await
+            .map_err(|error| io_error(&error, &part))?;
         spec.destination
             .copy_within(spec.source_path, &part)
             .await?;
@@ -142,20 +151,21 @@ pub async fn copy_file(
     Ok(())
 }
 
-/// Creates `part` empty with `part_mode(mode)` so that the data a
-/// server-side copy writes into it is never exposed under the server's
-/// default mode.
-async fn create_restricted_part(
+/// Opens a new, empty `part` created with `part_mode(mode)`, removing any
+/// part left behind first (see the module contract).
+async fn create_fresh_part(
     destination: &dyn Fs,
     part: &Path,
-    mode: u32,
-) -> Result<(), FsError> {
-    let mut writer = destination.open_write(part, WriteMode::Truncate).await?;
-    destination.chmod(part, part_mode(mode)).await?;
-    writer
-        .shutdown()
+    mode: Option<u32>,
+) -> Result<FsWriter, FsError> {
+    match destination.remove_file(part).await {
+        Ok(()) | Err(FsError::NotFound { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    let permissions = part_mode(mode);
+    destination
+        .open_write(part, WriteMode::Truncate { permissions })
         .await
-        .map_err(|error| io_error(&error, part))
 }
 
 /// Streams the source (from `resume_from`) into the part file and commits
@@ -165,21 +175,19 @@ async fn stream_into_part(
     part: &Path,
     progress: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<(), FsError> {
-    let write_mode = if spec.resume_from > 0 {
-        WriteMode::Resume {
-            offset: spec.resume_from,
-        }
-    } else {
-        WriteMode::Truncate
-    };
     let mut reader = spec
         .source
         .open_read(spec.source_path, spec.resume_from)
         .await?;
-    let mut writer = spec.destination.open_write(part, write_mode).await?;
-    if let Some(mode) = spec.mode {
-        spec.destination.chmod(part, part_mode(mode)).await?;
-    }
+    let mut writer = if spec.resume_from > 0 {
+        spec.destination.chmod(part, part_mode(spec.mode)).await?;
+        let offset = spec.resume_from;
+        spec.destination
+            .open_write(part, WriteMode::Resume { offset })
+            .await?
+    } else {
+        create_fresh_part(spec.destination, part, spec.mode).await?
+    };
 
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut total = spec.resume_from;
@@ -871,13 +879,19 @@ pub(crate) mod test_support {
                 let mut state = lock(&self.state);
                 MemFs::parent_is_dir(&state.nodes, path)?;
                 let position = match mode {
-                    WriteMode::Truncate => {
+                    WriteMode::Truncate { permissions } => {
+                        // Like `open(2)`: a new file gets the requested bits,
+                        // an existing one keeps its mode.
+                        let mode = state
+                            .nodes
+                            .get(path)
+                            .map_or(permissions & 0o777, |existing| existing.mode);
                         state.nodes.insert(
                             path.to_path_buf(),
                             Meta {
                                 node: Node::File(Vec::new()),
                                 mtime: 0,
-                                mode: 0o644,
+                                mode,
                             },
                         );
                         0
@@ -1137,17 +1151,9 @@ mod tests {
         let part = web.meta("/id_rsa.scpto-part").expect("part while copying");
         assert_eq!(part.node, Node::File(b"0123".to_vec()));
         assert_eq!(part.mode, 0o600);
-        let calls = web.calls();
-        let opened = calls
-            .iter()
-            .position(|call| *call == (Op::OpenWrite, PathBuf::from("/id_rsa.scpto-part")));
-        let restricted = calls
-            .iter()
-            .position(|call| *call == (Op::Chmod, PathBuf::from("/id_rsa.scpto-part")));
-        assert!(
-            opened.is_some() && opened < restricted,
-            "chmod follows the open: {calls:?}"
-        );
+        // Created restricted: no chmod is needed before the data.
+        assert!(web.called(Op::OpenWrite, "/id_rsa.scpto-part"));
+        assert!(!web.called(Op::Chmod, "/id_rsa.scpto-part"));
 
         drop(copy);
         let part = web
@@ -1197,11 +1203,12 @@ mod tests {
 
     #[test]
     fn part_mode_never_widens_group_or_other() {
-        assert_eq!(part_mode(0o600), 0o600);
-        assert_eq!(part_mode(0o400), 0o600);
-        assert_eq!(part_mode(0o640), 0o640);
-        assert_eq!(part_mode(0o4755), 0o755);
-        assert_eq!(part_mode(0o444), 0o644);
+        assert_eq!(part_mode(Some(0o600)), 0o600);
+        assert_eq!(part_mode(Some(0o400)), 0o600);
+        assert_eq!(part_mode(Some(0o640)), 0o640);
+        assert_eq!(part_mode(Some(0o4755)), 0o755);
+        assert_eq!(part_mode(Some(0o444)), 0o644);
+        assert_eq!(part_mode(None), 0o600);
     }
 
     #[tokio::test]
@@ -1229,7 +1236,40 @@ mod tests {
             .into_iter()
             .filter(|op| matches!(op, Op::OpenWrite | Op::Chmod | Op::CopyWithin))
             .collect();
-        assert_eq!(order, vec![Op::OpenWrite, Op::Chmod, Op::CopyWithin]);
+        assert_eq!(order, vec![Op::OpenWrite, Op::CopyWithin]);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_copy_replaces_a_stale_part_instead_of_reusing_it() {
+        let local = MemFs::new(Endpoint::Local);
+        let web = MemFs::new(remote());
+        local.add_file("/id_rsa", b"0123456789", 5, 0o600);
+        // A world-readable part from an earlier, unrelated attempt.
+        web.add_file("/id_rsa.scpto-part", b"stale", 0, 0o644);
+        let _gate = local.gate_reads("/id_rsa", 4);
+        let source = Path::new("/id_rsa");
+        let mut copy = spec(&local, &web, source, source, 10);
+        copy.mode = Some(0o600);
+        let mut copy = Box::pin(copy_file(copy, &|_| {}));
+        run_until_blocked(copy.as_mut()).await;
+        assert!(web.called(Op::RemoveFile, "/id_rsa.scpto-part"));
+        let part = web.meta("/id_rsa.scpto-part").expect("new part");
+        assert_eq!(part.node, Node::File(b"0123".to_vec()));
+        assert_eq!(part.mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_source_mode_gives_an_owner_only_part() {
+        let local = MemFs::new(Endpoint::Local);
+        let web = MemFs::new(remote());
+        local.add_file("/a.txt", b"0123456789", 5, 0o644);
+        let _gate = local.gate_reads("/a.txt", 4);
+        let source = Path::new("/a.txt");
+        let mut copy = spec(&local, &web, source, source, 10);
+        copy.mode = None;
+        let mut copy = Box::pin(copy_file(copy, &|_| {}));
+        run_until_blocked(copy.as_mut()).await;
+        assert_eq!(web.meta("/a.txt.scpto-part").expect("part").mode, 0o600);
     }
 
     #[tokio::test]

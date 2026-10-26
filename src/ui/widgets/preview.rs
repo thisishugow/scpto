@@ -46,7 +46,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, StatefulWidget, Widget, Wrap};
 use ratatui_image::thread::ThreadProtocol;
 use ratatui_image::StatefulImage;
 
-use super::sync_view::format_size;
+use super::format::format_size;
 use crate::vfs::{Entry, EntryKind, SpecialKind};
 
 /// What the preview shows.

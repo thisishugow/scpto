@@ -9,9 +9,9 @@
 //! into `Effect::ListDir` and `Effect::RememberDirectory`. Core does not
 //! implement features: transfers, dialogs, connections, sync, edit, and
 //! preview handle their own actions and events in their modules, and core
-//! routes to them by input mode and event kind (the routing arms that do
-//! not belong to core return no effects until the features are wired in
-//! Wave 3).
+//! routes to them by input mode and event kind as specified in "Wave 3
+//! routing" below (until that wiring lands, the arms that do not belong to
+//! core return no effects).
 //!
 //! # Behavior
 //!
@@ -132,6 +132,117 @@
 //!
 //! Until the first `Action::Resize` the size is 0x0, so every page height is
 //! 0 (which panes treat as 1); the runtime sends the initial size first.
+//!
+//! # Wave 3 routing (integration owner; the feature methods are specified
+//! in each feature module's "Public API")
+//!
+//! Feature action handlers share one shape: `fn <feature>_action(&mut self,
+//! action: Action) -> Result<Vec<Effect>, Action>`; `Ok` claims the action,
+//! `Err` hands it back unchanged for the next handler. Background events go
+//! to one method per event kind (no decline; core routes by kind), except
+//! `TimerFired`, which each timer-owning feature claims by id
+//! (`Option<Vec<Effect>>`). Features never call each other: they read and
+//! write each other's documented `pub` state fields, push dialogs onto
+//! `DialogState::stack`, and leave answers in `DialogState::answer`, which
+//! core routes.
+//!
+//! `input_mode`, first match wins:
+//!
+//! 1. `dialog_input_mode()` (`TextField` / `Dialog` for the top dialog,
+//!    else `Picker` while a picker is open);
+//! 2. `preview_input_mode()` (`Viewer`: help screen or full preview);
+//! 3. `sync_input_mode()` (`SyncView`);
+//! 4. `Queue` while the queue panel has focus;
+//! 5. `Filter` while typing a filter;
+//! 6. `Browse`.
+//!
+//! `handle_action` (after `Resize`, which stays core's):
+//!
+//! | Mode | Chain (first `Ok` wins; what nobody claims is dropped) |
+//! |---|---|
+//! | `TextField`, `Dialog`, `Picker` | `dialog_action` |
+//! | `Viewer` | `preview_action` |
+//! | `SyncView` | `sync_action` → `preview_action` (claims `Help`) |
+//! | `Queue` | `transfer_action` → `preview_action` (claims `Help`) → core `queue_action` |
+//! | `Filter` | core `filter_action`; `Paste` inserts its characters into the filter (`Pane::edit_filter`); an action that ends typing continues with the `Browse` chain |
+//! | `Browse` | `transfer_action` → `dialog_action` → `connection_action` → `preview_action` → `edit_action` → `sync_action` → core `browse_action` |
+//!
+//! Inside core's own arms: `Quit` returns `transfer_quit_requested()` (2);
+//! `Open` on an entry that is not enterable returns
+//! `preview_open(side)`; every `Effect::Connect` core emits is followed by
+//! `connection_connecting(&endpoint)`. After every action handled in
+//! `Browse` or `Filter` mode (any chain member), core appends
+//! `preview_cursor_moved()`. After every action, core takes
+//! `self.dialog.answer` and routes it:
+//!
+//! | Answer | Handler |
+//! |---|---|
+//! | `Dialog` with `Conflict`, `TarConflict`, `FinderDrop` | `transfer_dialog_answer` |
+//! | `Dialog` with `SudoPassword`, `Vpn` | `connection_dialog_answer` |
+//! | `Dialog` with `ConfirmSync` | `sync_dialog_answer` |
+//! | `Dialog` with `EditConflict`, `EditUploadFailed` | `edit_dialog_answer` |
+//! | `Dialog` with `QuitWhileRunning` | core: `DialogButton::Yes` → `[Effect::Quit]` |
+//! | `Picked { kind: PickerKind::Hosts { side }, target }` | `connection_picked(side, target)` |
+//!
+//! (The dialog feature handles `MakeDir`, `Rename`, `Chmod`, `Delete`,
+//! `TrashFailed`, `Notice`, and bookmark picks itself and never leaves them
+//! in `answer`.)
+//!
+//! `handle_event`:
+//!
+//! | Event | Handlers, in order |
+//! |---|---|
+//! | `Listed` | core `listed`, then `preview_cursor_moved` |
+//! | `Connected` | core `connected`, then `connection_connected` |
+//! | `ConnectFailed` | core (status, `connecting`), then `connection_failed` |
+//! | `InteractiveAuthRequired` | `connection_interactive_auth` |
+//! | `SudoPasswordRequired` | `connection_sudo_password_required` |
+//! | `Disconnected` | core (status message), then `connection_disconnected` |
+//! | `Reconnecting` | `connection_reconnecting` |
+//! | `Reconnected` | core `refresh_endpoint`, then `connection_reconnected` |
+//! | `HostResolved` | `connection_host_resolved` |
+//! | `VpnFinished` | `connection_vpn_finished` |
+//! | `FsOpFinished` | `dialog_fs_op_finished` |
+//! | `DroppedPathsChecked` | `transfer_dropped_paths_checked` |
+//! | `Transfer(event)` | `transfer_event`, then `sync_jobs_settled`, then `connection_release_unused` (3) |
+//! | `Compared` | `sync_compared` |
+//! | `SyncFinished` | `sync_finished`, then `connection_release_unused` |
+//! | `PreviewLoaded` | `preview_loaded` |
+//! | `ImageResized` | `preview_image_resized` |
+//! | `EditFinished` | `edit_finished`, then `connection_release_unused` |
+//! | `ShellExited` | core: an `Err` is an error status; `Ok` refreshes the focused pane (the shell may have changed files) |
+//! | `Revealed` | core: an `Err` is an error status |
+//! | `StateWriteFailed` | core (error status) |
+//! | `TimerFired { id, at }` | `connection_timer`, else `preview_timer` |
+//!
+//! Wiring points:
+//!
+//! 1. `App::new` ends with `connection_open_picker(PaneSide::Right)` when
+//!    `right` is `None` (the host picker opens on the right pane at
+//!    startup).
+//! 2. `Quit` passes the transfer feature's check first:
+//!    `transfer_quit_requested()` answers `[Effect::Quit]` or opens the
+//!    confirmation.
+//! 3. `Effect::Disconnect` is the connection feature's decision:
+//!    `connection_release_unused()` runs after `switch_endpoint` and after
+//!    the events marked above. For every endpoint it disconnects, core
+//!    forgets that endpoint's entry in `homes` and `connecting`, so showing
+//!    it again connects it again.
+//! 4. Aliases that `Groups::is_excluded` excludes get no `ResolveHost` in
+//!    `App::new` (and the picker leaves them out).
+//! 5. Core's private `last_directory` / `remember_directory` helpers are
+//!    replaced by `PersistedState::last_directory` /
+//!    `PersistedState::remember_directory`, and `add_bookmark` uses
+//!    `PersistedState::add_bookmark`.
+//! 6. `Effect::Connect(Endpoint::Local)` is answered by the session
+//!    executor (`Sessions::connect`) with `Connected { Local, home }`; core
+//!    keeps emitting it for a local pane without a start directory.
+//! 7. The runtime sends `Action::Resize` with the terminal size before the
+//!    first frame is drawn.
+//!
+//! Startup also shows the warning of `state::load_state` (a corrupt or
+//! unreadable `state.json`) with `CoreState::set_status` right after
+//! `App::new`, unless the ssh configuration warning is already shown.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;

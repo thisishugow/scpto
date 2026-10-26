@@ -154,8 +154,16 @@ impl Entry {
 /// How [`Fs::open_write`] opens its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
-    /// Create the file, or truncate it if it exists.
-    Truncate,
+    /// Create the file, or truncate it if it exists. A file this call
+    /// creates gets at most `permissions & 0o777` from the start (the
+    /// endpoint's umask may clear more bits), so no data written through the
+    /// writer is ever more widely readable than that; an existing file keeps
+    /// its permissions. Callers that need exact bits on the final file
+    /// `chmod` it after the data is committed.
+    Truncate {
+        /// Permission bits of a newly created file.
+        permissions: u32,
+    },
     /// Open an existing file and write starting at `offset`, used to resume
     /// a `.scpto-part` file. Bytes before `offset` are kept.
     Resume {
@@ -258,10 +266,71 @@ pub trait Fs: Send + Sync {
     fn copy_within<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, FsResult<()>>;
 }
 
+/// Permanently removes `path` and, when it is a directory, everything
+/// beneath it (children before their directory; symlinks are removed, never
+/// followed). A path that is already gone counts as removed. Shared by the
+/// permanent delete of the file executor and the sync's deletion of
+/// extraneous destination entries.
+pub async fn remove_tree(fs: &dyn Fs, path: &Path) -> FsResult<()> {
+    // (path, listed): a listed directory is removed once its children are.
+    let mut pending = vec![(path.to_path_buf(), false)];
+    while let Some((path, listed)) = pending.pop() {
+        if listed {
+            fs.remove_dir(&path).await?;
+            continue;
+        }
+        let entry = match fs.lstat(&path).await {
+            Ok(entry) => entry,
+            Err(FsError::NotFound { .. }) => continue,
+            Err(error) => return Err(error),
+        };
+        if entry.kind == EntryKind::Dir {
+            let children = fs.list(&path).await?;
+            pending.push((path.clone(), true));
+            pending.extend(
+                children
+                    .into_iter()
+                    .map(|child| (path.join(child.name), false)),
+            );
+        } else {
+            match fs.remove_file(&path).await {
+                Ok(()) | Err(FsError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn remove_tree_removes_children_first_and_tolerates_missing_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("a/b")).expect("mkdir");
+        std::fs::write(root.join("a/b/file"), b"x").expect("write");
+        std::fs::write(root.join("top"), b"y").expect("write");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("mkdir");
+        std::fs::write(outside.join("kept"), b"z").expect("write");
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
+        let fs = local::LocalFs::new();
+
+        remove_tree(&fs, &root).await.expect("remove tree");
+        assert!(!root.exists());
+        // The symlink was removed, not followed.
+        assert!(outside.join("kept").exists());
+        remove_tree(&fs, &root).await.expect("already gone");
+
+        let file = dir.path().join("single");
+        std::fs::write(&file, b"x").expect("write");
+        remove_tree(&fs, &file).await.expect("remove file");
+        assert!(!file.exists());
+    }
 
     #[test]
     fn fs_handle_is_dyn_compatible_and_shareable() {

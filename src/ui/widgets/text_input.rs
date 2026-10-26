@@ -1,8 +1,10 @@
 //! Single-line text input widget with caret and optional masking.
 //!
 //! The visible window scrolls horizontally to keep the caret in view. A
-//! masked field draws one `*` per character and never copies the value
-//! (the sudo password lives only in its `Zeroizing` buffer).
+//! masked field draws a fixed run of [`MASK_LEN`] `*` once it is non-empty
+//! (nothing while empty), with the caret after the run: typing shows that a
+//! key registered without revealing the password's length. It never copies
+//! the value (the sudo password lives only in its `Zeroizing` buffer).
 //!
 //! This module also holds the crate-internal text helpers the widgets share
 //! (control-character sanitizing, cell widths, and ellipsis truncation).
@@ -39,6 +41,9 @@ const CONTROL_PLACEHOLDER: char = '?';
 /// Appended (or prepended) when text is cut to fit.
 const ELLIPSIS: &str = "\u{2026}";
 
+/// Number of `*` a non-empty masked field shows, whatever its length.
+pub const MASK_LEN: usize = 8;
+
 /// Style of the field row while it has focus.
 const FOCUSED: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 
@@ -52,7 +57,7 @@ pub struct TextInputView<'a> {
     pub value: &'a str,
     /// Caret position in characters, `0..=value.chars().count()`.
     pub caret: usize,
-    /// Draw one `*` per character instead of the content.
+    /// Draw [`MASK_LEN`] `*` (nothing while empty) instead of the content.
     pub masked: bool,
     /// Whether the field has focus (highlighted, caret shown).
     pub focused: bool,
@@ -84,16 +89,19 @@ pub fn render(view: &TextInputView<'_>, area: Rect, buf: &mut Buffer) -> Option<
     Clear.render(row, buf);
     buf.set_style(row, style);
 
-    let display: Cow<'_, str> = if view.masked {
-        Cow::Owned("*".repeat(view.value.chars().count()))
+    let (display, caret): (Cow<'_, str>, usize) = if view.masked {
+        // The caret sits after the fixed run, which says nothing about where
+        // it is inside the hidden value.
+        let mask = if view.value.is_empty() { 0 } else { MASK_LEN };
+        (Cow::Owned("*".repeat(mask)), mask)
     } else {
-        sanitize(view.value)
+        // `sanitize` maps characters one to one, so the caret's character
+        // index is valid in `display` as well.
+        (sanitize(view.value), view.caret)
     };
-    // `sanitize` maps characters one to one, so the caret's character index
-    // is valid in `display` as well.
     let caret_byte = display
         .char_indices()
-        .nth(view.caret)
+        .nth(caret)
         .map_or(display.len(), |(offset, _)| offset);
 
     let clusters = clusters(&display);
@@ -323,19 +331,44 @@ mod tests {
     }
 
     #[test]
-    fn masked_value_draws_stars_and_debug_redacts() {
+    fn masked_value_draws_a_fixed_run_and_debug_redacts() {
         let view = TextInputView {
             value: "hunter2",
-            caret: 7,
+            caret: 3,
             masked: true,
             focused: true,
         };
         let (buf, caret) = draw(&view, 10);
-        assert_eq!(row_text(&buf, 0), "*******   ");
-        assert_eq!(caret, Some(Position::new(7, 0)));
+        assert_eq!(row_text(&buf, 0), "********  ");
+        assert_eq!(caret, Some(Position::new(8, 0)));
         let debug = format!("{view:?}");
         assert!(!debug.contains("hunter2"), "{debug}");
         assert!(debug.contains("<redacted>"));
+
+        // The run does not depend on the length.
+        let long = "x".repeat(40);
+        let (buf, _) = draw(
+            &TextInputView {
+                value: &long,
+                caret: 40,
+                ..view
+            },
+            10,
+        );
+        assert_eq!(row_text(&buf, 0), "********  ");
+    }
+
+    #[test]
+    fn empty_masked_value_draws_nothing() {
+        let view = TextInputView {
+            value: "",
+            caret: 0,
+            masked: true,
+            focused: true,
+        };
+        let (buf, caret) = draw(&view, 10);
+        assert_eq!(row_text(&buf, 0), "          ");
+        assert_eq!(caret, Some(Position::new(0, 0)));
     }
 
     #[test]

@@ -27,12 +27,19 @@
 //!   which is the Browse channel. A remote symlink is resolved with
 //!   `canonicalize` first, so the upload replaces the link target and the
 //!   link itself survives. Only regular files can be edited.
-//! - The upload writes `<name>.scpto-part` next to the file, applies the
-//!   original mode to the part file before any data is written, shuts the
-//!   writer down (committing the data), then renames the part onto the file
-//!   (`Fs::rename` handles servers without `posix-rename`). When the upload
-//!   fails, the part file is removed when possible and the temp file with
-//!   the edits is kept until the runtime cleans up on exit.
+//! - The upload writes `<name>.scpto-part` next to the file, created with
+//!   the original `mode & 0o777` (`0o600` when the mode is unknown, for
+//!   example for a remote file deleted in the meantime) so the edits are
+//!   never more widely readable than the original, shuts the writer down
+//!   (committing the data), renames the part onto the file (`Fs::rename`
+//!   handles servers without `posix-rename`), then sets the exact original
+//!   mode, which restores bits the server's umask cleared at creation.
+//! - No edit is ever lost: once the editor saved, every failure (reading
+//!   the temp file, the remote re-check, the upload) is reported as
+//!   [`EditOutcome::UploadFailed`] with the temp file's path, which is kept
+//!   until the runtime cleans up on exit; the part file is removed when
+//!   possible. The app shows the path and can retry the upload with
+//!   `Effect::ResolveEditConflict { overwrite: true }`.
 //! - Change detection for remote files compares the size, then the bytes,
 //!   of the temp file with the downloaded content. Local files are edited in
 //!   place and compared by size and full-precision modification time.
@@ -44,7 +51,8 @@
 //! - On `Unchanged` and `Uploaded` the per-download subdirectory is removed.
 //!   [`resolve_conflict`] removes the temp file and its subdirectory after
 //!   uploading or discarding; discarding reports `Unchanged` with
-//!   `quick_exit: false`.
+//!   `quick_exit: false`. A failed upload there is `UploadFailed` as well,
+//!   and the temp file stays.
 //!
 //! The runtime runs the command from [`editor_command`] with
 //! `term::TerminalGuard::run_foreground` between [`prepare`] and
@@ -124,6 +132,14 @@ pub enum EditOutcome {
     RemoteChanged {
         /// The local temp file holding the user's edits.
         temp: PathBuf,
+    },
+    /// The edits could not be uploaded. They are kept at `temp` (until scpto
+    /// exits), so the user can retry or copy them elsewhere.
+    UploadFailed {
+        /// The local temp file holding the user's edits.
+        temp: PathBuf,
+        /// Why the upload failed.
+        error: Error,
     },
 }
 
@@ -305,9 +321,13 @@ pub async fn finish(
         Origin::Remote(copy) => copy,
     };
 
-    let edited = tokio::fs::read(&session.file)
-        .await
-        .map_err(|error| FsError::from_io(&error, &session.file))?;
+    let edited = match tokio::fs::read(&session.file).await {
+        Ok(edited) => edited,
+        Err(error) => {
+            let error = FsError::from_io(&error, &session.file).into();
+            return Ok(upload_failed(session.file, error));
+        }
+    };
     if edited.len() == copy.content.len() && edited == copy.content {
         remove_session_dir(&copy.dir).await?;
         return Ok(EditOutcome::Unchanged { quick_exit });
@@ -316,24 +336,32 @@ pub async fn finish(
     let unchanged_remotely = match fs.stat(&copy.path).await {
         Ok(entry) => entry.size == copy.size && entry.mtime == copy.mtime,
         Err(FsError::NotFound { .. }) => false,
-        Err(error) => return Err(error.into()),
+        Err(error) => return Ok(upload_failed(session.file, error.into())),
     };
     if !unchanged_remotely {
         return Ok(EditOutcome::RemoteChanged { temp: session.file });
     }
 
-    upload(fs, &copy.path, &edited, copy.mode).await?;
+    if let Err(error) = upload(fs, &copy.path, &edited, copy.mode).await {
+        return Ok(upload_failed(session.file, error.into()));
+    }
     remove_session_dir(&copy.dir).await?;
     Ok(EditOutcome::Uploaded)
+}
+
+/// The outcome of a failed upload: the edits stay at `temp`.
+fn upload_failed(temp: PathBuf, error: Error) -> EditOutcome {
+    EditOutcome::UploadFailed { temp, error }
 }
 
 /// `Effect::ResolveEditConflict`: uploads `temp` over the remote file when
 /// `overwrite`, then removes `temp` either way.
 ///
-/// `temp` is the path from [`EditOutcome::RemoteChanged`]. The upload keeps
-/// the mode the remote file has now; a remote file deleted in the meantime
-/// is recreated with the server's default mode. When the upload fails,
-/// `temp` is kept.
+/// `temp` is the path from [`EditOutcome::RemoteChanged`] or
+/// [`EditOutcome::UploadFailed`]. The upload keeps the mode the remote file
+/// has now; a remote file deleted in the meantime is recreated with mode
+/// `0o600`. When the upload fails, the outcome is `UploadFailed` and `temp`
+/// is kept.
 pub async fn resolve_conflict(
     fs: &dyn Fs,
     location: &Location,
@@ -341,26 +369,34 @@ pub async fn resolve_conflict(
     overwrite: bool,
 ) -> Result<EditOutcome, Error> {
     let outcome = if overwrite {
-        let edited = tokio::fs::read(temp)
-            .await
-            .map_err(|error| FsError::from_io(&error, temp))?;
-        let path = match fs.canonicalize(&location.path).await {
-            Ok(path) => path,
-            Err(FsError::NotFound { .. }) => location.path.clone(),
-            Err(error) => return Err(error.into()),
-        };
-        let mode = match fs.stat(&path).await {
-            Ok(entry) => entry.mode,
-            Err(FsError::NotFound { .. }) => None,
-            Err(error) => return Err(error.into()),
-        };
-        upload(fs, &path, &edited, mode).await?;
+        if let Err(error) = overwrite_with(fs, location, temp).await {
+            return Ok(upload_failed(temp.to_path_buf(), error.into()));
+        }
         EditOutcome::Uploaded
     } else {
         EditOutcome::Unchanged { quick_exit: false }
     };
     remove_temp_file(temp).await?;
     Ok(outcome)
+}
+
+/// Uploads the edits in `temp` over `location`, keeping the mode the remote
+/// file has now.
+async fn overwrite_with(fs: &dyn Fs, location: &Location, temp: &Path) -> FsResult<()> {
+    let edited = tokio::fs::read(temp)
+        .await
+        .map_err(|error| FsError::from_io(&error, temp))?;
+    let path = match fs.canonicalize(&location.path).await {
+        Ok(path) => path,
+        Err(FsError::NotFound { .. }) => location.path.clone(),
+        Err(error) => return Err(error),
+    };
+    let mode = match fs.stat(&path).await {
+        Ok(entry) => entry.mode,
+        Err(FsError::NotFound { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    upload(fs, &path, &edited, mode).await
 }
 
 /// Reads a whole remote file.
@@ -394,11 +430,12 @@ async fn write_part_and_rename(
     content: &[u8],
     mode: Option<u32>,
 ) -> FsResult<()> {
-    let mut writer = fs.open_write(part, WriteMode::Truncate).await?;
-    // Restrict the part file before any edited data reaches it.
-    if let Some(mode) = mode {
-        fs.chmod(part, mode).await?;
-    }
+    // Created restricted, so no edited data is ever more widely readable
+    // than the original.
+    let permissions = mode.map_or(0o600, |mode| mode & 0o777);
+    let mut writer = fs
+        .open_write(part, WriteMode::Truncate { permissions })
+        .await?;
     writer
         .write_all(content)
         .await
@@ -408,7 +445,11 @@ async fn write_part_and_rename(
         .await
         .map_err(|error| FsError::from_io(&error, part))?;
     drop(writer);
-    fs.rename(part, path).await
+    fs.rename(part, path).await?;
+    match mode {
+        Some(mode) => fs.chmod(path, mode).await,
+        None => Ok(()),
+    }
 }
 
 /// `<path>.scpto-part`, in the same directory.
@@ -537,6 +578,8 @@ mod tests {
         /// Seconds clock used as the mtime of committed writes.
         clock: i64,
         fail_writes: bool,
+        /// `stat` fails as if the connection were lost.
+        fail_stat: bool,
     }
 
     /// In-memory remote file system with the operations `edit` uses.
@@ -662,6 +705,9 @@ mod tests {
         fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, FsResult<Entry>> {
             Box::pin(async move {
                 let state = self.state.lock().unwrap();
+                if state.fail_stat {
+                    return Err(FsError::Disconnected);
+                }
                 let resolved = resolve(&state, path);
                 let name = path.file_name().unwrap_or_default().to_owned();
                 if let Some(file) = state.files.get(&resolved) {
@@ -777,18 +823,23 @@ mod tests {
             mode: WriteMode,
         ) -> BoxFuture<'a, FsResult<FsWriter>> {
             Box::pin(async move {
-                assert_eq!(mode, WriteMode::Truncate, "edit never resumes");
+                let WriteMode::Truncate { permissions } = mode else {
+                    panic!("edit never resumes");
+                };
                 let mut state = self.state.lock().unwrap();
-                state.log.push(format!("open_write {}", path.display()));
+                state
+                    .log
+                    .push(format!("open_write {} {permissions:o}", path.display()));
                 // Creating the file makes it visible (as on a real server)
-                // with a default mode; data is committed on shutdown.
+                // with the requested mode, minus a 022 umask; data is
+                // committed on shutdown.
                 let mtime = state.clock;
                 state.files.insert(
                     path.to_path_buf(),
                     MockFile {
                         data: Vec::new(),
                         mtime,
-                        mode: 0o644,
+                        mode: permissions & 0o755,
                     },
                 );
                 let writer: FsWriter = Box::pin(MockWriter {
@@ -953,9 +1004,9 @@ mod tests {
         assert_eq!(
             fs.log(),
             [
-                "open_write /srv/secret.env.scpto-part",
-                "chmod /srv/secret.env.scpto-part 600",
+                "open_write /srv/secret.env.scpto-part 600",
                 "rename /srv/secret.env.scpto-part /srv/secret.env",
+                "chmod /srv/secret.env 600",
             ]
         );
         assert!(!dir.exists());
@@ -1116,18 +1167,105 @@ mod tests {
         stub_editor_saves(&file, b"mine");
         fs.state.lock().unwrap().fail_writes = true;
 
-        let error = finish(session, &fs, SLOW).await.unwrap_err();
+        let outcome = finish(session, &fs, SLOW).await.unwrap();
 
         assert_eq!(
-            error,
-            Error::Fs(FsError::Io {
-                path: "/srv/a.txt.scpto-part".into(),
-                message: "disk full".into(),
-            })
+            outcome,
+            EditOutcome::UploadFailed {
+                temp: file.clone(),
+                error: Error::Fs(FsError::Io {
+                    path: "/srv/a.txt.scpto-part".into(),
+                    message: "disk full".into(),
+                }),
+            }
         );
         assert!(fs.file("/srv/a.txt.scpto-part").is_none());
         assert_eq!(fs.file("/srv/a.txt").unwrap().data, b"v1");
         assert_eq!(std::fs::read(&file).unwrap(), b"mine");
+
+        // The kept edits can be uploaded once the problem is gone.
+        fs.state.lock().unwrap().fail_writes = false;
+        let location = fs.location("/srv/a.txt");
+        let outcome = resolve_conflict(&fs, &location, &file, true).await.unwrap();
+        assert_eq!(outcome, EditOutcome::Uploaded);
+        assert_eq!(fs.file("/srv/a.txt").unwrap().data, b"mine");
+        assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_remote_recheck_keeps_the_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        let fs = MockFs::new();
+        fs.add_file("/srv/a.txt", b"v1", 0o644);
+        let session = prepare(&fs, fs.location("/srv/a.txt"), temp.path())
+            .await
+            .unwrap();
+        let file = session.file.clone();
+        stub_editor_saves(&file, b"mine");
+        fs.state.lock().unwrap().fail_stat = true;
+
+        let outcome = finish(session, &fs, SLOW).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            EditOutcome::UploadFailed {
+                temp: file.clone(),
+                error: Error::Fs(FsError::Disconnected),
+            }
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"mine");
+    }
+
+    #[tokio::test]
+    async fn a_failed_overwrite_keeps_the_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let fs = MockFs::new();
+        fs.add_file("/srv/a.txt", b"v1", 0o644);
+        let edits = temp.path().join("a.txt");
+        std::fs::write(&edits, b"mine").unwrap();
+        fs.state.lock().unwrap().fail_writes = true;
+
+        let outcome = resolve_conflict(&fs, &fs.location("/srv/a.txt"), &edits, true)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&outcome, EditOutcome::UploadFailed { temp, .. } if *temp == edits),
+            "{outcome:?}"
+        );
+        assert_eq!(std::fs::read(&edits).unwrap(), b"mine");
+        assert_eq!(fs.file("/srv/a.txt").unwrap().data, b"v1");
+    }
+
+    #[tokio::test]
+    async fn a_recreated_file_is_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let fs = MockFs::new();
+        let edits = temp.path().join("gone.txt");
+        std::fs::write(&edits, b"mine").unwrap();
+
+        resolve_conflict(&fs, &fs.location("/srv/gone.txt"), &edits, true)
+            .await
+            .unwrap();
+
+        assert_eq!(fs.file("/srv/gone.txt").unwrap().mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn the_exact_original_mode_survives_the_umask() {
+        let temp = tempfile::tempdir().unwrap();
+        let fs = MockFs::new();
+        fs.add_file("/srv/shared.txt", b"a", 0o664);
+        let session = prepare(&fs, fs.location("/srv/shared.txt"), temp.path())
+            .await
+            .unwrap();
+        stub_editor_saves(&session.file, b"b");
+
+        finish(session, &fs, SLOW).await.unwrap();
+
+        // The mock's umask cleared group write at creation; the final chmod
+        // puts it back.
+        assert_eq!(fs.file("/srv/shared.txt").unwrap().mode, 0o664);
     }
 
     #[tokio::test]

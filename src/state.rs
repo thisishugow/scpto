@@ -11,10 +11,14 @@
 //! in the same directory (created with mode 0700 when missing) and is
 //! renamed over the target, so readers never see a half-written file.
 //! Concurrent scpto instances are not coordinated: the last writer wins.
-//! A missing file loads as the empty value; an unreadable or unparsable file
-//! is `Error::StateRead` (the caller reports it and continues with the empty
-//! value, so the next save replaces the bad file). Failed writes are
-//! `Error::StateWrite`.
+//! A missing file loads as the empty value. `state.json` never stops
+//! startup (plan 2.6): an unparsable file is renamed to `state.json.bak`
+//! (replacing an older backup) and loads as the empty state with the
+//! warning `Error::StateCorrupt`, so the user's bookmarks can still be
+//! recovered by hand; an unreadable file loads as the empty state with
+//! `Error::StateRead`. The caller shows the warning, and the next save
+//! writes a fresh file. An unreadable or unparsable `partials.json` is
+//! `Error::StateRead`. Failed writes are `Error::StateWrite`.
 //!
 //! # Public API
 //!
@@ -26,7 +30,8 @@
 //! pub fn state_dir(xdg_state_home: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf>;
 //!
 //! /// Blocking file I/O; async callers use `spawn_blocking`.
-//! pub fn load_state(dir: &Path) -> Result<PersistedState, Error>;
+//! /// Never fails: the state to use plus a warning to show, if any.
+//! pub fn load_state(dir: &Path) -> (PersistedState, Option<Error>);
 //! pub fn save_state(dir: &Path, state: &PersistedState) -> Result<(), Error>;
 //! pub fn load_partials(dir: &Path) -> Result<Partials, Error>;
 //! pub fn save_partials(dir: &Path, partials: &Partials) -> Result<(), Error>;
@@ -88,6 +93,8 @@ const APP_DIR: &str = "scpto";
 const STATE_FILE: &str = "state.json";
 /// File name of [`Partials`].
 const PARTIALS_FILE: &str = "partials.json";
+/// Name a corrupt [`STATE_FILE`] is moved to.
+const STATE_BACKUP_FILE: &str = "state.json.bak";
 
 /// The contents of `state.json`.
 ///
@@ -222,9 +229,39 @@ pub fn state_dir(xdg_state_home: Option<&OsStr>, home: Option<&Path>) -> Option<
     Some(base.join(APP_DIR))
 }
 
-/// Loads `state.json`; a missing file gives the empty state. Blocking.
-pub fn load_state(dir: &Path) -> Result<PersistedState, Error> {
-    load_json(&dir.join(STATE_FILE))
+/// Loads `state.json`: the state to use and a warning to show, if any. A
+/// missing file is the empty state without a warning; an unparsable one is
+/// moved to `state.json.bak` and gives the empty state with
+/// `Error::StateCorrupt`; an unreadable one gives the empty state with
+/// `Error::StateRead`. Blocking.
+pub fn load_state(dir: &Path) -> (PersistedState, Option<Error>) {
+    let path = dir.join(STATE_FILE);
+    let message = match read_json(&path) {
+        Ok(state) => return (state, None),
+        Err(JsonFailure::Unreadable(message)) => {
+            return (
+                PersistedState::default(),
+                Some(Error::StateRead { path, message }),
+            )
+        }
+        Err(JsonFailure::Corrupt(message)) => message,
+    };
+    let backup = dir.join(STATE_BACKUP_FILE);
+    let warning = match fs::rename(&path, &backup) {
+        Ok(()) => Error::StateCorrupt {
+            path,
+            backup,
+            message,
+        },
+        Err(error) => Error::StateRead {
+            message: format!(
+                "{message} (keeping a copy at {} failed: {error})",
+                backup.display()
+            ),
+            path,
+        },
+    };
+    (PersistedState::default(), Some(warning))
 }
 
 /// Saves `state.json` atomically, creating `dir` (mode 0700) when missing.
@@ -244,17 +281,32 @@ pub fn save_partials(dir: &Path, partials: &Partials) -> Result<(), Error> {
     save_json(&dir.join(PARTIALS_FILE), partials)
 }
 
-fn load_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T, Error> {
-    let read_error = |message: String| Error::StateRead {
-        path: path.to_path_buf(),
-        message,
-    };
+/// Why a JSON state file could not be loaded.
+enum JsonFailure {
+    /// Reading the file failed.
+    Unreadable(String),
+    /// The file was read but is not valid for its type.
+    Corrupt(String),
+}
+
+/// Reads and parses a JSON file; a missing file is `T::default()`.
+fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T, JsonFailure> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(T::default()),
-        Err(error) => return Err(read_error(error.to_string())),
+        Err(error) => return Err(JsonFailure::Unreadable(error.to_string())),
     };
-    serde_json::from_slice(&bytes).map_err(|error| read_error(error.to_string()))
+    serde_json::from_slice(&bytes).map_err(|error| JsonFailure::Corrupt(error.to_string()))
+}
+
+/// [`read_json`] with both failures as `Error::StateRead`.
+fn load_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T, Error> {
+    read_json(path).map_err(|failure| Error::StateRead {
+        path: path.to_path_buf(),
+        message: match failure {
+            JsonFailure::Unreadable(message) | JsonFailure::Corrupt(message) => message,
+        },
+    })
 }
 
 fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
@@ -510,10 +562,7 @@ mod tests {
     #[test]
     fn missing_files_load_as_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(
-            load_state(dir.path()).expect("state"),
-            PersistedState::default()
-        );
+        assert_eq!(load_state(dir.path()), (PersistedState::default(), None));
         assert_eq!(
             load_partials(dir.path()).expect("partials"),
             Partials::default()
@@ -529,7 +578,7 @@ mod tests {
         state.remember_directory(sudo_location());
         state.add_bookmark(local("/b"));
         save_state(&dir, &state).expect("save");
-        assert_eq!(load_state(&dir).expect("load"), state);
+        assert_eq!(load_state(&dir), (state, None));
         let mode = fs::metadata(&dir).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
 
@@ -548,19 +597,42 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_is_a_read_error_and_the_next_save_replaces_it() {
+    fn corrupt_file_is_kept_as_a_backup_with_a_warning_and_the_next_save_replaces_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
+        let backup = dir.path().join("state.json.bak");
+        fs::write(&backup, "older backup").expect("write");
         fs::write(&path, "{not json").expect("write");
-        assert!(matches!(
-            load_state(dir.path()),
-            Err(Error::StateRead { path: reported, .. }) if reported == path
-        ));
-        save_state(dir.path(), &PersistedState::default()).expect("save");
-        assert_eq!(
-            load_state(dir.path()).expect("load"),
-            PersistedState::default()
+        let (state, warning) = load_state(dir.path());
+        assert_eq!(state, PersistedState::default());
+        assert!(
+            matches!(
+                &warning,
+                Some(Error::StateCorrupt { path: reported, backup: kept, .. })
+                    if *reported == path && *kept == backup
+            ),
+            "{warning:?}"
         );
+        assert_eq!(fs::read(&backup).expect("backup"), b"{not json");
+        assert!(!path.exists());
+
+        save_state(dir.path(), &PersistedState::default()).expect("save");
+        assert_eq!(load_state(dir.path()), (PersistedState::default(), None));
+    }
+
+    #[test]
+    fn unreadable_state_is_a_warning_with_the_empty_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory where the file should be cannot be read as one.
+        let path = dir.path().join("state.json");
+        fs::create_dir(&path).expect("mkdir");
+        let (state, warning) = load_state(dir.path());
+        assert_eq!(state, PersistedState::default());
+        assert!(
+            matches!(&warning, Some(Error::StateRead { path: reported, .. }) if *reported == path),
+            "{warning:?}"
+        );
+        assert!(path.is_dir(), "nothing is moved when nothing could be read");
     }
 
     #[test]

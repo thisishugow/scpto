@@ -6,7 +6,10 @@
 //! `list` uses `symlink_metadata` per entry and `metadata` on symlinks only
 //! to fill `target_is_dir` (a dangling link is not an error). Modes are
 //! `mode & 0o7777`; mtimes are whole seconds. `home` is `$HOME`.
-//! `open_write` with `WriteMode::Resume { offset }` opens the existing file
+//! `open_write` with `WriteMode::Truncate { permissions }` creates a new
+//! file through `open(2)` with `permissions & 0o777` as its mode (minus the
+//! umask), so the bits are in place from the start; an existing file keeps
+//! its mode. `WriteMode::Resume { offset }` opens the existing file
 //! without truncating and seeks to `offset`. `copy_within` is
 //! `FsError::Unsupported` (local copies stream like any other); `trash`
 //! failures are `FsError::TrashFailed` so the app can offer a permanent
@@ -423,10 +426,14 @@ impl Fs for LocalFs {
     ) -> BoxFuture<'a, FsResult<FsWriter>> {
         Box::pin(async move {
             let file = match mode {
-                WriteMode::Truncate => {
+                WriteMode::Truncate { permissions } => {
                     open_regular(
                         path,
-                        OpenOptions::new().write(true).create(true).truncate(true),
+                        OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(permissions & 0o777),
                     )
                     .await?
                 }
@@ -687,7 +694,10 @@ mod tests {
             fs.open_read(&pipe, 0).await,
             Err(FsError::Io { path, .. }) if path == pipe
         ));
-        assert!(fs.open_write(&pipe, WriteMode::Truncate).await.is_err());
+        assert!(fs
+            .open_write(&pipe, WriteMode::Truncate { permissions: 0o644 })
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -695,8 +705,20 @@ mod tests {
         let (_guard, root) = tempdir();
         let fs = LocalFs::new();
         let file = root.join("out.scpto-part");
-        write_all(&fs, &file, WriteMode::Truncate, b"stale contents").await;
-        write_all(&fs, &file, WriteMode::Truncate, b"0123").await;
+        write_all(
+            &fs,
+            &file,
+            WriteMode::Truncate { permissions: 0o644 },
+            b"stale contents",
+        )
+        .await;
+        write_all(
+            &fs,
+            &file,
+            WriteMode::Truncate { permissions: 0o644 },
+            b"0123",
+        )
+        .await;
         assert_eq!(std::fs::read(&file).unwrap(), b"0123");
 
         write_all(&fs, &file, WriteMode::Resume { offset: 4 }, b"4567").await;
@@ -713,6 +735,38 @@ mod tests {
             fs.open_write(&missing, WriteMode::Resume { offset: 0 }).await,
             Err(FsError::NotFound { path }) if path == missing
         ));
+    }
+
+    #[tokio::test]
+    async fn truncate_creates_with_the_given_permissions_and_keeps_existing_ones() {
+        let (_guard, root) = tempdir();
+        let fs = LocalFs::new();
+        let secret = root.join("id_rsa.scpto-part");
+        let mut writer = fs
+            .open_write(&secret, WriteMode::Truncate { permissions: 0o600 })
+            .await
+            .expect("open_write");
+        // The bits are in place before any data is written.
+        let mode = std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        writer.write_all(b"key").await.expect("write");
+        writer.shutdown().await.expect("shutdown");
+
+        // Bits beyond 0o777 are never applied, and an existing file keeps
+        // its mode when truncated.
+        std::fs::set_permissions(&secret, Permissions::from_mode(0o640)).unwrap();
+        write_all(
+            &fs,
+            &secret,
+            WriteMode::Truncate {
+                permissions: 0o4600,
+            },
+            b"new",
+        )
+        .await;
+        let mode = std::fs::metadata(&secret).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(std::fs::read(&secret).unwrap(), b"new");
     }
 
     #[tokio::test]

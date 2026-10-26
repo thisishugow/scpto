@@ -28,8 +28,6 @@
 //! `ListHit::first_visible` and `ListHit::row_count` count positions in
 //! `visible`, like `cursor`.
 
-use std::mem::MaybeUninit;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -38,6 +36,7 @@ use ratatui::widgets::{Block, Clear, Widget};
 
 use crate::sync::{Comparison, ComparisonEntry, DiffStatus};
 use crate::ui::hit::ListHit;
+use crate::ui::widgets::format::{format_local_mtime, format_size};
 use crate::vfs::{Entry, EntryKind, Location};
 
 /// The narrowest the path column gets before detail columns are dropped.
@@ -138,7 +137,7 @@ impl Columns {
         let size_x = x + 1 + SIZE_WIDTH.saturating_sub(text_width(&size));
         buf.set_stringn(size_x, y, &size, usize::from(SIZE_WIDTH), style);
         if self.detail == Detail::SizeAndTime {
-            if let Some(time) = entry.mtime.and_then(format_mtime) {
+            if let Some(time) = entry.mtime.and_then(format_local_mtime) {
                 let time_x = x + 1 + SIZE_WIDTH + 1;
                 buf.set_stringn(time_x, y, &time, usize::from(TIME_WIDTH), style);
             }
@@ -322,49 +321,6 @@ fn text_width(text: &str) -> u16 {
     u16::try_from(Line::raw(text).width()).unwrap_or(u16::MAX)
 }
 
-/// Formats a byte count with binary units, for example `512 B` or
-/// `12.4 MiB`. Shared by the widgets that show sizes.
-pub(crate) fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    // 1023.95 and up would print as `1024.0`; promote it to the next unit.
-    while value >= 1023.95 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
-}
-
-/// Formats seconds since the Unix epoch as local `YYYY-MM-DD HH:MM`;
-/// `None` when the C library cannot represent the time (a year beyond
-/// `i32`).
-fn format_mtime(seconds: i64) -> Option<String> {
-    // time_t is 64-bit on every supported target (64-bit macOS and Linux).
-    let time: libc::time_t = seconds;
-    let mut tm = MaybeUninit::<libc::tm>::uninit();
-    // SAFETY: both pointers are valid for the duration of the call;
-    // localtime_r either fills the whole `tm` and returns its address or
-    // returns null without promising anything about it.
-    let result = unsafe { libc::localtime_r(&time, tm.as_mut_ptr()) };
-    if result.is_null() {
-        return None;
-    }
-    // SAFETY: localtime_r returned non-null, so it initialized `tm`.
-    let tm = unsafe { tm.assume_init() };
-    Some(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        i64::from(tm.tm_year) + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -516,7 +472,7 @@ mod tests {
             cursor: 0,
             first_visible: 0,
         };
-        let time = format_mtime(1_700_000_100).unwrap();
+        let time = format_local_mtime(1_700_000_100).unwrap();
         assert_eq!(time.len(), 16);
         let (wide, _) = draw(&view, 100, 5);
         assert!(row_text(&wide, 2).contains(&time));
@@ -603,16 +559,5 @@ mod tests {
         assert_eq!(status_label(DiffStatus::SizeDiffers), "size");
         assert_eq!(status_label(DiffStatus::KindDiffers), "kind");
         assert_eq!(status_label(DiffStatus::Same), "=");
-    }
-
-    #[test]
-    fn sizes_use_binary_units() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-        assert_eq!(format_size(1024), "1.0 KiB");
-        assert_eq!(format_size(1536), "1.5 KiB");
-        assert_eq!(format_size(1024 * 1024 - 1), "1.0 MiB");
-        assert_eq!(format_size(13 * 1024 * 1024 * 1024), "13.0 GiB");
-        assert_eq!(format_size(u64::MAX), "16.0 EiB");
     }
 }

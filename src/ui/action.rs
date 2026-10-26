@@ -549,18 +549,25 @@ pub enum Effect {
     },
     /// Copy the given relative paths one way, via rsync or as an engine job
     /// with id `job`. An rsync sync reports no per-file progress; the queue
-    /// shows it as indeterminate until `BgEvent::SyncFinished`.
+    /// shows it as indeterminate until `BgEvent::SyncFinished`. Selected
+    /// paths that exist only on the destination side are deleted there when
+    /// `delete_extraneous` is set, else left alone (see `sync`).
     Sync {
         /// Job id used for the engine path and for `SyncFinished`.
         job: JobId,
         /// Copy direction.
         direction: SyncDirection,
-        /// The left directory.
-        left: Location,
-        /// The right directory.
-        right: Location,
-        /// Paths relative to both directories.
+        /// The comparison the paths were selected from: its `left` and
+        /// `right` are the two directories, and its entries tell the engine
+        /// path which selected paths are files or symlinks on the source
+        /// (`sync::engine_job`) and which exist only on the destination
+        /// (`sync::extraneous`).
+        comparison: Box<Comparison>,
+        /// The selected paths, relative to both directories.
         paths: Vec<PathBuf>,
+        /// Delete selected destination-only paths (default off; the
+        /// checkbox of the sync confirmation).
+        delete_extraneous: bool,
     },
     /// Cancel a sync started by [`Effect::Sync`]. The sync executor knows
     /// which backend runs it: it kills rsync (answered by
@@ -723,8 +730,10 @@ pub enum BgEvent {
         /// The comparison or its failure.
         result: Result<Box<Comparison>, Error>,
     },
-    /// An rsync-based sync finished (engine-based syncs report through
-    /// `Transfer` events of the same job id).
+    /// An rsync-based sync finished, or an engine-based sync failed before
+    /// its job was submitted (deleting extraneous destination paths).
+    /// Engine-based syncs otherwise report through `Transfer` events of the
+    /// same job id.
     SyncFinished {
         /// The sync's job id.
         job: JobId,

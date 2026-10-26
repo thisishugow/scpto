@@ -1,7 +1,6 @@
 //! One connection per remote host: the per-process ControlMaster,
 //! multiplexed background children, two SFTP channels per endpoint, error
-//! classification, the single remote-command quoting helper, remote tool
-//! probes, exponential backoff reconnect, and teardown. `Sessions`
+//! classification, remote tool probes, exponential backoff reconnect, and teardown. `Sessions`
 //! implements `connections::Connections`.
 //!
 //! # Master lifecycle (plan 2.5, 7.3, 8.5)
@@ -65,12 +64,11 @@
 //! - VPN hint eligibility is `ConnectError::vpn_hint_eligible()`; matching
 //!   the `vpn` rule is the app's job (`Settings::vpn_rule`).
 //!
-//! # Quoting helper (7.3)
+//! # Quoting (7.3)
 //!
-//! Every remote command string (tar `-C`, rsync `-e`, the `t` shell, probes,
-//! sudo) is built with `quote` / `join_command`: each word is wrapped in
-//! single quotes with `'` written as `'\''`; a word containing `\n` fails
-//! with `Error::NewlineInPath`. The `t` shell's command is
+//! Every remote command string (tar `-C`, the `t` shell, probes, sudo) is
+//! built with `connections::quote` / `connections::join_command`, the one
+//! quoting helper of the crate. The `t` shell's command is
 //! `cd '<dir>' && exec "$SHELL" -l` built so that `$SHELL` sits inside the
 //! single-quoted remote command and expands remotely.
 //!
@@ -145,9 +143,6 @@
 //! }
 //!
 //! /// Pure helpers.
-//! pub fn quote(word: &str) -> Result<String, Error>;
-//! /// Quotes every word and joins them with single spaces.
-//! pub fn join_command(words: &[String]) -> Result<String, Error>;
 //! /// `min(base * 2^(attempt - 1), cap)` for one-based `attempt`.
 //! pub fn backoff_delay(attempt: u32, base: Duration, cap: Duration) -> Duration;
 //! /// Classifies a finished, unsuccessful ssh process by exit status and
@@ -168,7 +163,6 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,7 +177,8 @@ use tokio::sync::{watch, Notify, OnceCell};
 use tokio::task::JoinHandle;
 
 use crate::connections::{
-    rsync_version_ok, Connections, FsChannel, RemoteChild, RemoteTools, SshClient, StderrTail,
+    join_command, rsync_version_ok, Connections, FsChannel, RemoteChild, RemoteTools, SshClient,
+    StderrTail,
 };
 use crate::error::{ConnectError, Error, ExitStatus, FsError, SudoError, UnreachableReason};
 use crate::settings::{Settings, KEEPALIVE_COUNT_MAX};
@@ -222,27 +217,6 @@ const TOOLS_MARKER: &str = "--scpto-rsync--";
 /// The tool probe, run as `sh -c <script>` as the login user.
 const TOOLS_SCRIPT: &str = "if command -v tar >/dev/null 2>&1; then echo tar=yes; \
      else echo tar=no; fi; echo --scpto-rsync--; rsync --version 2>/dev/null; exit 0";
-
-/// Quotes one word for a remote POSIX shell: wrapped in single quotes, with
-/// every `'` written as `'\''`. A word containing a newline is rejected with
-/// [`Error::NewlineInPath`] (plan 7.3).
-pub fn quote(word: &str) -> Result<String, Error> {
-    if word.contains('\n') {
-        return Err(Error::NewlineInPath {
-            path: PathBuf::from(word),
-        });
-    }
-    Ok(format!("'{}'", word.replace('\'', r"'\''")))
-}
-
-/// Quotes every word with [`quote`] and joins them with single spaces.
-pub fn join_command(words: &[String]) -> Result<String, Error> {
-    let quoted = words
-        .iter()
-        .map(|word| quote(word))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(quoted.join(" "))
-}
 
 /// The wait before retry number `attempt` (one-based):
 /// `min(base * 2^(attempt - 1), cap)`. Attempt 0 counts as attempt 1.
@@ -876,7 +850,7 @@ impl Shared {
             Ok(())
         } else {
             Err(classify_ssh_exit(
-                exit_status(output.status),
+                output.status.into(),
                 &stderr_lines(&output.stderr),
             ))
         }
@@ -1024,7 +998,7 @@ impl Shared {
         if status.success() {
             Ok(parse_tools(&output))
         } else {
-            Err(child_failure(&program(), exit_status(status), &stderr))
+            Err(child_failure(&program(), status.into(), &stderr))
         }
     }
 }
@@ -1159,17 +1133,6 @@ fn not_connected(endpoint: &Endpoint) -> Error {
 fn ssh_unavailable(error: io::Error) -> ConnectError {
     ConnectError::SshUnavailable {
         message: error.to_string(),
-    }
-}
-
-/// How a finished process ended, in the crate's terms.
-fn exit_status(status: std::process::ExitStatus) -> ExitStatus {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => ExitStatus::Code(code),
-        (None, Some(signal)) => ExitStatus::Signal(signal),
-        // `wait` reports only exited or signaled children; keep the raw
-        // status visible should that ever change.
-        (None, None) => ExitStatus::Code(status.into_raw()),
     }
 }
 
@@ -1359,56 +1322,6 @@ mod tests {
     }
 
     #[test]
-    fn quote_wraps_words_in_single_quotes() {
-        assert_eq!(quote("plain").unwrap(), "'plain'");
-        assert_eq!(quote("").unwrap(), "''");
-        assert_eq!(quote("a b").unwrap(), "'a b'");
-        assert_eq!(quote("it's").unwrap(), r"'it'\''s'");
-        assert_eq!(quote("$HOME `x` \"y\"").unwrap(), "'$HOME `x` \"y\"'");
-        assert_eq!(quote("\u{7a7a}\u{767d}").unwrap(), "'\u{7a7a}\u{767d}'");
-    }
-
-    #[test]
-    fn quote_rejects_newlines() {
-        assert_eq!(
-            quote("a\nb"),
-            Err(Error::NewlineInPath {
-                path: PathBuf::from("a\nb")
-            })
-        );
-        // A carriage return alone is an ordinary byte for the shell.
-        assert_eq!(quote("a\rb").unwrap(), "'a\rb'");
-    }
-
-    #[test]
-    fn join_command_quotes_every_word() {
-        let words = lines(&["tar", "-C", "/srv/my dir", "-xf", "-"]);
-        assert_eq!(
-            join_command(&words).unwrap(),
-            "'tar' '-C' '/srv/my dir' '-xf' '-'"
-        );
-        assert_eq!(join_command(&[]).unwrap(), "");
-        assert!(matches!(
-            join_command(&lines(&["ok", "bad\nname"])),
-            Err(Error::NewlineInPath { .. })
-        ));
-    }
-
-    #[test]
-    fn quoted_words_survive_a_real_shell() {
-        let words = lines(&["printf", "%s|", "a b", "it's", "$HOME", "\\", "*"]);
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(join_command(&words).unwrap())
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
-            "a b|it's|$HOME|\\|*|"
-        );
-    }
-
-    #[test]
     fn backoff_doubles_up_to_the_cap() {
         let base = Duration::from_secs(1);
         let cap = Duration::from_secs(30);
@@ -1574,16 +1487,6 @@ mod tests {
                 detail: "ssh ended with killed by signal 9".into()
             }
         );
-    }
-
-    #[test]
-    fn exit_status_conversion() {
-        use std::process::ExitStatus as StdStatus;
-        assert_eq!(
-            exit_status(StdStatus::from_raw(255 << 8)),
-            ExitStatus::Code(255)
-        );
-        assert_eq!(exit_status(StdStatus::from_raw(9)), ExitStatus::Signal(9));
     }
 
     #[test]

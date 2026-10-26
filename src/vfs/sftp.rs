@@ -34,6 +34,17 @@
 //! and renames again. This is not atomic (plan 7.5 S14): a failure between
 //! the two steps leaves the target removed.
 //!
+//! `open_write` with `WriteMode::Truncate { permissions }` truncates an
+//! existing file (which keeps its mode); a missing file is created with
+//! `create_new` and restricted to `permissions & 0o777` with `fsetstat` on
+//! the new handle before the writer is returned, so no data is written to
+//! it before the bits are in place. `openssh-sftp-client` 0.15 always sends
+//! empty attributes with `SSH_FXP_OPEN`, so the bits cannot travel with the
+//! open itself: between the two requests (one round trip) the empty file
+//! has the server's default mode. A user who opens it in that window can
+//! read what is written later; closing that window needs open attributes
+//! from the client library.
+//!
 //! Reads and writes are pipelined: a reader keeps up to 2 MiB of 64 KiB
 //! read requests in flight and a writer up to 2 MiB of write requests, so
 //! throughput does not collapse to one request per round trip. A writer's
@@ -538,19 +549,34 @@ impl Fs for SftpFs {
         mode: WriteMode,
     ) -> BoxFuture<'a, FsResult<FsWriter>> {
         Box::pin(async move {
+            let open_error = |error: SftpError| self.fail(&error, path, "open for writing");
             let mut options = self.sftp.options();
             options.write(true);
-            let offset = match mode {
-                WriteMode::Truncate => {
-                    options.create(true).truncate(true);
-                    0
+            let (file, offset) = match mode {
+                WriteMode::Truncate { permissions } => match self.lstat(path).await {
+                    Ok(_) => {
+                        options.create(true).truncate(true);
+                        (options.open(path).await.map_err(open_error)?, 0)
+                    }
+                    Err(FsError::NotFound { .. }) => {
+                        // `create_new` guarantees that the handle is the file
+                        // this call created, so restricting it cannot touch
+                        // anything else.
+                        options.create_new(true);
+                        let mut file = options.open(path).await.map_err(open_error)?;
+                        // The mask keeps the value within 9 bits.
+                        let bits = Permissions::from((permissions & 0o777) as u16);
+                        file.set_permissions(bits)
+                            .await
+                            .map_err(|error| self.fail(&error, path, "change permissions"))?;
+                        (file, 0)
+                    }
+                    Err(error) => return Err(error),
+                },
+                WriteMode::Resume { offset } => {
+                    (options.open(path).await.map_err(open_error)?, offset)
                 }
-                WriteMode::Resume { offset } => offset,
             };
-            let file = options
-                .open(path)
-                .await
-                .map_err(|error| self.fail(&error, path, "open for writing"))?;
             let writer = SftpWriter::new(file, offset, path, self.lost.clone());
             Ok(Box::pin(writer) as FsWriter)
         })
@@ -1402,7 +1428,13 @@ mod tests {
         let data = pattern(5 * 1024 * 1024 + 12_345);
         let fs = local_fs().await;
 
-        write_file(&fs, &path, WriteMode::Truncate, &data).await;
+        write_file(
+            &fs,
+            &path,
+            WriteMode::Truncate { permissions: 0o644 },
+            &data,
+        )
+        .await;
         assert_eq!(std::fs::read(&path).expect("local read"), data);
         assert_eq!(read_file(&fs, &path, 0).await, data);
         let offset = 3 * CHUNK + 7;
@@ -1412,8 +1444,45 @@ mod tests {
             .is_empty());
 
         // Truncate replaces longer content entirely.
-        write_file(&fs, &path, WriteMode::Truncate, b"short").await;
+        write_file(
+            &fs,
+            &path,
+            WriteMode::Truncate { permissions: 0o644 },
+            b"short",
+        )
+        .await;
         assert_eq!(std::fs::read(&path).expect("local read"), b"short");
+    }
+
+    #[tokio::test]
+    async fn truncate_creates_restricted_files_and_keeps_existing_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("id_rsa.scpto-part");
+        let fs = local_fs().await;
+        let mut writer = fs
+            .open_write(&path, WriteMode::Truncate { permissions: 0o600 })
+            .await
+            .expect("open_write");
+        // The bits are in place before any data is written.
+        let mode =
+            |path: &Path| std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(mode(&path), 0o600);
+        writer.write_all(b"key").await.expect("write");
+        writer.shutdown().await.expect("shutdown");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        write_file(
+            &fs,
+            &path,
+            WriteMode::Truncate {
+                permissions: 0o4600,
+            },
+            b"new",
+        )
+        .await;
+        assert_eq!(mode(&path), 0o640, "an existing file keeps its mode");
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
     }
 
     #[tokio::test]
@@ -1448,7 +1517,7 @@ mod tests {
         let path = dir.path().join("f");
         let fs = local_fs().await;
         let mut writer = fs
-            .open_write(&path, WriteMode::Truncate)
+            .open_write(&path, WriteMode::Truncate { permissions: 0o644 })
             .await
             .expect("open_write");
         writer.write_all(b"abc").await.expect("write");
@@ -2013,7 +2082,15 @@ mod tests {
             fs.mkdir(&work).await.expect("mkdir work");
             let data = pattern(3 * 1024 * 1024 + 99);
             let part = work.join("big.scpto-part");
-            write_file(fs, &part, WriteMode::Truncate, &data[..1_000_000]).await;
+            write_file(
+                fs,
+                &part,
+                WriteMode::Truncate { permissions: 0o600 },
+                &data[..1_000_000],
+            )
+            .await;
+            // The part was created with the requested bits.
+            assert_eq!(fs.lstat(&part).await.expect("part").mode, Some(0o600));
             write_file(
                 fs,
                 &part,
@@ -2021,7 +2098,13 @@ mod tests {
                 &data[1_000_000..],
             )
             .await;
-            write_file(fs, &work.join("big"), WriteMode::Truncate, b"old").await;
+            write_file(
+                fs,
+                &work.join("big"),
+                WriteMode::Truncate { permissions: 0o644 },
+                b"old",
+            )
+            .await;
             fs.rename(&part, &work.join("big")).await.expect("rename");
             assert_eq!(read_file(fs, &work.join("big"), 0).await, data);
             fs.remove_file(&work.join("big")).await.expect("remove");

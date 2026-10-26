@@ -2,6 +2,7 @@
 
 pub mod dialog;
 pub mod drag_label;
+pub mod format;
 pub mod help;
 pub mod pane;
 pub mod picker;

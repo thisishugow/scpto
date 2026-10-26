@@ -60,7 +60,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileTimes};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -73,7 +72,7 @@ use tokio::task::JoinHandle;
 use tokio_util::io::SyncIoBridge;
 
 use crate::connections::{Connections, RemoteChild, StderrTail};
-use crate::error::{ConnectError, Error, ExitStatus, FsError};
+use crate::error::{ConnectError, Error, FsError};
 use crate::vfs::Endpoint;
 
 /// Buffer between the tar crate's small reads and writes and the pipe.
@@ -446,7 +445,7 @@ async fn settle(
     if !status.success() {
         return Err(Error::CommandFailed {
             program: "tar".to_owned(),
-            status: exit_status(status),
+            status: status.into(),
             stderr: stderr_text(stderr),
         });
     }
@@ -455,16 +454,6 @@ async fn settle(
         Some(error) => Err(Error::Archive {
             message: error.to_string(),
         }),
-    }
-}
-
-fn exit_status(status: std::process::ExitStatus) -> ExitStatus {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => ExitStatus::Code(code),
-        (None, Some(signal)) => ExitStatus::Signal(signal),
-        // A Unix status without a code always carries a signal; reporting it
-        // as status -1 keeps the failure visible should that ever change.
-        (None, None) => ExitStatus::Code(-1),
     }
 }
 
@@ -553,6 +542,7 @@ mod tests {
 
     use super::*;
     use crate::connections::{FsChannel, RemoteTools};
+    use crate::error::ExitStatus;
     use crate::vfs::Fs;
 
     /// One node of a directory tree as compared by the tests.
@@ -913,14 +903,6 @@ mod tests {
         assert_eq!(
             stderr_text(&tail),
             "tar: x: Cannot stat\ntar: Exiting with failure status"
-        );
-        assert_eq!(
-            exit_status(std::process::ExitStatus::from_raw(2 << 8)),
-            ExitStatus::Code(2)
-        );
-        assert_eq!(
-            exit_status(std::process::ExitStatus::from_raw(9)),
-            ExitStatus::Signal(9)
         );
     }
 
