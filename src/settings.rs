@@ -19,7 +19,7 @@
 //! [`ConfigPath`] resolves both this file and sshto's group file (`groups`)
 //! with the same rules.
 //!
-//! # Public API (Wave 2 implements `parse` and `load`)
+//! # Public API
 //!
 //! ```text
 //! /// Parses settings text. Lines are split on `\n` (a trailing `\r` is
@@ -48,8 +48,11 @@
 //! ```
 
 use std::ffi::OsStr;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::error::ConfigError;
 
 /// Environment variable naming an explicit settings file.
 pub const CONFIG_ENV: &str = "SCPTO_CONFIG";
@@ -199,6 +202,123 @@ impl Default for Settings {
     }
 }
 
+/// Parses settings text. Lines are split on `\n` (a trailing `\r` is
+/// dropped); empty lines and lines starting with `#` are skipped. The first
+/// bad line fails with [`ConfigError::Parse`] carrying its one-based number.
+pub fn parse(path: &Path, text: &str) -> Result<Settings, ConfigError> {
+    let mut settings = Settings::default();
+    // Lines of the reconnect keys, for the cross-key check after the file.
+    let mut base_line = None;
+    let mut cap_line = None;
+    for (index, raw) in text.split('\n').enumerate() {
+        let line = index + 1;
+        let content = raw.strip_suffix('\r').unwrap_or(raw);
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let fail = |message: String| ConfigError::Parse {
+            path: path.to_path_buf(),
+            line,
+            message,
+        };
+        let mut fields = content.splitn(3, '|');
+        let directive = fields.next().unwrap_or_default();
+        match (directive, fields.next(), fields.next()) {
+            (DIRECTIVE_SET, Some(key), Some(value)) => match key {
+                KEY_CONCURRENCY => settings.concurrency = count(key, value, 1).map_err(fail)?,
+                KEY_TAR_THRESHOLD => settings.tar_threshold = count(key, value, 1).map_err(fail)?,
+                KEY_SHOW_HIDDEN => {
+                    settings.show_hidden = value.parse().map_err(|_| {
+                        fail(format!("{key} must be true or false, got \"{value}\""))
+                    })?;
+                }
+                KEY_MTIME_TOLERANCE => {
+                    settings.mtime_tolerance = number(key, value, 0).map_err(fail)?;
+                }
+                KEY_RECONNECT_BASE_MS => {
+                    settings.reconnect_base =
+                        Duration::from_millis(number(key, value, 1).map_err(fail)?);
+                    base_line = Some(line);
+                }
+                KEY_RECONNECT_CAP_MS => {
+                    settings.reconnect_cap =
+                        Duration::from_millis(number(key, value, 1).map_err(fail)?);
+                    cap_line = Some(line);
+                }
+                KEY_KEEPALIVE_INTERVAL => {
+                    settings.keepalive_interval =
+                        Duration::from_secs(number(key, value, 1).map_err(fail)?);
+                }
+                _ => {
+                    return Err(fail(format!(
+                        "unknown key \"{key}\" (expected one of: {})",
+                        ALL_KEYS.join(", ")
+                    )))
+                }
+            },
+            (DIRECTIVE_VPN, Some(pattern), Some(command)) => {
+                if pattern.is_empty() || command.is_empty() {
+                    return Err(fail("vpn needs a non-empty glob and command".to_owned()));
+                }
+                settings.vpn_rules.push(VpnRule {
+                    pattern: pattern.to_owned(),
+                    command: command.to_owned(),
+                    line,
+                });
+            }
+            (DIRECTIVE_SET, _, _) => return Err(fail("expected set|<key>|<value>".to_owned())),
+            (DIRECTIVE_VPN, _, _) => return Err(fail("expected vpn|<glob>|<command>".to_owned())),
+            _ => return Err(fail(format!("unknown directive \"{directive}\""))),
+        }
+    }
+    if settings.reconnect_cap < settings.reconnect_base {
+        return Err(ConfigError::Parse {
+            path: path.to_path_buf(),
+            line: base_line.max(cap_line).unwrap_or(1),
+            message: format!("{KEY_RECONNECT_CAP_MS} must be at least {KEY_RECONNECT_BASE_MS}"),
+        });
+    }
+    Ok(settings)
+}
+
+/// Parses an integer value of `key` that must be at least `min`.
+fn number(key: &str, value: &str, min: u64) -> Result<u64, String> {
+    match value.parse::<u64>() {
+        Ok(parsed) if parsed >= min => Ok(parsed),
+        _ => Err(format!(
+            "{key} must be an integer >= {min}, got \"{value}\""
+        )),
+    }
+}
+
+/// Like [`number`], for values stored as `usize`.
+fn count(key: &str, value: &str, min: u64) -> Result<usize, String> {
+    usize::try_from(number(key, value, min)?).map_err(|_| format!("{key} is too large: {value}"))
+}
+
+/// Reads and parses the file. A missing file at a default location gives
+/// `Settings::default()`; a missing explicit file, a dangling symlink, or any
+/// other read error is [`ConfigError::Read`].
+pub fn load(location: &ConfigPath) -> Result<Settings, ConfigError> {
+    let read_error = |error: std::io::Error| ConfigError::Read {
+        path: location.path.clone(),
+        message: error.to_string(),
+    };
+    match std::fs::read_to_string(&location.path) {
+        Ok(text) => parse(&location.path, &text),
+        // A dangling symlink also reports NotFound, but the link itself
+        // exists, so the user meant to have a file there.
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                && !location.explicit
+                && location.path.symlink_metadata().is_err() =>
+        {
+            Ok(Settings::default())
+        }
+        Err(error) => Err(read_error(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +368,105 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), ALL_KEYS.len());
+    }
+
+    fn parse_ok(text: &str) -> Settings {
+        parse(Path::new("cfg"), text).expect("parse")
+    }
+
+    fn parse_line(text: &str) -> usize {
+        match parse(Path::new("cfg"), text) {
+            Err(ConfigError::Parse { line, .. }) => line,
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_all_keys_comments_crlf_and_last_set_wins() {
+        let settings = parse_ok(
+            "# c\r\n\r\nset|concurrency|5\r\nset|concurrency|6\nset|tar-threshold|10\n\
+             set|show-hidden|true\nset|mtime-tolerance|2\nset|reconnect-base-ms|50\n\
+             set|reconnect-cap-ms|400\nset|keepalive-interval|7\n",
+        );
+        assert_eq!(settings.concurrency, 6);
+        assert_eq!(settings.tar_threshold, 10);
+        assert!(settings.show_hidden);
+        assert_eq!(settings.mtime_tolerance, 2);
+        assert_eq!(settings.reconnect_base, Duration::from_millis(50));
+        assert_eq!(settings.reconnect_cap, Duration::from_millis(400));
+        assert_eq!(settings.keepalive_interval, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn vpn_command_keeps_pipes_and_records_the_line() {
+        let settings = parse_ok("\nvpn|nadi-*|ssh -t jump 'a|b'\n");
+        assert_eq!(
+            settings.vpn_rules,
+            vec![VpnRule {
+                pattern: "nadi-*".into(),
+                command: "ssh -t jump 'a|b'".into(),
+                line: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn bad_lines_report_their_one_based_number() {
+        assert_eq!(parse_line("set|concurrency|0"), 1);
+        assert_eq!(parse_line("# x\nset|concurrency|abc"), 2);
+        assert_eq!(parse_line("\n\nset|show-hidden|yes"), 3);
+        assert_eq!(parse_line("set|mtime-tolerance|-1"), 1);
+        assert_eq!(parse_line("set|nope|1"), 1);
+        assert_eq!(parse_line("set|concurrency"), 1);
+        assert_eq!(parse_line("vpn||cmd"), 1);
+        assert_eq!(parse_line("ok\n"), 1);
+        assert_eq!(parse_line("vpn|glob"), 1);
+        assert_eq!(parse_line("vpn|glob|"), 1);
+    }
+
+    #[test]
+    fn mtime_tolerance_zero_is_valid_but_other_minimums_are_one() {
+        assert_eq!(parse_ok("set|mtime-tolerance|0").mtime_tolerance, 0);
+        assert_eq!(parse_line("set|keepalive-interval|0"), 1);
+        assert_eq!(parse_line("set|reconnect-base-ms|0"), 1);
+    }
+
+    #[test]
+    fn reconnect_cap_below_base_fails_after_the_whole_file() {
+        assert_eq!(
+            parse_line("set|reconnect-cap-ms|10\nset|reconnect-base-ms|20"),
+            2
+        );
+        assert_eq!(parse_line("set|reconnect-base-ms|60000"), 1);
+        let fixed = parse_ok("set|reconnect-base-ms|60000\nset|reconnect-cap-ms|90000");
+        assert_eq!(fixed.reconnect_cap, Duration::from_millis(90000));
+    }
+
+    #[test]
+    fn load_handles_missing_default_missing_explicit_and_dangling_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("config");
+        let default = ConfigPath {
+            path: file.clone(),
+            explicit: false,
+        };
+        assert_eq!(load(&default).expect("default"), Settings::default());
+        let explicit = ConfigPath {
+            path: file.clone(),
+            explicit: true,
+        };
+        assert!(matches!(load(&explicit), Err(ConfigError::Read { .. })));
+
+        std::os::unix::fs::symlink(dir.path().join("gone"), &file).expect("symlink");
+        assert!(matches!(load(&default), Err(ConfigError::Read { .. })));
+        std::fs::remove_file(&file).expect("unlink");
+
+        std::fs::write(&file, "set|concurrency|9\n").expect("write");
+        assert_eq!(load(&default).expect("load").concurrency, 9);
+        std::fs::write(&file, "bogus\n").expect("write");
+        assert!(matches!(
+            load(&default),
+            Err(ConfigError::Parse { line: 1, .. })
+        ));
     }
 }
