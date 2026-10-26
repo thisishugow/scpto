@@ -47,7 +47,6 @@ pub fn format_local_mtime(mtime: i64) -> Option<String> {
 /// The local time zone's offset from UTC, in seconds, at `time` (so daylight
 /// saving time applies per timestamp).
 fn local_utc_offset(time: i64) -> Option<i64> {
-    let time = libc::time_t::try_from(time).ok()?;
     let mut tm = MaybeUninit::<libc::tm>::uninit();
     // SAFETY: `localtime_r` is the reentrant variant; it only reads `time`
     // and writes the `tm` it is given, and returns null (leaving `tm`

@@ -21,13 +21,13 @@ Build a source archive into a new directory:
 python3 tools/package.py target/package-preview
 ```
 
-The command writes `scpto-<version>.tar.gz`, `SHA256SUMS`, and `Formula/scpto.rb.in`. Without binary assets, the Formula retains checksum placeholders and is not installable. Extract the source archive and run `cargo build --release --locked` to verify it independently. The source archive is a build distribution; integration fixtures and development tooling are not included.
+The command writes `scpto-<version>.tar.gz`, `SHA256SUMS`, and `Formula/scpto.rb.in`. Without binary assets, the Formula retains checksum placeholders and is not installable. Extract the source archive and run `cargo build --release --locked` and `cargo test --no-run --locked` to verify it independently. The source archive is a build distribution; integration fixtures and development tooling are not included. Cargo discovers the `it` test target from `tests/it/main.rs` in a repository checkout; no explicit target declaration requires that file in the source archive.
 
 ## CI and binary releases
 
 CI runs on pushes and pull requests. Separate jobs check formatting, Clippy with warnings denied, tests on Ubuntu and macOS, and Rust documentation with warnings denied. Ubuntu policy checks reject CJK source text, unfinished-code markers, `chafa` and `onig`, and multiple versions of `crossterm` or `ratatui`. A musl release build runs on every push and pull request.
 
-The Ubuntu integration job installs rsync 3.x and tmux, starts both Docker SSH fixtures, and runs `cargo test --locked -- --include-ignored`, `cargo test --test it`, and `python3 tests/verify.py` with `SCPTO_IT=1` and `SCPTO_EXPECT_COPY_DATA=1`. Fixture teardown runs even after a failure.
+The Ubuntu test jobs explicitly install `openssh-sftp-server` for unit tests. The integration job also installs rsync 3.x and tmux, starts both Docker SSH fixtures, and runs `cargo test --locked -- --include-ignored`, `cargo test --test it`, and `python3 tests/verify.py` with `SCPTO_IT=1` and `SCPTO_EXPECT_COPY_DATA=1`. Fixture teardown runs even after a failure.
 
 Pushing a `v*` tag starts `.github/workflows/release.yml`:
 

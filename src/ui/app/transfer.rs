@@ -115,7 +115,7 @@
 //!     pub fn drag_label_view(&self) -> Option<DragLabelView>;
 //!     /// The drop target to highlight in `side`'s pane.
 //!     pub fn drop_target(&self, side: PaneSide) -> Option<DropTarget>;
-//!     /// Status bar summary, for example `2 running, 1 failed`; empty when
+//!     /// Status bar summary, for example `2 jobs running, 1 job failed`; empty when
 //!     /// the queue is idle.
 //!     pub fn transfer_summary(&self) -> String;
 //!     /// The collapsed queue panel's row.
@@ -795,7 +795,7 @@ impl App {
     }
 
     /// The collapsed queue panel's row, for example
-    /// `Queue: 2 running, 45% of 1.2 GiB`.
+    /// `Queue: 2 jobs running, 45% of 1.2 GiB`.
     pub fn queue_summary(&self) -> String {
         let summary = self.transfer_summary();
         if summary.is_empty() {
@@ -818,8 +818,8 @@ impl App {
         )
     }
 
-    /// Status bar summary, for example `2 running, 1 failed`; empty when the
-    /// queue is idle.
+    /// Status bar summary, for example `2 jobs running, 1 job failed`;
+    /// empty when the queue is idle.
     pub fn transfer_summary(&self) -> String {
         let jobs = &self.transfer.jobs;
         let unfinished = jobs.iter().filter(|job| job.outcome.is_none());
@@ -836,7 +836,10 @@ impl App {
         [(running, "running"), (paused, "paused"), (failed, "failed")]
             .into_iter()
             .filter(|(count, _)| *count > 0)
-            .map(|(count, word)| format!("{count} {word}"))
+            .map(|(count, word)| {
+                let unit = if count == 1 { "job" } else { "jobs" };
+                format!("{count} {unit} {word}")
+            })
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -3591,6 +3594,7 @@ mod tests {
             Some(TransferMode::PerFile),
             vec![item(20, 2, "f", 1, ItemState::Running { bytes: 0 })],
         ));
+        assert_eq!(app.transfer_summary(), "1 job running");
         app.transfer.jobs.push(sync_job(3));
         app.transfer.jobs.push(queue_job(
             4,
@@ -3600,6 +3604,10 @@ mod tests {
         let mut failed = queue_job(5, None, Vec::new());
         failed.outcome = Some(JobOutcome::Failed(not_found()));
         app.transfer.jobs.push(failed);
+        assert_eq!(
+            app.transfer_summary(),
+            "2 jobs running, 1 job paused, 1 job failed"
+        );
         let mut partly = queue_job(6, None, Vec::new());
         partly.outcome = Some(JobOutcome::Finished(JobSummary {
             done: 1,
@@ -3607,7 +3615,10 @@ mod tests {
             failed: 1,
         }));
         app.transfer.jobs.push(partly);
-        assert_eq!(app.transfer_summary(), "2 running, 1 paused, 2 failed");
+        assert_eq!(
+            app.transfer_summary(),
+            "2 jobs running, 1 job paused, 2 jobs failed"
+        );
     }
 
     #[test]

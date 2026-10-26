@@ -84,7 +84,8 @@ use std::mem;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use ratatui::text::Text;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Text};
 use ratatui_image::thread::{ResizeRequest, ThreadProtocol};
 
 use super::App;
@@ -723,8 +724,8 @@ fn is_markdown(location: &Location) -> bool {
     preview::is_markdown(file_name(location))
 }
 
-/// The lines of a text preview: rendered Markdown, or highlighted (the
-/// highlighter is created on first use).
+/// The lines of a text preview: an empty-file message, rendered Markdown,
+/// or highlighted text (the highlighter is created on first use).
 fn text_of(
     highlighter: &mut Option<Highlighter>,
     background: Background,
@@ -732,7 +733,12 @@ fn text_of(
     bytes: &[u8],
     rendered: bool,
 ) -> Text<'static> {
-    if rendered {
+    if bytes.is_empty() {
+        Text::from(Line::styled(
+            "Empty file",
+            Style::new().add_modifier(Modifier::DIM),
+        ))
+    } else if rendered {
         preview::render_markdown(bytes)
     } else {
         highlighter
@@ -963,6 +969,41 @@ mod tests {
         let view = app.full_preview_view(&mut title).expect("view");
         assert_eq!(view.title, "/l/a.rs");
         assert!(matches!(view.body, PreviewBody::Text(_)));
+    }
+
+    #[test]
+    fn empty_files_show_a_dim_placeholder_in_both_preview_modes() {
+        for name in ["a.rs", "b.md"] {
+            for quick in [false, true] {
+                let mut app = app();
+                select(&mut app, name);
+                let action = if quick {
+                    Action::ToggleQuickView
+                } else {
+                    Action::Preview
+                };
+                let effects = app.preview_action(action).expect("claimed");
+                let path = format!("/l/{name}");
+                let request = load_of(&effects[0], &path);
+                app.preview_loaded(request, local(&path), text(b""));
+                let mut title = String::new();
+                let view = if quick {
+                    app.quick_preview_view(&mut title).expect("quick view").1
+                } else {
+                    app.full_preview_view(&mut title).expect("full preview")
+                };
+                let area = Rect::new(0, 0, if quick { 80 } else { 160 }, 45);
+                let mut buffer = Buffer::empty(area);
+                widgets::preview::render(view, area, &mut buffer);
+                let line: String = (1..area.right() - 1)
+                    .map(|x| buffer[(x, 1)].symbol())
+                    .collect();
+                assert_eq!(line.trim_end(), "Empty file", "{name}, quick={quick}");
+                assert!(buffer[(1, 1)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::DIM));
+            }
+        }
     }
 
     #[test]

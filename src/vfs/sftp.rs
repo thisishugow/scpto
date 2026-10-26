@@ -51,9 +51,10 @@
 //! chunks never exceed the negotiated write limit, so each chunk is one
 //! request sent in offset order. Interrupted uploads therefore leave a
 //! contiguous prefix that can be resumed from the part file's size.
-//! The first accepted chunk runs alone to learn a safe request size from
-//! the client's actual write count; its remaining bytes finish before the
-//! pipeline starts. This also works when the first caller buffer is short.
+//! Initial chunks run alone until a full 64 KiB chunk is offered to learn a
+//! safe request size from the client's actual write count; its remaining
+//! bytes finish before the pipeline starts. Short caller buffers do not
+//! constrain later pipelined chunks.
 //! A writer's `shutdown()` waits for every write acknowledgement and then
 //! closes the remote handle, reporting a failed close; only then is the
 //! data committed.
@@ -942,10 +943,10 @@ impl AsyncRead for SftpReader {
 /// One pipelined write; yields the number of bytes it carried.
 type WriteChunk = BoxFuture<'static, (usize, FsResult<()>)>;
 
-/// The initial chunk, which discovers a safe request size and finishes alone.
-type WriteProbe = BoxFuture<'static, FsResult<usize>>;
+/// A chunk that finishes alone, yielding a safe request size if offered `CHUNK` bytes.
+type WriteProbe = BoxFuture<'static, FsResult<Option<usize>>>;
 
-/// Streaming writer with write-behind. The first accepted chunk learns a
+/// Streaming writer with write-behind. The first full chunk learns a
 /// safe request size before later writes are pipelined, one request each,
 /// with at most `WRITE_BEHIND` bytes awaiting acknowledgement. `shutdown`
 /// waits for all writes and closes the handle.
@@ -1004,12 +1005,14 @@ impl SftpWriter {
         )
     }
 
-    /// Finishes the first accepted chunk before any later offsets are sent.
+    /// Finishes a probe chunk before any later offsets are sent.
     fn poll_probe(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if let Some(probe) = &mut self.probe {
             let result = ready!(probe.poll_unpin(cx));
             self.probe = None;
-            self.chunk_size = result.map_err(|error| self.lost.io_error(error))?;
+            if let Some(size) = result.map_err(|error| self.lost.io_error(error))? {
+                self.chunk_size = size;
+            }
         }
         Poll::Ready(Ok(()))
     }
@@ -1037,8 +1040,8 @@ impl AsyncWrite for SftpWriter {
             let path = this.path.clone();
             let lost = this.lost.clone();
             // Accept the owned chunk now so cancelling a pending caller
-            // never consumes unreported bytes. Only this initial chunk may
-            // span multiple requests, and it finishes before later chunks.
+            // never consumes unreported bytes. Only probe chunks may span
+            // multiple requests, and each finishes before later chunks.
             this.probe = Some(
                 async move {
                     let written = file
@@ -1048,7 +1051,7 @@ impl AsyncWrite for SftpWriter {
                     file.write_all(&data[written..])
                         .await
                         .map_err(|error| lost.classify(&error, &path, "write"))?;
-                    Ok(written)
+                    Ok((len == CHUNK).then_some(written))
                 }
                 .boxed(),
             );
@@ -1532,6 +1535,46 @@ mod tests {
         writer.flush().await.expect("flush initial chunk");
         assert_eq!(std::fs::read(&path).expect("flushed prefix"), data[..4093]);
         writer.write_all(&data[4093..]).await.expect("larger write");
+        writer.shutdown().await.expect("shutdown commits");
+        assert_eq!(std::fs::read(&path).expect("complete file"), data);
+    }
+
+    #[tokio::test]
+    async fn short_first_writes_do_not_limit_later_pipelined_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("short-then-large.bin");
+        let fs = local_fs().await;
+        let data = pattern(WRITE_BEHIND + 3 * CHUNK + 7);
+        let mut writer = fs
+            .open_write(&path, WriteMode::Truncate { permissions: 0o600 })
+            .await
+            .expect("open_write");
+        let mut offset = 0;
+        for len in [4093, 17] {
+            writer
+                .write_all(&data[offset..offset + len])
+                .await
+                .expect("short write");
+            offset += len;
+            writer.flush().await.expect("flush short write");
+            assert_eq!(
+                std::fs::read(&path).expect("flushed prefix"),
+                data[..offset]
+            );
+        }
+        let accepted = writer.write(&data[offset..]).await.expect("full probe");
+        assert_eq!(accepted, CHUNK);
+        offset += accepted;
+        let accepted = writer
+            .write(&data[offset..])
+            .await
+            .expect("pipelined write");
+        assert!(accepted > 4093 && accepted <= CHUNK);
+        offset += accepted;
+        writer
+            .write_all(&data[offset..])
+            .await
+            .expect("remaining writes");
         writer.shutdown().await.expect("shutdown commits");
         assert_eq!(std::fs::read(&path).expect("complete file"), data);
     }

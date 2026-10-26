@@ -15,7 +15,7 @@
 //!     pub message_is_error: bool,
 //!     /// For example `3 selected, 12.4 MiB`.
 //!     pub selection: &'a str,
-//!     /// For example `2 running, 1 failed`.
+//!     /// For example `2 jobs running, 1 job failed`.
 //!     pub transfers: &'a str,
 //! }
 //!
@@ -46,7 +46,7 @@ pub struct StatusBarView<'a> {
     pub message_is_error: bool,
     /// For example `3 selected, 12.4 MiB`.
     pub selection: &'a str,
-    /// For example `2 running, 1 failed`.
+    /// For example `2 jobs running, 1 job failed`.
     pub transfers: &'a str,
 }
 
@@ -117,7 +117,7 @@ mod tests {
             message: "Copied 3 items",
             message_is_error: false,
             selection: "3 selected, 12.4 MiB",
-            transfers: "2 running, 1 failed",
+            transfers: "2 jobs running, 1 job failed",
         }
     }
 
@@ -126,7 +126,7 @@ mod tests {
         let buf = draw(&full(), 90);
         assert_eq!(
             row_text(&buf, 0).trim_end(),
-            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 running, 1 failed"
+            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 jobs running, 1 job failed"
         );
         assert_eq!(buf[(0, 0)].fg, Color::Reset);
         assert_eq!(buf[(17, 0)].fg, Color::Cyan);
@@ -138,7 +138,7 @@ mod tests {
         let buf = draw(&full(), 50);
         assert_eq!(
             row_text(&buf, 0),
-            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 running\u{2026}"
+            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 jobs ru\u{2026}"
         );
         // No room after the separator: the part is left out entirely.
         let buf = draw(&full(), 40);
@@ -167,10 +167,10 @@ mod tests {
             message: "",
             message_is_error: false,
             selection: "",
-            transfers: "1 running",
+            transfers: "1 job running",
         };
         let buf = draw(&view, 30);
-        assert_eq!(row_text(&buf, 0).trim_end(), "1 running");
+        assert_eq!(row_text(&buf, 0).trim_end(), "1 job running");
     }
 
     #[test]

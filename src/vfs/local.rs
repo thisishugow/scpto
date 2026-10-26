@@ -167,11 +167,11 @@ fn utimens(path: &Path, atime: i64, mtime: i64) -> FsResult<()> {
     })?;
     let times = [
         libc::timespec {
-            tv_sec: atime as libc::time_t,
+            tv_sec: atime,
             tv_nsec: 0,
         },
         libc::timespec {
-            tv_sec: mtime as libc::time_t,
+            tv_sec: mtime,
             tv_nsec: 0,
         },
     ];

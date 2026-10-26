@@ -12,7 +12,10 @@
 //! bracketed words (`[pause/resume]`, `[cancel]`, `[retry]`, `[discard]`,
 //! `[retry failed]`, `[clear done]`). The label keeps at least
 //! [`MIN_LABEL_WIDTH`] cells: buttons that would squeeze it further are
-//! dropped from the end of the list, then the gauge, then the state. The cursor row is highlighted only while the
+//! dropped from the end of the list, then the gauge. The state shares the
+//! remaining width with the label, keeping up to `MIN_LABEL_WIDTH` label
+//! cells and using an ellipsis only when the state does not fit.
+//! The cursor row is highlighted only while the
 //! panel is focused, and a focused panel has a bold border.
 //!
 //! # Public API (Wave 2, widgets)
@@ -55,6 +58,7 @@ use ratatui::widgets::{Block, Clear, Widget};
 use crate::transfer::model::QueueTarget;
 use crate::ui::action::QueueControl;
 use crate::ui::hit::QueueHit;
+use crate::ui::widgets::text_input::{fit_end, sanitize};
 
 /// The narrowest the label gets before the gauge is dropped.
 pub const MIN_LABEL_WIDTH: u16 = 12;
@@ -63,9 +67,6 @@ pub const MIN_LABEL_WIDTH: u16 = 12;
 const BAR_CELLS: u16 = 10;
 /// `[` + bar + `]` + a space + `100%`.
 const GAUGE_WIDTH: u16 = BAR_CELLS + 2 + 1 + 4;
-/// Width of the state column (fits `running`, `canceled`, `reconnecting`);
-/// longer states are cut.
-const STATE_WIDTH: u16 = 12;
 const INDENT: u16 = 2;
 
 /// What the queue panel shows.
@@ -212,15 +213,19 @@ fn draw_row(
         right -= 1;
     }
 
-    if !row.state.is_empty() && start + MIN_LABEL_WIDTH + 1 + STATE_WIDTH <= right {
+    let state = sanitize(row.state);
+    let label_width = text_width(row.label).min(MIN_LABEL_WIDTH);
+    let state_width =
+        text_width(&state).min(right.saturating_sub(start).saturating_sub(label_width + 1));
+    if state_width > 0 {
         buf.set_stringn(
-            right - STATE_WIDTH,
+            right - state_width,
             rect.y,
-            row.state,
-            usize::from(STATE_WIDTH),
+            fit_end(&state, state_width),
+            usize::from(state_width),
             base.add_modifier(Modifier::BOLD),
         );
-        right -= STATE_WIDTH + 1;
+        right -= state_width + 1;
     }
 
     buf.set_stringn(
@@ -413,6 +418,57 @@ mod tests {
             map.resolve(10, 2),
             Some(crate::ui::action::ClickTarget::QueueRow(ITEM))
         );
+    }
+
+    #[test]
+    fn failure_reasons_share_the_available_row_width() {
+        let rows = [
+            QueueRowView {
+                target: JOB,
+                indent: false,
+                label: "copy report.txt -> web:/srv",
+                state: "failed: Permission denied",
+                progress: Progress::None,
+                controls: &[QueueControl::ClearFinished],
+            },
+            QueueRowView {
+                target: ITEM,
+                indent: true,
+                label: "report.txt",
+                state: "failed: Permission denied",
+                progress: Progress::None,
+                controls: &[QueueControl::Retry, QueueControl::DiscardPartial],
+            },
+        ];
+        let view = QueueView {
+            rows: &rows,
+            cursor: None,
+            first_visible: 0,
+            focused: false,
+        };
+        for width in [160, 70, 40] {
+            let (buf, hit) = draw(&view, width, 45);
+            for (index, row) in rows.iter().enumerate() {
+                let y = index as u16 + 1;
+                let rendered = row_text(&buf, y);
+                if width >= 70 {
+                    assert!(rendered.contains(row.label), "{width}: {rendered:?}");
+                    assert!(rendered.contains(row.state), "{width}: {rendered:?}");
+                    assert!(!rendered.contains('\u{2026}'), "{width}: {rendered:?}");
+                } else {
+                    let expected = if row.indent {
+                        "failed\u{2026} [retry] [discard]"
+                    } else {
+                        "failed: Per\u{2026} [clear done]"
+                    };
+                    assert!(rendered.contains(expected), "{rendered:?}");
+                }
+            }
+            assert_eq!(hit.buttons.len(), 3);
+            for (rect, _, control) in hit.buttons {
+                assert_eq!(text_at(&buf, rect), control_label(control));
+            }
+        }
     }
 
     #[test]

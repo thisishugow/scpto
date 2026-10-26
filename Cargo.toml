@@ -43,7 +43,3 @@ tempfile = "3.27.0"
 lto = "thin"
 strip = true
 codegen-units = 1
-
-[[test]]
-name = "it"
-path = "tests/it/main.rs"
