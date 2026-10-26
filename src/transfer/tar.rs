@@ -1,12 +1,12 @@
 //! tar acceleration between the local machine and a non-sudo remote: the
 //! `tar` crate packs or unpacks locally through `tokio_util::io::SyncIoBridge`
 //! in `spawn_blocking` (symlinks not followed; absolute and `..` entries
-//! rejected), streaming through remote `tar -C <dir> -xf -` / `-cf -`.
+//! rejected), streaming through remote `tar -C <dir> -mxf -` / `-cf -`.
 //!
 //! # Contract (plan 7.5 S8)
 //!
 //! - The remote side is `Connections::spawn_remote(remote, ["tar", "-C",
-//!   dir, "-xf", "-"])` for uploads and `["tar", "-C", dir, "-cf", "-",
+//!   dir, "-mxf", "-"])` for uploads and `["tar", "-C", dir, "-cf", "-",
 //!   "./<name>"...]` for downloads (words are quoted by the session; the
 //!   `./` prefix keeps a name such as `-rf` from being read as an option).
 //!   Its stderr tail goes into `Error::CommandFailed { program: "tar", .. }`
@@ -16,6 +16,10 @@
 //!   the local source's parent, so each source lands under its own name.
 //!   Regular files, directories, and symlinks (as links) are archived; FIFOs,
 //!   sockets, and devices are skipped, as in per-file transfers (S15).
+//!   Upload extraction skips timestamps with `-m`; after the stream succeeds,
+//!   `Fs::set_times` restores regular files, then directories deepest first.
+//!   Symlinks are excluded because SFTP SETSTAT follows their targets.
+//!   Metadata failures return path-associated warnings without failing data.
 //! - Unpacking: every entry is checked first; an absolute path or a `..`
 //!   component (in the entry path or a hard link target) fails the job with
 //!   `Error::Archive`. Extraction uses `Entry::unpack_in(local_dir)` with
@@ -24,6 +28,7 @@
 //!   mtimes are kept (the tar crate sets none on directories, so this module
 //!   applies those itself). Directory entries are applied last, deepest
 //!   first, so their mtimes and modes survive the files written into them.
+//!   Directory timestamp failures are returned as non-fatal warnings.
 //!   FIFO and device entries are skipped.
 //! - Error precedence: a local failure (file system, unsafe entry) wins and
 //!   ends the remote child. When the stream itself breaks (the remote stopped
@@ -44,7 +49,7 @@
 //!     remote: &Endpoint,
 //!     remote_dir: &Path,
 //!     progress: &(dyn Fn(u64) + Send + Sync),
-//! ) -> Result<(), Error>;
+//! ) -> Result<Vec<(PathBuf, Error)>, Error>;
 //!
 //! /// Unpacks `names` (entries of remote `remote_dir`) into `local_dir`.
 //! pub async fn download(
@@ -54,12 +59,13 @@
 //!     names: &[OsString],
 //!     local_dir: &Path,
 //!     progress: &(dyn Fn(u64) + Send + Sync),
-//! ) -> Result<(), Error>;
+//! ) -> Result<Vec<(PathBuf, Error)>, Error>;
 //! ```
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileTimes};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -71,7 +77,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::io::SyncIoBridge;
 
-use crate::connections::{Connections, RemoteChild, StderrTail};
+use crate::connections::{Connections, FsChannel, RemoteChild, StderrTail};
 use crate::error::{ConnectError, Error, FsError};
 use crate::vfs::Endpoint;
 
@@ -83,13 +89,14 @@ const PIPE_BUFFER: usize = 256 * 1024;
 /// Each source lands in `remote_dir` under its own file name. Fails with
 /// `Error::CommandFailed` when the remote `tar` exits unsuccessfully, and
 /// with the local error when a source cannot be read.
+/// Returns non-fatal timestamp warnings paired with destination paths.
 pub async fn upload(
     connections: &dyn Connections,
     sources: &[PathBuf],
     remote: &Endpoint,
     remote_dir: &Path,
     progress: &(dyn Fn(u64) + Send + Sync),
-) -> Result<(), Error> {
+) -> Result<Vec<(PathBuf, Error)>, Error> {
     let roots = sources
         .iter()
         .map(|source| upload_root(source))
@@ -98,7 +105,7 @@ pub async fn upload(
         "tar".to_owned(),
         "-C".to_owned(),
         utf8(remote_dir.as_os_str(), remote_dir)?.to_owned(),
-        "-xf".to_owned(),
+        "-mxf".to_owned(),
         "-".to_owned(),
     ];
     let RemoteChild {
@@ -112,14 +119,17 @@ pub async fn upload(
     let ended = Arc::new(AtomicBool::new(false));
     let writer = Metered::new(SyncIoBridge::new(stdin), moved_tx, Arc::clone(&ended));
     let task = tokio::task::spawn_blocking(move || {
+        let mut metadata = Vec::new();
         let bridge = pack(
             BufWriter::with_capacity(PIPE_BUFFER, writer),
             &roots,
             &ended,
+            &mut metadata,
         )?;
         // Closing stdin is the end-of-input signal for the remote tar.
         let mut bridge = bridge.inner;
-        bridge.shutdown().map_err(StreamFailure::Stream)
+        bridge.shutdown().map_err(StreamFailure::Stream)?;
+        Ok(metadata)
     });
     // `tar -x` writes nothing to stdout; it is drained so that unexpected
     // output can never block the remote side. The drain ends when ssh closes
@@ -129,13 +139,44 @@ pub async fn upload(
         track(task, moved_rx, progress),
         tokio::io::copy(&mut stdout, &mut sink),
     );
-    settle(packed?, &mut child, &stderr).await?;
+    let metadata = settle(packed?, &mut child, &stderr).await?;
     drained.map_err(|error| {
         Error::Connect(ConnectError::Other {
             detail: format!("reading the output of the remote tar failed: {error}"),
         })
     })?;
-    Ok(())
+    Ok(restore_uploaded_times(connections, remote, remote_dir, metadata).await)
+}
+
+/// Restores only files and directories: SFTP SETSTAT follows symlinks.
+async fn restore_uploaded_times(
+    connections: &dyn Connections,
+    remote: &Endpoint,
+    remote_dir: &Path,
+    mut metadata: Vec<PackedMetadata>,
+) -> Vec<(PathBuf, Error)> {
+    metadata.sort_by_key(|entry| {
+        (
+            entry.directory,
+            std::cmp::Reverse(entry.name.components().count()),
+        )
+    });
+    let destination = connections.fs(remote, FsChannel::Transfer).await;
+    let mut warnings = Vec::new();
+    for entry in metadata {
+        let path = remote_dir.join(entry.name);
+        let result = match &destination {
+            Ok(fs) => fs
+                .set_times(&path, entry.mtime, entry.mtime)
+                .await
+                .map_err(Error::from),
+            Err(error) => Err(error.clone()),
+        };
+        if let Err(error) = result {
+            warnings.push((path, error));
+        }
+    }
+    warnings
 }
 
 /// Unpacks `names` (entries of remote `remote_dir`) into `local_dir`.
@@ -144,6 +185,7 @@ pub async fn upload(
 /// entry, with the local error when writing fails, and with
 /// `Error::CommandFailed` when the remote `tar` exits unsuccessfully (for
 /// example because one of the names does not exist).
+/// Returns directory timestamp warnings paired with their destination paths.
 pub async fn download(
     connections: &dyn Connections,
     remote: &Endpoint,
@@ -151,7 +193,7 @@ pub async fn download(
     names: &[OsString],
     local_dir: &Path,
     progress: &(dyn Fn(u64) + Send + Sync),
-) -> Result<(), Error> {
+) -> Result<Vec<(PathBuf, Error)>, Error> {
     let mut argv = vec![
         "tar".to_owned(),
         "-C".to_owned(),
@@ -181,6 +223,7 @@ pub async fn download(
             BufReader::with_capacity(PIPE_BUFFER, reader),
             &local_dir,
             &ended,
+            |path, times| fs::set_times_nofollow(path, times),
         )
     });
     let unpacked = track(task, moved_rx, progress).await?;
@@ -201,6 +244,13 @@ enum StreamFailure {
 struct UploadRoot {
     path: PathBuf,
     name: PathBuf,
+}
+
+/// Timestamp captured while packing a regular file or directory.
+struct PackedMetadata {
+    name: PathBuf,
+    mtime: i64,
+    directory: bool,
 }
 
 fn upload_root(source: &Path) -> Result<UploadRoot, Error> {
@@ -255,11 +305,12 @@ fn pack<W: Write>(
     writer: BufWriter<W>,
     roots: &[UploadRoot],
     ended: &AtomicBool,
+    metadata: &mut Vec<PackedMetadata>,
 ) -> Result<W, StreamFailure> {
     let mut builder = Builder::new(writer);
     builder.follow_symlinks(false);
     for root in roots {
-        append_tree(&mut builder, &root.path, &root.name, ended)?;
+        append_tree(&mut builder, &root.path, &root.name, ended, metadata)?;
     }
     // Finishing only writes the end marker and flushes, so any failure here
     // is the pipe's.
@@ -274,15 +325,24 @@ fn append_tree<W: Write>(
     path: &Path,
     name: &Path,
     ended: &AtomicBool,
+    metadata: &mut Vec<PackedMetadata>,
 ) -> Result<(), StreamFailure> {
     let local = |error: io::Error| StreamFailure::Local(FsError::from_io(&error, path).into());
-    let file_type = fs::symlink_metadata(path).map_err(local)?.file_type();
+    let attributes = fs::symlink_metadata(path).map_err(local)?;
+    let file_type = attributes.file_type();
     if !(file_type.is_dir() || file_type.is_file() || file_type.is_symlink()) {
         return Ok(());
     }
     builder
         .append_path_with_name(path, name)
         .map_err(|error| stream_or_local(error, path, ended))?;
+    if !file_type.is_symlink() {
+        metadata.push(PackedMetadata {
+            name: name.to_path_buf(),
+            mtime: attributes.mtime(),
+            directory: file_type.is_dir(),
+        });
+    }
     if file_type.is_dir() {
         let mut children = fs::read_dir(path)
             .and_then(|entries| entries.collect::<io::Result<Vec<_>>>())
@@ -290,7 +350,13 @@ fn append_tree<W: Write>(
         children.sort_by_key(|child| child.file_name());
         for child in children {
             let child_name = child.file_name();
-            append_tree(builder, &child.path(), &name.join(&child_name), ended)?;
+            append_tree(
+                builder,
+                &child.path(),
+                &name.join(&child_name),
+                ended,
+                metadata,
+            )?;
         }
     }
     Ok(())
@@ -300,8 +366,14 @@ fn append_tree<W: Write>(
 /// then consumes the rest of the stream (tar pads its output past the end
 /// marker). `ended` is the flag shared with the pipe end of `reader`, set
 /// once the pipe ran dry or failed.
-fn unpack<R: Read>(reader: R, local_dir: &Path, ended: &AtomicBool) -> Result<(), StreamFailure> {
+fn unpack<R: Read>(
+    reader: R,
+    local_dir: &Path,
+    ended: &AtomicBool,
+    mut set_directory_time: impl FnMut(&Path, FileTimes) -> io::Result<()>,
+) -> Result<Vec<(PathBuf, Error)>, StreamFailure> {
     let mut archive = Archive::new(reader);
+    let mut warnings = Vec::new();
     archive.set_overwrite(true);
     archive.set_preserve_permissions(false);
     archive.set_preserve_mtime(true);
@@ -319,14 +391,33 @@ fn unpack<R: Read>(reader: R, local_dir: &Path, ended: &AtomicBool) -> Result<()
         }
         // Deepest first, as the tar crate's own `Archive::unpack` does, so a
         // parent's mtime and mode are set after its children were written.
-        directories.sort_by(|(a, _), (b, _)| b.path_bytes().cmp(&a.path_bytes()));
+        directories.sort_by_key(|(_, path)| std::cmp::Reverse(path.components().count()));
         for (mut entry, path) in directories {
             extract(&mut entry, &path, local_dir, ended)?;
-            restore_dir_mtime(&entry, &local_dir.join(&path))?;
+            let seconds = entry.header().mtime().map_err(StreamFailure::Stream)?;
+            let mtime = UNIX_EPOCH
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or_else(|| {
+                    StreamFailure::Local(Error::Archive {
+                        message: format!(
+                            "{} has an out-of-range directory timestamp",
+                            path.display()
+                        ),
+                    })
+                })?;
+            let destination = local_dir.join(&path);
+            if let Err(error) =
+                set_directory_time(&destination, FileTimes::new().set_modified(mtime))
+            {
+                warnings.push((
+                    destination.clone(),
+                    FsError::from_io(&error, &destination).into(),
+                ));
+            }
         }
     }
     io::copy(&mut archive.into_inner(), &mut io::sink()).map_err(StreamFailure::Stream)?;
-    Ok(())
+    Ok(warnings)
 }
 
 /// Rejects entries that would land outside the destination directory.
@@ -368,15 +459,6 @@ fn extract<R: Read>(
         })),
         Err(error) => Err(stream_or_local(error, &local_dir.join(path), ended)),
     }
-}
-
-/// Sets an extracted directory's mtime from its entry: the tar crate restores
-/// mtimes of files and symlinks but not of directories.
-fn restore_dir_mtime<R: Read>(entry: &Entry<'_, R>, dir: &Path) -> Result<(), StreamFailure> {
-    let seconds = entry.header().mtime().map_err(StreamFailure::Stream)?;
-    let mtime = UNIX_EPOCH + Duration::from_secs(seconds);
-    fs::set_times_nofollow(dir, FileTimes::new().set_modified(mtime))
-        .map_err(|error| StreamFailure::Local(FsError::from_io(&error, dir).into()))
 }
 
 /// Attributes an I/O error raised while the tar crate used both the pipe and
@@ -427,15 +509,15 @@ async fn track<T>(
 /// Combines the local outcome with the remote tar's exit status, following
 /// the precedence in the module documentation. A local failure returns at
 /// once, and dropping the child afterwards kills it.
-async fn settle(
-    local: Result<(), StreamFailure>,
+async fn settle<T>(
+    local: Result<T, StreamFailure>,
     child: &mut Child,
     stderr: &StderrTail,
-) -> Result<(), Error> {
-    let stream_error = match local {
-        Ok(()) => None,
+) -> Result<T, Error> {
+    let local = match local {
+        Ok(value) => Ok(value),
         Err(StreamFailure::Local(error)) => return Err(error),
-        Err(StreamFailure::Stream(error)) => Some(error),
+        Err(StreamFailure::Stream(error)) => Err(error),
     };
     let status = child.wait().await.map_err(|error| {
         Error::Connect(ConnectError::Other {
@@ -449,12 +531,9 @@ async fn settle(
             stderr: stderr_text(stderr),
         });
     }
-    match stream_error {
-        None => Ok(()),
-        Some(error) => Err(Error::Archive {
-            message: error.to_string(),
-        }),
-    }
+    local.map_err(|error| Error::Archive {
+        message: error.to_string(),
+    })
 }
 
 fn stderr_text(stderr: &StderrTail) -> String {
@@ -668,14 +747,16 @@ mod tests {
 
     fn pack_to_vec(roots: &[UploadRoot]) -> Vec<u8> {
         let ended = AtomicBool::new(false);
-        pack(BufWriter::new(Vec::new()), roots, &ended).expect("pack")
+        pack(BufWriter::new(Vec::new()), roots, &ended, &mut Vec::new()).expect("pack")
     }
 
-    fn unpack_bytes(bytes: Vec<u8>, dst: &Path) -> Result<(), StreamFailure> {
+    fn unpack_bytes(bytes: Vec<u8>, dst: &Path) -> Result<Vec<(PathBuf, Error)>, StreamFailure> {
         let (counter, _moved) = watch::channel(0);
         let ended = Arc::new(AtomicBool::new(false));
         let reader = Metered::new(Cursor::new(bytes), counter, Arc::clone(&ended));
-        unpack(reader, dst, &ended)
+        unpack(reader, dst, &ended, |path, times| {
+            fs::set_times_nofollow(path, times)
+        })
     }
 
     fn entry_names(bytes: &[u8]) -> Vec<String> {
@@ -712,10 +793,54 @@ mod tests {
         builder.into_inner().expect("finish raw")
     }
 
-    fn assert_unsafe(result: Result<(), StreamFailure>) {
+    fn assert_unsafe(result: Result<Vec<(PathBuf, Error)>, StreamFailure>) {
         assert!(
             matches!(result, Err(StreamFailure::Local(Error::Archive { .. }))),
             "expected an unsafe-entry archive error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn directory_timestamp_failure_keeps_extracted_data_and_restores_other_directories() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        let proj = sample_tree(src.path());
+        let bytes = pack_to_vec(&[root_of(&proj)]);
+        let failed = dst.path().join("proj/nested");
+        let mut restored = Vec::new();
+        let warnings = unpack(
+            Cursor::new(bytes),
+            dst.path(),
+            &AtomicBool::new(false),
+            |path, times| {
+                assert!(dst.path().join("proj/a.txt").is_file());
+                restored.push(path.to_path_buf());
+                if path == failed {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    fs::set_times_nofollow(path, times)
+                }
+            },
+        )
+        .expect("extraction succeeds despite metadata warning");
+        assert_eq!(
+            warnings,
+            vec![(
+                failed.clone(),
+                FsError::PermissionDenied {
+                    path: failed.clone()
+                }
+                .into()
+            )]
+        );
+        assert_eq!(restored.last(), Some(&dst.path().join("proj")));
+        assert_eq!(
+            mtime_of(&fs::metadata(dst.path().join("proj")).expect("root metadata")),
+            DIR_MTIME
+        );
+        assert_eq!(
+            fs::read(dst.path().join("proj/a.txt")).expect("copied data"),
+            fs::read(proj.join("a.txt")).expect("source data")
         );
     }
 
@@ -906,40 +1031,11 @@ mod tests {
         );
     }
 
-    /// A `Connections` that runs the remote argv either directly on this
-    /// machine (the system `tar` standing in for the remote one) or through
-    /// plain `ssh -F <config>` against the docker fixtures.
-    struct ProcessConnections {
-        ssh_config: Option<PathBuf>,
-    }
+    /// Connections using local files and the system tar for hermetic streams.
+    struct ProcessConnections;
 
     fn not_needed<T: Send + 'static>() -> BoxFuture<'static, Result<T, Error>> {
         Box::pin(async { Err(unsupported("not used by the tar tests".to_owned())) })
-    }
-
-    impl ProcessConnections {
-        fn command(&self, endpoint: &Endpoint, argv: &[String]) -> Command {
-            match &self.ssh_config {
-                None => {
-                    let mut command = Command::new(&argv[0]);
-                    // Keeps macOS bsdtar from adding AppleDouble entries.
-                    command.args(&argv[1..]).env("COPYFILE_DISABLE", "1");
-                    command
-                }
-                Some(config) => {
-                    let Endpoint::Remote { host, .. } = endpoint else {
-                        panic!("ssh needs a remote endpoint");
-                    };
-                    let mut command = Command::new("ssh");
-                    command
-                        .arg("-F")
-                        .arg(config)
-                        .args(["-o", "BatchMode=yes", host.as_str()])
-                        .arg(shell_words::join(argv));
-                    command
-                }
-            }
-        }
     }
 
     impl Connections for ProcessConnections {
@@ -948,15 +1044,16 @@ mod tests {
             _endpoint: &'a Endpoint,
             _channel: FsChannel,
         ) -> BoxFuture<'a, Result<Arc<dyn Fs>, Error>> {
-            not_needed()
+            Box::pin(async { Ok(Arc::new(crate::vfs::local::LocalFs::new()) as Arc<dyn Fs>) })
         }
 
         fn spawn_remote<'a>(
             &'a self,
-            endpoint: &'a Endpoint,
+            _endpoint: &'a Endpoint,
             argv: &'a [String],
         ) -> BoxFuture<'a, Result<RemoteChild, Error>> {
-            let mut command = self.command(endpoint, argv);
+            let mut command = Command::new(&argv[0]);
+            command.args(&argv[1..]).env("COPYFILE_DISABLE", "1");
             Box::pin(async move {
                 let mut child = command
                     .stdin(Stdio::piped())
@@ -1031,7 +1128,7 @@ mod tests {
 
     /// Uploads a sample tree into `remote_dir`, downloads it again into a
     /// new local directory, and checks that it survived both ways.
-    async fn round_trip(connections: &ProcessConnections, endpoint: &Endpoint, remote_dir: &Path) {
+    async fn round_trip(connections: &dyn Connections, endpoint: &Endpoint, remote_dir: &Path) {
         let src = tempfile::tempdir().expect("tempdir");
         let back = tempfile::tempdir().expect("tempdir");
         let proj = sample_tree(src.path());
@@ -1064,15 +1161,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_timestamp_warning_keeps_data_and_never_sets_symlink_targets() {
+        use crate::transfer::stream::test_support::{MemFs, Op};
+        use crate::ui::effects::transfer::test_support::{TestConnections, Tools};
+
+        let src = tempfile::tempdir().expect("source");
+        let dst = tempfile::tempdir().expect("destination");
+        let outside = tempfile::tempdir().expect("outside");
+        let tree = src.path().join("tree");
+        fs::create_dir(&tree).expect("source directory");
+        write_file(&tree.join("file"), b"data", 0o600);
+        let sentinel = outside.path().join("sentinel");
+        write_file(&sentinel, b"untouched", 0o600);
+        set_mtime(&sentinel, 123);
+        symlink(&sentinel, tree.join("link")).expect("source link");
+        set_mtime(&tree, DIR_MTIME);
+
+        let endpoint = remote("fake");
+        let metadata = MemFs::new(endpoint.clone());
+        let destination = dst.path().join("tree");
+        let path = destination.to_str().expect("utf8 path");
+        metadata.add_dir(path);
+        metadata.add_file(
+            destination.join("file").to_str().expect("utf8 path"),
+            b"data",
+            0,
+            0o600,
+        );
+        metadata.add_symlink(
+            destination.join("link").to_str().expect("utf8 path"),
+            sentinel.to_str().expect("utf8 path"),
+        );
+        let error = FsError::PermissionDenied {
+            path: destination.clone(),
+        };
+        metadata.fail(Op::SetTimes, path, error.clone(), false);
+        let connections = TestConnections::new(
+            vec![(endpoint.clone(), metadata.clone())],
+            Tools::Ready(Ok(RemoteTools {
+                tar: true,
+                rsync_ok: false,
+            })),
+        );
+        let warnings = upload(&connections, &[tree], &endpoint, dst.path(), &|_| {})
+            .await
+            .expect("data succeeds");
+        assert_eq!(warnings, vec![(destination.clone(), error.into())]);
+        assert_eq!(
+            fs::read(destination.join("file")).expect("copied data"),
+            b"data"
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link")).expect("copied link"),
+            sentinel
+        );
+        assert_eq!(
+            mtime_of(&fs::metadata(&sentinel).expect("sentinel metadata")),
+            123
+        );
+        let restored: Vec<_> = metadata
+            .calls()
+            .into_iter()
+            .filter(|(op, _)| *op == Op::SetTimes)
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(restored, [destination.join("file"), destination]);
+    }
+
+    #[tokio::test]
     async fn upload_and_download_through_the_system_tar() {
-        let connections = ProcessConnections { ssh_config: None };
+        let connections = ProcessConnections;
         let remote_dir = tempfile::tempdir().expect("tempdir");
         round_trip(&connections, &remote("fake"), remote_dir.path()).await;
     }
 
     #[tokio::test]
     async fn remote_tar_failures_are_command_failures() {
-        let connections = ProcessConnections { ssh_config: None };
+        let connections = ProcessConnections;
         let endpoint = remote("fake");
         let src = tempfile::tempdir().expect("tempdir");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1106,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_source_failure_wins_over_the_remote_outcome() {
-        let connections = ProcessConnections { ssh_config: None };
+        let connections = ProcessConnections;
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("gone");
         let result = upload(
@@ -1121,7 +1286,7 @@ mod tests {
     }
 
     async fn run_remote(
-        connections: &ProcessConnections,
+        connections: &dyn Connections,
         endpoint: &Endpoint,
         argv: &[&str],
     ) -> String {
@@ -1153,11 +1318,7 @@ mod tests {
             eprintln!("skipped: set SCPTO_IT=1 to run against the docker fixtures");
             return;
         }
-        let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/it/ssh_config");
-        assert!(config.is_file(), "run tests/it/fixtures/up.sh first");
-        let connections = ProcessConnections {
-            ssh_config: Some(config),
-        };
+        let connections = crate::ui::effects::transfer::test_support::FixtureConnections::new();
         for host in ["it-modern-plain", "it-legacy-plain"] {
             let endpoint = remote(host);
             let remote_dir =

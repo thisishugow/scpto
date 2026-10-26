@@ -928,6 +928,14 @@ impl App {
                 paths,
                 all_exist,
             } => self.transfer_dropped_paths_checked(text, paths, all_exist),
+            BgEvent::TransferCommandFailed(error) => {
+                self.error_status(error);
+                Vec::new()
+            }
+            BgEvent::TransferSubmitted { job, result } => {
+                self.transfer_submitted(job, result);
+                self.connection_release_unused()
+            }
             BgEvent::Transfer(event) => {
                 let mut effects = self.transfer_event(event);
                 self.sync_jobs_settled();
@@ -997,6 +1005,7 @@ impl App {
             Action::MoveCursor(movement) => self.core.pane_mut(side).move_cursor(movement, page),
             Action::Open => return self.open(side),
             Action::Parent => return self.parent(side),
+            Action::Refresh => return self.refresh(side),
             Action::ToggleSelect => self.core.pane_mut(side).toggle_and_advance(page),
             Action::SelectAll => self.core.pane_mut(side).select_all(),
             Action::InvertSelection => self.core.pane_mut(side).invert_selection(),
@@ -1490,6 +1499,30 @@ mod tests {
     }
 
     #[test]
+    fn refresh_reloads_only_the_focused_pane_and_is_ignored_in_queue() {
+        let mut app = two_local();
+        app.core.pane_mut(PaneSide::Left).toggle(2);
+        app.core.pane_mut(PaneSide::Left).set_cursor(3, 20);
+        let untouched = app.core.pane(PaneSide::Right).clone();
+        let effects = app.handle_action(Action::Refresh);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(list_dir(&effects[0]).1, local("/l"));
+        deliver(&mut app, &effects[0], vec![file("0"), file("a"), file("b")]);
+        assert_eq!(cursor_name(&app, PaneSide::Left), "b");
+        assert!(app
+            .core
+            .pane(PaneSide::Left)
+            .selection
+            .contains(std::ffi::OsStr::new("a")));
+        assert_eq!(app.core.pane(PaneSide::Right), &untouched);
+        app.handle_action(Action::ToggleQueue);
+        app.handle_action(Action::SwitchFocus);
+        app.handle_action(Action::SwitchFocus);
+        assert_eq!(app.input_mode(), InputMode::Queue);
+        assert!(app.handle_action(Action::Refresh).is_empty());
+    }
+
+    #[test]
     fn startup_lists_local_panes_and_resolves_aliases() {
         let hosts = HostList {
             aliases: vec!["db".into(), "web".into()],
@@ -1919,6 +1952,36 @@ mod tests {
         let effects = app.handle_action(Action::DialogHotkey('B'));
         assert_eq!(effects, [Effect::SaveBookmark(local("/l"))]);
         assert_eq!(app.input_mode(), InputMode::Browse);
+    }
+
+    #[test]
+    fn control_r_runs_the_context_menu_shortcut_but_not_other_dialogs() {
+        use crate::ui::hit::HitMap;
+        use crate::ui::input::InputState;
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = two_local();
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let press = |app: &mut App| {
+            let action = InputState::new()
+                .handle(&event, app.input_mode(), &HitMap::default(), Instant::now())
+                .expect("control-r action in menu mode");
+            app.handle_action(action)
+        };
+        app.handle_action(Action::ContextMenu(None));
+        let effects = press(&mut app);
+        assert!(app.dialog.menu.is_none());
+        assert_eq!(effects.len(), 1);
+        assert_eq!(list_dir(&effects[0]).1, local("/l"));
+        deliver(&mut app, &effects[0], vec![dir("sub"), file("a")]);
+        app.handle_action(Action::SortMenu);
+        assert!(press(&mut app).is_empty());
+        assert!(app.dialog.menu.is_some());
+        app.handle_action(Action::Cancel);
+        app.handle_action(Action::Delete);
+        assert!(press(&mut app).is_empty());
+        assert!(!app.dialog.stack.is_empty());
+        assert!(app.core.pane(PaneSide::Left).pending.is_none());
     }
 
     #[test]

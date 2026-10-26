@@ -1778,8 +1778,13 @@ mod tests {
         std::fs::create_dir(root.join("copy")).expect("mkdir");
         let fs = local_fs().await;
         if !fs.capabilities().copy_within {
-            // Servers before OpenSSH 9.0 lack copy-data and stream instead,
-            // which the test above covers.
+            let reason = "local sftp-server does not advertise copy-data; server-side part-mode test cannot run";
+            eprintln!("{reason}");
+            assert!(
+                std::env::var_os("SCPTO_EXPECT_COPY_DATA").as_deref()
+                    != Some(std::ffi::OsStr::new("1")),
+                "{reason}; SCPTO_EXPECT_COPY_DATA=1 requires this capability"
+            );
             return;
         }
         let error = copy_file(

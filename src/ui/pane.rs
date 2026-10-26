@@ -1414,6 +1414,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_and_stale_refresh_preserve_the_current_view() {
+        let mut pane = listed(sample());
+        pane.toggle(4);
+        pane.set_sort(
+            Sort {
+                key: SortKey::Size,
+                order: SortOrder::Descending,
+            },
+            PAGE,
+        );
+        pane.edit_filter(TextEdit::Insert('.'), PAGE);
+        let expected = pane.clone();
+        pane.begin_refresh(RequestId(2)).expect("listed");
+        pane.begin_refresh(RequestId(3)).expect("listed");
+        assert_eq!(pane.finish_list(RequestId(2), Ok(Vec::new())), Ok(false));
+        let error = FsError::PermissionDenied {
+            path: "/home/u".into(),
+        };
+        assert_eq!(
+            pane.finish_list(RequestId(3), Err(error.clone())),
+            Err(error)
+        );
+        assert_eq!(pane, expected);
+    }
+
+    #[test]
     fn refresh_needs_a_listing() {
         let mut pane = Pane::new(Endpoint::Local, false);
         assert_eq!(pane.begin_refresh(RequestId(1)), None);

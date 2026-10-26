@@ -12,7 +12,8 @@
 //!   is refused with a status message, and so is copying or moving a
 //!   directory into itself or below itself on the same endpoint. The job is
 //!   pushed onto [`TransferState::jobs`] at once (mode `None`, no items) so
-//!   the queue shows it while the engine expands it.
+//!   the queue shows it while the engine expands it. Successful channel
+//!   submission clears the unchanged source selection; failures preserve it.
 //! - Drag and drop: `DragStart` records [`Drag`] with
 //!   `Pane::drag_sources`; `DragMove` updates its target and pointer. In
 //!   single-pane mode a `DragMove` onto the hidden pane's tab
@@ -42,7 +43,8 @@
 //!   [`QueueJob::outcome`], put a summary in the status bar, and refresh
 //!   every pane showing the job's destination endpoint (and the source
 //!   endpoint for a move) with `App::refresh`. The queue cursor stays on the
-//!   same job or item while rows come and go.
+//!   same job or item while rows come and go. Jobs are displayed newest
+//!   first, with each job followed by its items.
 //! - Conflicts: `ConflictRaised` pushes a [`DialogPurpose::Conflict`] dialog
 //!   (buttons Overwrite, Skip, Rename, OverwriteIfNewer, and Resume when
 //!   `Conflict::partial` is present; checkbox "Apply to all in this job");
@@ -91,6 +93,8 @@
 //!     /// queue mode `MoveCursor` and `Click`/`DoubleClick` on a
 //!     /// `ClickTarget::QueueRow`; hands every other action back unchanged.
 //!     pub fn transfer_action(&mut self, action: Action) -> Result<Vec<Effect>, Action>;
+//!     /// Clears the unchanged source selection after an accepted submission.
+//!     pub fn transfer_submitted(&mut self, job: JobId, result: Result<(), FsError>);
 //!     /// `BgEvent::Transfer`.
 //!     pub fn transfer_event(&mut self, event: TransferEvent) -> Vec<Effect>;
 //!     /// `BgEvent::DroppedPathsChecked`.
@@ -132,13 +136,15 @@
 //! [`DialogPurpose::TarConflict`]: super::dialog::DialogPurpose::TarConflict
 //! [`DialogPurpose::QuitWhileRunning`]: super::dialog::DialogPurpose::QuitWhileRunning
 
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::core::StatusMessage;
 use super::dialog::{Checkbox, Dialog, DialogAnswer, DialogFocus, DialogPurpose};
 use super::App;
-use crate::error::Error;
+use crate::error::{Error, FsError};
 use crate::transfer::model::{
     Conflict, ConflictChoice, ConflictDecision, Item, ItemId, ItemKind, ItemState, JobId, JobKind,
     JobRequest, JobSummary, JobTargets, QueueTarget, SkipReason, TarConflictChoice,
@@ -185,6 +191,15 @@ pub struct TransferState {
     pub first_visible: usize,
     /// The drag in progress.
     pub drag: Option<Drag>,
+    /// Source selection snapshots waiting for the engine submission result.
+    pending_selection: HashMap<JobId, SubmittedSelection>,
+}
+
+#[derive(Debug)]
+struct SubmittedSelection {
+    side: PaneSide,
+    location: Location,
+    names: HashSet<OsString>,
 }
 
 /// One job as the queue panel shows it.
@@ -304,7 +319,7 @@ impl TransferState {
     /// The flattened queue rows: each job followed by its items.
     fn rows(&self) -> Vec<QueueTarget> {
         let mut rows = Vec::new();
-        for job in &self.jobs {
+        for job in self.jobs.iter().rev() {
             rows.push(QueueTarget::Job(job.id));
             rows.extend(job.items.iter().map(|item| QueueTarget::Item(item.id)));
         }
@@ -437,6 +452,42 @@ impl App {
         }
     }
 
+    /// Adds a submitted job, exposing the newest entry unless the queue has focus.
+    pub fn transfer_add_job(&mut self, job: QueueJob) {
+        let keep = self.transfer.cursor_target();
+        self.transfer.jobs.push(job);
+        if self.core.queue_focused() {
+            self.transfer.place_cursor(keep, self.queue_page());
+        } else {
+            self.transfer.cursor = 0;
+            self.transfer.first_visible = 0;
+        }
+    }
+
+    /// Applies an engine submission result, clearing only the unchanged source selection.
+    pub fn transfer_submitted(&mut self, job: JobId, result: Result<(), FsError>) {
+        let snapshot = self.transfer.pending_selection.remove(&job);
+        match result {
+            Ok(()) => {
+                if let Some(snapshot) = snapshot {
+                    let pane = self.core.pane_mut(snapshot.side);
+                    if pane.location().as_ref() == Some(&snapshot.location)
+                        && pane.selection == snapshot.names
+                    {
+                        pane.clear_selection();
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some(entry) = self.transfer.job_mut(job) {
+                    entry.outcome = Some(JobOutcome::Failed(error.clone().into()));
+                }
+                self.core
+                    .set_status(StatusMessage::error(error.to_string()));
+            }
+        }
+    }
+
     /// `BgEvent::Transfer`.
     pub fn transfer_event(&mut self, event: TransferEvent) -> Vec<Effect> {
         let keep = self.transfer.cursor_target();
@@ -475,6 +526,16 @@ impl App {
             TransferEvent::ItemsAdded { job, items } => {
                 if let Some(entry) = self.transfer.job_mut(job) {
                     entry.items.extend(items);
+                }
+                Vec::new()
+            }
+            TransferEvent::ItemWarning { item, warning } => {
+                if let Some(entry) = self
+                    .transfer
+                    .job_of_item_mut(item)
+                    .and_then(|job| job.items.iter_mut().find(|entry| entry.id == item))
+                {
+                    entry.warning = warning;
                 }
                 Vec::new()
             }
@@ -596,7 +657,7 @@ impl App {
             }
             DialogPurpose::FinderDrop { paths, destination } => match answer.button {
                 DialogButton::Upload => {
-                    self.submit(JobKind::Copy, Endpoint::Local, paths, destination)
+                    self.submit(JobKind::Copy, Endpoint::Local, paths, destination, None)
                 }
                 _ => Vec::new(),
             },
@@ -654,7 +715,7 @@ impl App {
         texts.clear();
         rows.clear();
         let mut shapes = Vec::with_capacity(self.transfer.row_count());
-        for job in &self.transfer.jobs {
+        for job in self.transfer.jobs.iter().rev() {
             texts.push(job_label(job));
             texts.push(self.job_state_text(job));
             shapes.push((
@@ -665,7 +726,11 @@ impl App {
             ));
             for item in &job.items {
                 texts.push(item_label(item));
-                texts.push(item_state_text(&item.state));
+                let state = item_state_text(&item.state);
+                texts.push(match &item.warning {
+                    Some(warning) => format!("{state}; warning: {warning}"),
+                    None => state,
+                });
                 shapes.push((
                     QueueTarget::Item(item.id),
                     true,
@@ -826,7 +891,7 @@ impl App {
             return Vec::new();
         };
         let source = self.core.pane(side).endpoint.clone();
-        self.submit(kind, source, sources, destination)
+        self.submit(kind, source, sources, destination, Some(side))
     }
 
     /// Submits a job transferring `sources` (absolute paths on `source`)
@@ -837,6 +902,7 @@ impl App {
         source: Endpoint,
         sources: Vec<PathBuf>,
         destination: Location,
+        origin: Option<PaneSide>,
     ) -> Vec<Effect> {
         if sources.is_empty() {
             self.core
@@ -875,9 +941,22 @@ impl App {
             describe(&destination.endpoint, &destination.path)
         );
         let id = self.core.next_job();
+        if let Some(side) = origin {
+            let pane = self.core.pane(side);
+            if let Some(location) = pane.location() {
+                self.transfer.pending_selection.insert(
+                    id,
+                    SubmittedSelection {
+                        side,
+                        location,
+                        names: pane.selection.clone(),
+                    },
+                );
+            }
+        }
         self.core
             .set_status(StatusMessage::info(format!("Queued {label}")));
-        self.transfer.jobs.push(QueueJob {
+        self.transfer_add_job(QueueJob {
             id,
             kind,
             mode: None,
@@ -909,7 +988,7 @@ impl App {
             return Vec::new();
         };
         let source = self.core.pane(drag.side).endpoint.clone();
-        self.submit(kind, source, drag.sources, destination)
+        self.submit(kind, source, drag.sources, destination, Some(drag.side))
     }
 
     /// What releasing `drag` on `target` does: copy into the other pane's
@@ -1577,6 +1656,7 @@ mod tests {
             mtime: None,
             mode: Some(0o644),
             state,
+            warning: None,
         }
     }
 
@@ -1648,6 +1728,127 @@ mod tests {
     }
 
     // Copy and move.
+
+    #[test]
+    fn accepted_copy_and_move_clear_only_the_submitting_pane_selection() {
+        for action in [Action::Copy, Action::Move] {
+            let mut app = app();
+            app.core.pane_mut(PaneSide::Left).toggle(2);
+            app.core.pane_mut(PaneSide::Right).toggle(2);
+            let effects = app.handle_action(action);
+            assert!(!app.core.pane(PaneSide::Left).selection.is_empty());
+            app.handle_action(Action::SwitchFocus);
+            app.handle_event(BgEvent::TransferSubmitted {
+                job: submitted(&effects).id,
+                result: Ok(()),
+            });
+            assert!(app.core.pane(PaneSide::Left).selection.is_empty());
+            assert!(!app.core.pane(PaneSide::Right).selection.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_submission_and_canceled_dialog_preserve_selection() {
+        let mut app = app();
+        app.core.pane_mut(PaneSide::Left).toggle(2);
+        let selected = app.core.pane(PaneSide::Left).selection.clone();
+        let effects = app.handle_action(Action::Copy);
+        app.handle_event(BgEvent::TransferSubmitted {
+            job: submitted(&effects).id,
+            result: Err(FsError::Disconnected),
+        });
+        assert_eq!(app.core.pane(PaneSide::Left).selection, selected);
+        assert!(matches!(
+            app.transfer.jobs[0].outcome,
+            Some(JobOutcome::Failed(_))
+        ));
+        app.transfer_dropped_paths_checked(String::new(), vec!["/l/a.txt".into()], true);
+        app.handle_action(Action::Cancel);
+        assert_eq!(app.core.pane(PaneSide::Left).selection, selected);
+        assert!(app.dialog.stack.is_empty());
+    }
+
+    #[test]
+    fn submission_ack_does_not_clear_a_new_selection_or_directory() {
+        for navigate in [false, true] {
+            let mut app = app();
+            app.core.pane_mut(PaneSide::Left).toggle(2);
+            let effects = app.handle_action(Action::Copy);
+            let pane = app.core.pane_mut(PaneSide::Left);
+            if navigate {
+                let request = crate::ui::action::RequestId(900);
+                pane.begin_list(request, "/other".into(), None);
+                pane.finish_list(request, Ok(entries(Path::new("/l"))))
+                    .expect("listing");
+            }
+            pane.toggle(3);
+            let selected = pane.selection.clone();
+            app.handle_event(BgEvent::TransferSubmitted {
+                job: submitted(&effects).id,
+                result: Ok(()),
+            });
+            assert_eq!(app.core.pane(PaneSide::Left).selection, selected);
+        }
+    }
+
+    #[test]
+    fn new_submission_is_visible_while_browsing() {
+        let mut app = with_many_rows();
+        app.transfer.cursor = 11;
+        app.transfer.first_visible = 7;
+        let effects = app.handle_action(Action::Copy);
+        assert_eq!(
+            app.transfer.cursor_target(),
+            Some(QueueTarget::Job(submitted(&effects).id))
+        );
+        assert_eq!(app.transfer.first_visible, 0);
+    }
+
+    #[test]
+    fn directory_warning_is_visible_without_failing_the_item_and_can_clear() {
+        let mut app = with_queue();
+        app.transfer_event(TransferEvent::ItemChanged {
+            item: ItemId(10),
+            state: ItemState::Done,
+        });
+        app.transfer_event(TransferEvent::ItemWarning {
+            item: ItemId(10),
+            warning: Some(not_found()),
+        });
+        assert_eq!(app.transfer.jobs[0].items[0].state, ItemState::Done);
+        assert_eq!(view_rows(&app)[1].3, "done; warning: /x does not exist");
+        app.transfer_event(TransferEvent::ItemWarning {
+            item: ItemId(10),
+            warning: None,
+        });
+        assert_eq!(view_rows(&app)[1].3, "done");
+    }
+
+    #[test]
+    fn queue_lists_newest_jobs_first_with_their_items() {
+        let app = with_many_rows();
+        let expected = vec![
+            QueueTarget::Job(JobId(3)),
+            QueueTarget::Item(ItemId(30)),
+            QueueTarget::Item(ItemId(31)),
+            QueueTarget::Item(ItemId(32)),
+            QueueTarget::Job(JobId(2)),
+            QueueTarget::Item(ItemId(20)),
+            QueueTarget::Item(ItemId(21)),
+            QueueTarget::Item(ItemId(22)),
+            QueueTarget::Job(JobId(1)),
+            QueueTarget::Item(ItemId(10)),
+            QueueTarget::Item(ItemId(11)),
+            QueueTarget::Item(ItemId(12)),
+        ];
+        assert_eq!(app.transfer.rows(), expected);
+        let (mut texts, mut rows) = (Vec::new(), Vec::new());
+        let view = app.queue_view(&mut texts, &mut rows);
+        assert_eq!(
+            view.rows.iter().map(|row| row.target).collect::<Vec<_>>(),
+            expected
+        );
+    }
 
     #[test]
     fn copy_submits_the_cursor_entry_into_the_other_pane_directory() {
@@ -1728,7 +1929,10 @@ mod tests {
     fn copy_into_the_same_directory_is_refused() {
         let mut app = build((Endpoint::Local, "/l"), (Endpoint::Local, "/l"));
         select_cursor(&mut app, PaneSide::Left, 2);
+        app.core.pane_mut(PaneSide::Left).toggle(2);
+        let selected = app.core.pane(PaneSide::Left).selection.clone();
         assert!(act(&mut app, Action::Copy).is_empty());
+        assert_eq!(app.core.pane(PaneSide::Left).selection, selected);
         assert_eq!(
             status(&app),
             StatusMessage::error("Source and destination are the same directory")
@@ -2958,7 +3162,8 @@ mod tests {
         app.transfer
             .jobs
             .extend([synced, failed_sync, engine_sync, sync_job(4)]);
-        app.transfer.cursor = 3;
+        // The newest job remains selected while older finished jobs clear.
+        app.transfer.cursor = 0;
         let target = Some(QueueTarget::Job(JobId(1)));
         assert_eq!(
             act(&mut app, queue(QueueControl::ClearFinished, target)),
@@ -3056,7 +3261,7 @@ mod tests {
             at: Instant::now(),
         };
         act(&mut app, double);
-        assert_eq!((app.transfer.cursor, app.transfer.first_visible), (11, 7));
+        assert_eq!((app.transfer.cursor, app.transfer.first_visible), (3, 0));
     }
 
     #[test]
@@ -3262,13 +3467,11 @@ mod tests {
         assert_eq!(
             shown,
             [
-                row("job 1", "preparing", Progress::None, PAUSE_CANCEL),
-                row(
-                    "sync -> web:/srv",
-                    "syncing",
-                    Progress::Indeterminate,
-                    CANCEL
-                ),
+                row("job 5", &failed_text, Progress::None, CLEAR),
+                row("job 4", "2 failed", Progress::None, RETRY_DISCARD_CLEAR),
+                row("bad", &failed_text, Progress::None, RETRY_DISCARD),
+                row("d/", &failed_text, Progress::None, RETRY),
+                row("old", "not newer", Progress::None, NO_CONTROLS),
                 row(
                     "job 3 [tar, no resume]",
                     "reconnecting",
@@ -3276,11 +3479,13 @@ mod tests {
                     CANCEL
                 ),
                 row("t", "reconnecting", Progress::None, CANCEL),
-                row("job 4", "2 failed", Progress::None, RETRY_DISCARD_CLEAR),
-                row("bad", &failed_text, Progress::None, RETRY_DISCARD),
-                row("d/", &failed_text, Progress::None, RETRY),
-                row("old", "not newer", Progress::None, NO_CONTROLS),
-                row("job 5", &failed_text, Progress::None, CLEAR),
+                row(
+                    "sync -> web:/srv",
+                    "syncing",
+                    Progress::Indeterminate,
+                    CANCEL
+                ),
+                row("job 1", "preparing", Progress::None, PAUSE_CANCEL),
             ]
         );
     }

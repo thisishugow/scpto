@@ -65,6 +65,7 @@ const CONTENT: &[HelpLine] = &[
     Key(".", "Toggle hidden files"),
     Key("s", "Sort menu: name, extension, size, modified, reverse"),
     Key("x", "Menu of actions for the entry under the cursor"),
+    Key("Ctrl+R", "Refresh this pane; keep surviving selections"),
     Blank,
     Heading("File operations"),
     Key("c", "Copy to the other pane's directory"),
@@ -87,6 +88,22 @@ const CONTENT: &[HelpLine] = &[
     Key("Q", "Toggle the queue panel"),
     Key("?", "This help"),
     Key("q", "Quit (asks while transfers run)"),
+    Blank,
+    Heading("Queue panel"),
+    Key(
+        "Q then Tab",
+        "Show queue, then Tab from the right pane to enter",
+    ),
+    Key("Up Down / j k", "Select a job or item"),
+    Key("Space / p", "Pause / resume the selected job or item"),
+    Key("c", "Cancel the selected job or item"),
+    Key("r", "Retry the selected failed or canceled entry"),
+    Key("d", "Discard the selected partial transfer"),
+    Key("R", "Retry all failed transfers"),
+    Key("C", "Clear finished transfers"),
+    Key("Tab / Esc", "Leave the queue panel"),
+    Text("c, d, and r are mode-specific: copy/delete/rename in panes;"),
+    Text("cancel/discard partial/retry while the queue has focus."),
     Blank,
     Heading("Viewers (preview, help)"),
     Key("Up Down PgUp PgDn", "Scroll"),
@@ -202,6 +219,7 @@ mod tests {
         "Backspace / Left / h",
         "Space / Insert",
         "Ctrl+A / *",
+        "Ctrl+R",
         "c",
         "m",
         "n",
@@ -236,6 +254,41 @@ mod tests {
                 "missing {keys}"
             );
         }
+    }
+
+    #[test]
+    fn queue_help_explains_focus_and_mode_specific_controls() {
+        let start = CONTENT
+            .iter()
+            .position(|line| matches!(line, Heading("Queue panel")))
+            .expect("queue section");
+        let section: Vec<&HelpLine> = CONTENT[start + 1..]
+            .iter()
+            .take_while(|line| !matches!(line, Heading(_)))
+            .collect();
+        for expected in [
+            (
+                "Q then Tab",
+                "Show queue, then Tab from the right pane to enter",
+            ),
+            ("Space / p", "Pause / resume the selected job or item"),
+            ("c", "Cancel the selected job or item"),
+            ("r", "Retry the selected failed or canceled entry"),
+            ("d", "Discard the selected partial transfer"),
+            ("R", "Retry all failed transfers"),
+            ("C", "Clear finished transfers"),
+            ("Tab / Esc", "Leave the queue panel"),
+        ] {
+            assert!(
+                section
+                    .iter()
+                    .any(|line| matches!(line, Key(key, action) if (*key, *action) == expected)),
+                "missing {expected:?}"
+            );
+        }
+        assert!(section
+            .iter()
+            .any(|line| matches!(line, Text(text) if text.contains("mode-specific"))));
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //!   relay task that sends every `TransferEvent` as `BgEvent::Transfer`
 //!   until either side closes. The returned sender is `Ctx::engine`;
 //!   dropping every clone stops the engine.
-//! - `send` forwards one command; a closed engine only happens during
-//!   shutdown, so the command is dropped with a comment saying so.
+//! - `send` acknowledges submitted jobs after the engine channel accepts
+//!   them. A closed channel reports the failure to the application.
 //! - `TarStreams` implements `transfer::engine::TarTransfer` by calling
 //!   `transfer::tar::upload` / `transfer::tar::download` with the same
 //!   arguments.
@@ -38,7 +38,7 @@ use futures_util::future::BoxFuture;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::connections::Connections;
-use crate::error::Error;
+use crate::error::{Error, FsError};
 use crate::settings::Settings;
 use crate::state::PartialStore;
 use crate::transfer::engine::{self, EngineConfig, TarTransfer};
@@ -86,16 +86,26 @@ pub fn start_engine(
 
 /// Forwards `command` to the engine (`Effect::Transfer`).
 pub fn send(ctx: &Ctx, command: TransferCommand) {
-    forward(&ctx.engine, command);
+    let job = match &command {
+        TransferCommand::Submit(request) => Some(request.id),
+        _ => None,
+    };
+    let result = forward(&ctx.engine, command);
+    let event = match (job, result) {
+        (Some(job), result) => BgEvent::TransferSubmitted { job, result },
+        (None, Err(error)) => BgEvent::TransferCommandFailed(error),
+        (None, Ok(())) => return,
+    };
+    // A closed event receiver means the application has already exited.
+    let _ = ctx.events.send(event);
 }
 
-/// Sends `command` on the engine channel.
-pub(super) fn forward(engine: &TransferCommandTx, command: TransferCommand) {
-    if let Err(unsent) = engine.send(command) {
-        // The engine only stops after the app dropped its command sender
-        // during shutdown; nothing is left to act on the command.
-        drop(unsent);
-    }
+/// Sends a command, reporting a closed engine channel to the caller.
+pub(super) fn forward(engine: &TransferCommandTx, command: TransferCommand) -> Result<(), FsError> {
+    engine.send(command).map_err(|_| FsError::Io {
+        path: "transfer queue".into(),
+        message: "Transfer engine stopped; the command was not submitted".into(),
+    })
 }
 
 /// The product's tar streams: delegates to `transfer::tar`.
@@ -109,7 +119,7 @@ impl TarTransfer for TarStreams {
         remote: &'a Endpoint,
         remote_dir: &'a Path,
         progress: &'a (dyn Fn(u64) + Send + Sync),
-    ) -> BoxFuture<'a, Result<(), Error>> {
+    ) -> BoxFuture<'a, Result<Vec<(PathBuf, Error)>, Error>> {
         Box::pin(tar::upload(
             connections,
             sources,
@@ -127,7 +137,7 @@ impl TarTransfer for TarStreams {
         names: &'a [OsString],
         local_dir: &'a Path,
         progress: &'a (dyn Fn(u64) + Send + Sync),
-    ) -> BoxFuture<'a, Result<(), Error>> {
+    ) -> BoxFuture<'a, Result<Vec<(PathBuf, Error)>, Error>> {
         Box::pin(tar::download(
             connections,
             remote,
@@ -141,7 +151,7 @@ impl TarTransfer for TarStreams {
 
 /// Connections shared by the executor tests of `transfer` and `sync`.
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
@@ -550,6 +560,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submitting_reports_acceptance_and_closed_channel_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, mut events) =
+            crate::ui::effects::fs::test_support::ctx(loopback("box"), dir.path());
+        let (engine, mut received) = mpsc::unbounded_channel();
+        ctx.engine = engine;
+        let command = copy_into(7, Endpoint::Local, remote("box"), &[dir.path()], dir.path());
+        send(&ctx, command.clone());
+        assert_eq!(received.recv().await, Some(command.clone()));
+        assert!(matches!(
+            next_event(&mut events).await,
+            BgEvent::TransferSubmitted {
+                job: JobId(7),
+                result: Ok(())
+            }
+        ));
+        drop(received);
+        send(&ctx, command);
+        assert!(matches!(
+            next_event(&mut events).await,
+            BgEvent::TransferSubmitted {
+                job: JobId(7),
+                result: Err(_)
+            }
+        ));
+        send(&ctx, TransferCommand::ClearFinished);
+        assert!(matches!(
+            next_event(&mut events).await,
+            BgEvent::TransferCommandFailed(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn per_file_jobs_run_and_their_events_are_relayed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = make_tree(dir.path());
@@ -561,7 +604,8 @@ mod tests {
         forward(
             &engine,
             copy_into(1, Endpoint::Local, remote("box"), &[&tree], &target),
-        );
+        )
+        .expect("engine accepted command");
         // The directories tree and sub, the files a.txt and sub/b.bin, the link.
         assert_eq!(
             finish(&mut events, JobId(1)).await,
@@ -588,7 +632,8 @@ mod tests {
         forward(
             &engine,
             copy_into(1, Endpoint::Local, remote("box"), &[&tree], &uploaded),
-        );
+        )
+        .expect("engine accepted command");
         let (mode, summary_up) = finish(&mut events, JobId(1)).await;
         assert_eq!(mode, TransferMode::Tar);
         assert_eq!(summary_up.failed, 0);
@@ -603,7 +648,8 @@ mod tests {
                 &[&uploaded.join("tree")],
                 &downloaded,
             ),
-        );
+        )
+        .expect("engine accepted command");
         let (mode, summary_down) = finish(&mut events, JobId(2)).await;
         assert_eq!(mode, TransferMode::Tar);
         assert_eq!(summary_down.failed, 0);
@@ -632,12 +678,13 @@ mod tests {
         forward(
             &engine,
             copy_into(1, Endpoint::Local, remote("box"), &[&tree], dir.path()),
-        );
+        )
+        .expect("engine accepted command");
         tokio::time::timeout(std::time::Duration::from_secs(10), engine.closed())
             .await
             .expect("the engine stopped");
-        // Commands to a stopped engine are dropped without a panic.
-        forward(&engine, TransferCommand::ClearFinished);
+        // A stopped engine reports that the command was rejected.
+        assert!(forward(&engine, TransferCommand::ClearFinished).is_err());
     }
 
     /// Upload and download round trips through the executor against
@@ -679,7 +726,8 @@ mod tests {
             forward(
                 &engine,
                 copy_into(upload.0, Endpoint::Local, endpoint.clone(), &[&tree], &up),
-            );
+            )
+            .expect("engine accepted command");
             let (mode, summary_up) = finish(&mut events, upload).await;
             assert_eq!((mode, summary_up.failed), (expected, 0));
 
@@ -693,7 +741,8 @@ mod tests {
                     &[&up.join("tree")],
                     &down,
                 ),
-            );
+            )
+            .expect("engine accepted command");
             let (mode, summary_down) = finish(&mut events, download).await;
             assert_eq!((mode, summary_down.failed), (expected, 0));
             assert_same_tree(&tree, &down.join("tree"));

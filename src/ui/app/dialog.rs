@@ -77,7 +77,8 @@
 //!   actions for that row, each with its key: Open (Enter) for the `..`
 //!   row and enterable entries, else Preview (`v`) and Edit (`e`); then
 //!   Quick view (`i`), Copy (`c`), Move (`m`), Rename (`r`), Delete (`d`),
-//!   Chmod (`p`), Reveal (`R`), and Bookmark dir (`B`) for entries. Nothing
+//!   Chmod (`p`), Reveal (`R`), and Bookmark dir (`B`) for entries, plus
+//!   Refresh (`^R`) for every row. Nothing
 //!   opens for a pane without rows. In a menu, Tab/arrows move the cursor
 //!   (wrapping), Enter or a click on an item runs it, its hotkey (matched
 //!   exactly, so `r` and `R` differ) runs it, and Esc closes it. Running an
@@ -1238,7 +1239,7 @@ impl App {
             action,
         };
         let open = item("Enter", "Open", None, Action::Open);
-        let items = match pane.cursor_entry() {
+        let mut items = match pane.cursor_entry() {
             None => vec![open],
             Some(entry) => {
                 let mut items = if entry.is_enterable() {
@@ -1262,6 +1263,7 @@ impl App {
                 items
             }
         };
+        items.push(item("^R", "Refresh", None, Action::Refresh));
         let title = pane.cursor_entry().map_or_else(
             || "..".to_owned(),
             |entry| entry.name.to_string_lossy().into_owned(),
@@ -1290,6 +1292,10 @@ impl App {
                 None
             }
             Action::Confirm => Some(menu.cursor),
+            Action::Refresh => menu
+                .items
+                .iter()
+                .position(|item| item.action == Action::Refresh),
             Action::DialogHotkey(key) => {
                 menu.items.iter().position(|item| item.hotkey == Some(key))
             }
@@ -2121,7 +2127,8 @@ mod tests {
                 ("d", "Delete"),
                 ("p", "Chmod"),
                 ("R", "Reveal"),
-                ("B", "Bookmark dir")
+                ("B", "Bookmark dir"),
+                ("^R", "Refresh")
             ]
         );
         // Hotkeys match exactly: `R` reveals, `r` renames.
@@ -2139,11 +2146,11 @@ mod tests {
         act(&mut app, Action::DialogHotkey('r'));
         assert_eq!(menu_answer(&mut app), Some(Action::Rename));
 
-        // The `..` row only opens.
+        // The `..` row offers navigation and refresh.
         set_cursor(&mut app, PaneSide::Left, 0);
         act(&mut app, Action::ContextMenu(None));
         assert_eq!(menu(&app).title, "..");
-        assert_eq!(menu_keys(&app), [("Enter", "Open")]);
+        assert_eq!(menu_keys(&app), [("Enter", "Open"), ("^R", "Refresh")]);
         act(&mut app, Action::Confirm);
         assert_eq!(menu_answer(&mut app), Some(Action::Open));
     }

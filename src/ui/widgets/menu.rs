@@ -33,7 +33,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Clear, Widget};
+use ratatui::widgets::{Block, Widget};
 
 use crate::ui::hit::MenuHit;
 use crate::ui::widgets::text_input::{cell_width, fit_end};
@@ -98,7 +98,7 @@ pub fn render(view: &MenuView<'_>, bounds: Rect, buf: &mut Buffer) -> MenuHit {
     let x = view.anchor.0.clamp(bounds.x, bounds.right() - width);
     let y = view.anchor.1.clamp(bounds.y, bounds.bottom() - height);
     let area = Rect::new(x, y, width, height);
-    Clear.render(area, buf);
+    crate::ui::widgets::overlay::clear(area, buf);
     Block::bordered()
         .border_style(BORDER)
         .title(format!(
