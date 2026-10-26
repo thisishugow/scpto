@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="192" viewBox="0 0 480 192" role="img" aria-labelledby="title desc">
+  <title id="title">scpto</title>
+  <desc id="desc">Two terminal file panes connected by a transfer arrow. Pick files. Transfer.</desc>
+  <rect width="480" height="192" rx="24" fill="#101c2d"/>
+  <g transform="translate(24 32)">
+    <rect width="152" height="128" rx="28" fill="#192b40" stroke="#30445a" stroke-width="2"/>
+    <g fill="#101c2d" stroke="#65849c" stroke-width="2">
+      <rect x="15" y="24" width="54" height="80" rx="6"/>
+      <rect x="83" y="24" width="54" height="80" rx="6"/>
+    </g>
+    <path d="M25 38h18m-18 14h29m-29 14h18M94 38h18m-18 42h28m-28 14h18" fill="none" stroke="#64c8f0" stroke-width="4" stroke-linecap="round"/>
+    <path d="M52 64h48m-12-12 12 12-12 12" fill="none" stroke="#6ee7b7" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="193" y="108" fill="#f1f6fc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="76" font-weight="700" letter-spacing="-4">scp<tspan fill="#6ee7b7">to</tspan></text>
+  <text x="196" y="143" fill="#a6b9ce" font-family="-apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif" font-size="19">Pick files. Transfer.</text>
+</svg>
