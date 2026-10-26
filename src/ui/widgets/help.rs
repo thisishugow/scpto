@@ -1,6 +1,7 @@
 //! Help screen listing key and mouse bindings.
 //!
-//! The content is static (plan 2.4 key table, mouse gestures, and the
+//! The content is static (the plan 2.4 key table as amended by plan 8.9:
+//! letter keys only, no function keys; mouse gestures; and the
 //! Terminal.app / iTerm2 modifier notes) and scrolls by line. Every content
 //! line is one screen row (nothing wraps), so [`line_count`] is exactly the
 //! number of rows the content takes.
@@ -53,22 +54,26 @@ const CONTENT: &[HelpLine] = &[
     Key("Up Down / j k", "Move the cursor"),
     Key("PgUp PgDn", "Move one page"),
     Key("Home End / g G", "First / last entry"),
-    Key("Enter / Right / l", "Enter directory; preview a file"),
+    Key(
+        "Enter / Right / l",
+        "Enter directory (.. goes up); preview a file",
+    ),
     Key("Backspace / Left / h", "Parent directory"),
     Key("Space / Insert", "Toggle selection and move down"),
     Key("Ctrl+A / *", "Select all / invert selection"),
     Key("/", "Filter (fuzzy match); Enter keeps, Esc clears"),
     Key(".", "Toggle hidden files"),
-    Key("s", "Cycle sort: name, size, modified time"),
+    Key("s", "Sort menu: name, extension, size, modified, reverse"),
+    Key("x", "Menu of actions for the entry under the cursor"),
     Blank,
     Heading("File operations"),
-    Key("F5 / c", "Copy to the other pane's directory"),
-    Key("F6 / m", "Move to the other pane's directory"),
-    Key("F7 / n", "Create directory"),
-    Key("F8 / Delete / d", "Delete (asks first)"),
-    Key("F2 / r", "Rename"),
-    Key("F4 / e", "Edit with $VISUAL / $EDITOR"),
-    Key("F3 / v", "Full-screen preview"),
+    Key("c", "Copy to the other pane's directory"),
+    Key("m", "Move to the other pane's directory"),
+    Key("n", "Create directory"),
+    Key("d / Delete", "Delete (asks first)"),
+    Key("r", "Rename"),
+    Key("e", "Edit with $VISUAL / $EDITOR"),
+    Key("v", "Full-screen preview"),
     Key("i", "Toggle quick view in the other pane"),
     Key("p", "Change permissions (chmod)"),
     Key("R", "Reveal in Finder (remote files download first)"),
@@ -79,28 +84,32 @@ const CONTENT: &[HelpLine] = &[
     Key("b / B", "Bookmark list / bookmark this directory"),
     Key("=", "Compare the two panes' directories"),
     Key("t", "Open a shell in this directory"),
-    Key("F9 / Q", "Toggle the queue panel"),
-    Key("? / F1", "This help"),
-    Key("q / F10", "Quit (asks while transfers run)"),
+    Key("Q", "Toggle the queue panel"),
+    Key("?", "This help"),
+    Key("q", "Quit (asks while transfers run)"),
     Blank,
     Heading("Viewers (preview, help)"),
     Key("Up Down PgUp PgDn", "Scroll"),
     Key("m", "Toggle rendered / raw Markdown"),
     Key("Esc / q", "Close"),
     Blank,
-    Heading("Dialogs and lists"),
+    Heading("Dialogs, menus, and lists"),
     Key("Tab / Shift+Tab", "Next / previous field or button"),
     Key("Enter", "Confirm or pick"),
     Key("Esc", "Cancel or close"),
     Key("Space", "Toggle the focused option"),
-    Key("Letters", "Button hotkeys; filter text in lists"),
+    Key("Letters", "Button and menu hotkeys; filter text in lists"),
     Key("Ctrl+W / Ctrl+U", "Delete word / clear field"),
     Blank,
     Heading("Mouse"),
     Key("Click", "Move the cursor and focus the pane"),
     Key("Ctrl+click / Cmd+click", "Toggle selection"),
     Key("Shift+click", "Select a range"),
+    Key("Option/Alt+click", "Menu of actions for the clicked entry"),
     Key("Double click", "Enter directory; preview a file"),
+    Key("Pane title button", "Switch this pane's endpoint"),
+    Key("Column header", "Sort by it; click again to reverse"),
+    Key("Bottom bar buttons", "Same as their keys"),
     Key("Drag", "Copy to the other pane or into a folder row"),
     Key(
         "Drag within a pane",
@@ -109,6 +118,7 @@ const CONTENT: &[HelpLine] = &[
     Key("Esc while dragging", "Cancel the drag"),
     Key("Wheel", "Scroll"),
     Key("Queue buttons", "Pause, resume, cancel, or retry"),
+    Key("Right click", "Not used (left to the terminal)"),
     Blank,
     Heading("Finder"),
     Text("Drop files from Finder onto the window to upload them to the"),
@@ -118,6 +128,9 @@ const CONTENT: &[HelpLine] = &[
     Heading("Terminal notes"),
     Text("Terminal.app does not report Cmd, and iTerm2 uses Cmd+click for"),
     Text("URLs: use Ctrl+click or Space to toggle selection."),
+    Text("Option+click reaches scpto only when the terminal sends Option as"),
+    Text("Meta/Alt (and Terminal.app uses it for native selection): x and"),
+    Text("the bottom bar offer the same actions."),
     Text("With mouse capture on, select text natively by holding Option"),
     Text("(Terminal.app) or Shift."),
     Text("Mac keyboards have no Insert key: use Space."),
@@ -179,7 +192,7 @@ mod tests {
         lines(&buf)
     }
 
-    /// Every key of the plan 2.4 table, as listed.
+    /// Every key of the plan 2.4 table as amended by plan 8.9, as listed.
     const PLAN_KEYS: &[&str] = &[
         "Tab",
         "Up Down / j k",
@@ -189,25 +202,28 @@ mod tests {
         "Backspace / Left / h",
         "Space / Insert",
         "Ctrl+A / *",
-        "F5 / c",
-        "F6 / m",
-        "F7 / n",
-        "F8 / Delete / d",
-        "F2 / r",
-        "F4 / e",
-        "F3 / v",
+        "c",
+        "m",
+        "n",
+        "d / Delete",
+        "r",
+        "e",
+        "v",
+        "i",
         "p",
+        "R",
         "/",
         ".",
         "s",
+        "x",
         "o",
         "S",
         "b / B",
         "=",
         "t",
-        "F9 / Q",
-        "q / F10",
-        "? / F1",
+        "Q",
+        "q",
+        "?",
     ];
 
     #[test]
@@ -219,6 +235,20 @@ mod tests {
                     .any(|line| matches!(line, Key(k, _) if k == keys)),
                 "missing {keys}"
             );
+        }
+    }
+
+    #[test]
+    fn no_function_keys_are_listed() {
+        for line in CONTENT {
+            if let Key(keys, _) = line {
+                assert!(
+                    !keys.split([' ', '/']).any(|word| word.len() > 1
+                        && word.starts_with('F')
+                        && word[1..].bytes().all(|b| b.is_ascii_digit())),
+                    "{keys}"
+                );
+            }
         }
     }
 

@@ -276,6 +276,7 @@ fn dispatch(ctx: &Ctx, effect: Effect, foreground: &mut VecDeque<Pending>) {
             overwrite,
         } => edit::resolve_conflict(ctx, location, temp, overwrite),
         Effect::RememberDirectory(location) => state::remember_directory(ctx, location),
+        Effect::RememberSort { endpoint, sort } => state::remember_sort(ctx, endpoint, sort),
         Effect::SaveBookmark(location) => state::save_bookmark(ctx, location),
         Effect::RemoveBookmark(location) => state::remove_bookmark(ctx, location),
         Effect::CancelRequest(request) => {

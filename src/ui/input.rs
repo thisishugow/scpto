@@ -5,15 +5,23 @@
 //!
 //! # Contract
 //!
-//! - Keys follow plan 2.4 in `InputMode::Browse` and the per-mode rules in
-//!   `ui::action::InputMode`. Only key press and repeat events are mapped;
-//!   releases and unmapped keys produce no action.
+//! - Keys follow plan 2.4 as amended by plan 8.9 (letter keys only: no
+//!   function key is mapped in any mode) in `InputMode::Browse` and the
+//!   per-mode rules in `ui::action::InputMode`. Only key press and repeat
+//!   events are mapped; releases and unmapped keys produce no action.
 //! - Mouse, resolved only through `ui::hit::HitMap` of the last frame:
-//!   - left press: a queue button (`HitMap::queue_button`) first becomes
-//!     `Action::Queue { target: Some(..) }`; otherwise `HitMap::resolve`.
-//!     A press on the same `ClickTarget` as the previous press within
-//!     `DOUBLE_CLICK` becomes `Action::DoubleClick`, else `Action::Click`
-//!     with modifiers (Ctrl or Super → toggle, Shift → range).
+//!   - left press: a button-bar button (`HitMap::bar_button`) first becomes
+//!     its action, exactly as its key; then a queue button
+//!     (`HitMap::queue_button`) becomes `Action::Queue { target: Some(..) }`;
+//!     otherwise `HitMap::resolve`. With Alt (Option) held, a press on a
+//!     `ClickTarget::PaneRow` becomes `Action::ContextMenu` anchored at the
+//!     pointer. A press on the same `ClickTarget` as the previous press
+//!     within `DOUBLE_CLICK` becomes `Action::DoubleClick`, else
+//!     `Action::Click` with modifiers (Ctrl or Super → toggle, Shift →
+//!     range). Bar buttons and context menus never start a double click or
+//!     a drag.
+//!   - right and middle buttons: ignored entirely (plan 8.9: herdr and the
+//!     terminal own the right button).
 //!   - drag with the button held: once the pointer is at least one cell
 //!     away from a press on a `ClickTarget::PaneRow`, emit `DragStart`
 //!     once, then `DragMove` (with `HitMap::drop_target`) whenever the cell
@@ -29,8 +37,8 @@
 //!
 //! - Letters are matched by the character the terminal reports, so Shift is
 //!   ignored for them (`Q` arrives as `Q` with Shift). Keys held with Alt,
-//!   Super, Hyper, or Meta are unmapped. Named keys (arrows, F-keys) accept
-//!   Shift only; Ctrl combinations are listed explicitly below.
+//!   Super, Hyper, or Meta are unmapped. Named keys (arrows, Enter, Tab,
+//!   ...) accept Shift only; Ctrl combinations are listed explicitly below.
 //! - A double click needs two unmodified presses; a press with Ctrl, Super,
 //!   or Shift is always a `Click` and resets the double-click timer, and so
 //!   does the second press of a double click (a third press is a `Click`).
@@ -45,13 +53,13 @@
 //! `Browse` (plan 2.4): Tab `SwitchFocus`; Up/`k`, Down/`j`, PgUp, PgDn,
 //! Home/`g`, End/`G` `MoveCursor`; Enter/Right/`l` `Open`; Backspace/Left/`h`
 //! `Parent`; Space/Insert `ToggleSelect`; Ctrl+A `SelectAll`; `*`
-//! `InvertSelection`; F5/`c` `Copy`; F6/`m` `Move`; F7/`n` `MakeDir`;
-//! F8/Delete/`d` `Delete`; F2/`r` `Rename`; F4/`e` `Edit`; F3/`v` `Preview`;
-//! `i` `ToggleQuickView`; `p` `Chmod`; `R` `Reveal`; `/` `StartFilter`; `.`
-//! `ToggleHidden`; `s` `CycleSort`; `o` `OpenEndpointPicker`; `S`
-//! `ReconnectWithSudo`; `b` `ShowBookmarks`; `B` `AddBookmark`; `=`
-//! `Compare`; `t` `OpenShell`; F9/`Q` `ToggleQueue`; `?`/F1 `Help`;
-//! `q`/F10/Ctrl+C `Quit`; Esc `Cancel`.
+//! `InvertSelection`; `c` `Copy`; `m` `Move`; `n` `MakeDir`; Delete/`d`
+//! `Delete`; `r` `Rename`; `e` `Edit`; `v` `Preview`; `i`
+//! `ToggleQuickView`; `p` `Chmod`; `R` `Reveal`; `/` `StartFilter`; `.`
+//! `ToggleHidden`; `s` `SortMenu`; `x` `ContextMenu(None)`; `o`
+//! `OpenEndpointPicker`; `S` `ReconnectWithSudo`; `b` `ShowBookmarks`; `B`
+//! `AddBookmark`; `=` `Compare`; `t` `OpenShell`; `Q` `ToggleQueue`; `?`
+//! `Help`; `q`/Ctrl+C `Quit`; Esc `Cancel`.
 //!
 //! Text editing, shared by `Filter`, `TextField`, and `Picker`: characters
 //! `Text(Insert)`; Backspace `Text(Backspace)`; Delete `Text(DeleteForward)`
@@ -65,9 +73,10 @@
 //! - `Picker`: Up/Ctrl+P, Down/Ctrl+N, PgUp, PgDn `MoveCursor`; Delete
 //!   `PickerRemove`.
 //!
-//! `Dialog`: Tab/Right/Down `DialogFocus(Next)`; Shift+Tab/Left/Up
-//! `DialogFocus(Previous)`; Space `ToggleOption`; Enter `Confirm`;
-//! Esc/Ctrl+C `Cancel`; letters `DialogHotkey` with the letter as typed.
+//! `Dialog` (dialogs and popup menus): Tab/Right/Down `DialogFocus(Next)`;
+//! Shift+Tab/Left/Up `DialogFocus(Previous)`; Space `ToggleOption`; Enter
+//! `Confirm`; Esc/Ctrl+C `Cancel`; letters `DialogHotkey` with the letter
+//! as typed.
 //!
 //! `Viewer`: the `Browse` movement keys plus Space (`PageDown`) `MoveCursor`;
 //! `m` `ToggleMarkdown`; Esc/`q`/Ctrl+C `Cancel`.
@@ -75,12 +84,12 @@
 //! `Queue`: the `Browse` movement keys `MoveCursor`; Space/`p`
 //! `TogglePause`; `c`/Delete `Cancel`; `r` `Retry`; `d` `DiscardPartial`;
 //! `R` `RetryAllFailed`; `C` `ClearFinished` (all `Queue { target: None }`);
-//! Tab `SwitchFocus`; Esc `Cancel`; F9/`Q` `ToggleQueue`; `?`/F1 `Help`;
-//! `q`/F10/Ctrl+C `Quit`.
+//! Tab `SwitchFocus`; Esc `Cancel`; `Q` `ToggleQueue`; `?` `Help`;
+//! `q`/Ctrl+C `Quit`.
 //!
 //! `SyncView`: the `Browse` movement keys `MoveCursor`; Space/Insert
 //! `ToggleSelect`; `>` `StartSync(LeftToRight)`; `<` `StartSync(RightToLeft)`;
-//! `?`/F1 `Help`; Esc/`q`/Ctrl+C `Cancel`.
+//! `?` `Help`; Esc/`q`/Ctrl+C `Cancel`.
 //!
 //! # Public API (Wave 2)
 //!
@@ -116,8 +125,8 @@ use ratatui::crossterm::event::{
 
 use crate::sync::SyncDirection;
 use crate::ui::action::{
-    Action, ClickModifiers, ClickTarget, CursorMove, FocusStep, InputMode, PaneSide, QueueControl,
-    TextEdit,
+    Action, ClickModifiers, ClickTarget, CursorMove, FocusStep, InputMode, MenuAnchor, PaneSide,
+    QueueControl, TextEdit,
 };
 use crate::ui::hit::HitMap;
 
@@ -244,6 +253,10 @@ impl InputState {
     fn press(&mut self, mouse: &MouseEvent, hits: &HitMap, now: Instant) -> Option<Action> {
         let (column, row) = (mouse.column, mouse.row);
         self.gesture = Gesture::Idle;
+        if let Some(action) = hits.bar_button(column, row) {
+            self.last_click = None;
+            return Some(action);
+        }
         if let Some((target, control)) = hits.queue_button(column, row) {
             self.last_click = None;
             return Some(Action::Queue {
@@ -255,6 +268,17 @@ impl InputState {
             self.last_click = None;
             return None;
         };
+        if let (true, ClickTarget::PaneRow { side, index }) =
+            (mouse.modifiers.contains(KeyModifiers::ALT), target)
+        {
+            self.last_click = None;
+            return Some(Action::ContextMenu(Some(MenuAnchor {
+                side,
+                index,
+                column,
+                row,
+            })));
+        }
         if let ClickTarget::PaneRow { side, index } = target {
             self.gesture = Gesture::Pressed {
                 side,
@@ -443,28 +467,29 @@ fn browse_key(key: Key) -> Option<Action> {
         Key::Named(KeyCode::Insert) | Key::Char(' ') => Action::ToggleSelect,
         Key::Ctrl('a') => Action::SelectAll,
         Key::Char('*') => Action::InvertSelection,
-        Key::Named(KeyCode::F(5)) | Key::Char('c') => Action::Copy,
-        Key::Named(KeyCode::F(6)) | Key::Char('m') => Action::Move,
-        Key::Named(KeyCode::F(7)) | Key::Char('n') => Action::MakeDir,
-        Key::Named(KeyCode::F(8) | KeyCode::Delete) | Key::Char('d') => Action::Delete,
-        Key::Named(KeyCode::F(2)) | Key::Char('r') => Action::Rename,
-        Key::Named(KeyCode::F(4)) | Key::Char('e') => Action::Edit,
-        Key::Named(KeyCode::F(3)) | Key::Char('v') => Action::Preview,
+        Key::Char('c') => Action::Copy,
+        Key::Char('m') => Action::Move,
+        Key::Char('n') => Action::MakeDir,
+        Key::Named(KeyCode::Delete) | Key::Char('d') => Action::Delete,
+        Key::Char('r') => Action::Rename,
+        Key::Char('e') => Action::Edit,
+        Key::Char('v') => Action::Preview,
         Key::Char('i') => Action::ToggleQuickView,
         Key::Char('p') => Action::Chmod,
         Key::Char('R') => Action::Reveal,
         Key::Char('/') => Action::StartFilter,
         Key::Char('.') => Action::ToggleHidden,
-        Key::Char('s') => Action::CycleSort,
+        Key::Char('s') => Action::SortMenu,
+        Key::Char('x') => Action::ContextMenu(None),
         Key::Char('o') => Action::OpenEndpointPicker,
         Key::Char('S') => Action::ReconnectWithSudo,
         Key::Char('b') => Action::ShowBookmarks,
         Key::Char('B') => Action::AddBookmark,
         Key::Char('=') => Action::Compare,
         Key::Char('t') => Action::OpenShell,
-        Key::Named(KeyCode::F(9)) | Key::Char('Q') => Action::ToggleQueue,
-        Key::Named(KeyCode::F(1)) | Key::Char('?') => Action::Help,
-        Key::Named(KeyCode::F(10)) | Key::Char('q') | Key::Ctrl('c') => Action::Quit,
+        Key::Char('Q') => Action::ToggleQueue,
+        Key::Char('?') => Action::Help,
+        Key::Char('q') | Key::Ctrl('c') => Action::Quit,
         Key::Named(KeyCode::Esc) => Action::Cancel,
         _ => return None,
     })
@@ -543,9 +568,9 @@ fn queue_key(key: Key) -> Option<Action> {
             return Some(match key {
                 Key::Named(KeyCode::Tab) => Action::SwitchFocus,
                 Key::Named(KeyCode::Esc) => Action::Cancel,
-                Key::Named(KeyCode::F(9)) | Key::Char('Q') => Action::ToggleQueue,
-                Key::Named(KeyCode::F(1)) | Key::Char('?') => Action::Help,
-                Key::Named(KeyCode::F(10)) | Key::Char('q') | Key::Ctrl('c') => Action::Quit,
+                Key::Char('Q') => Action::ToggleQueue,
+                Key::Char('?') => Action::Help,
+                Key::Char('q') | Key::Ctrl('c') => Action::Quit,
                 _ => return None,
             })
         }
@@ -564,7 +589,7 @@ fn sync_view_key(key: Key) -> Option<Action> {
         Key::Named(KeyCode::Insert) | Key::Char(' ') => Action::ToggleSelect,
         Key::Char('>') => Action::StartSync(SyncDirection::LeftToRight),
         Key::Char('<') => Action::StartSync(SyncDirection::RightToLeft),
-        Key::Named(KeyCode::F(1)) | Key::Char('?') => Action::Help,
+        Key::Char('?') => Action::Help,
         Key::Named(KeyCode::Esc) | Key::Char('q') | Key::Ctrl('c') => Action::Cancel,
         _ => return None,
     })
@@ -576,6 +601,7 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::*;
+    use crate::state::SortKey;
     use crate::transfer::model::{ItemId, JobId, QueueTarget};
     use crate::ui::action::{DialogButton, DropTarget, ScrollRegion};
     use crate::ui::hit::{DialogHit, PaneHit, QueueHit, ViewerHit, ViewerKind};
@@ -592,6 +618,8 @@ mod tests {
                 PaneHit {
                     side: PaneSide::Left,
                     area: Rect::new(0, 0, 40, 20),
+                    title: Rect::default(),
+                    headers: Vec::new(),
                     rows: Rect::new(0, 2, 40, 17),
                     first_visible: 0,
                     enterable: vec![true, false, false, true],
@@ -599,6 +627,8 @@ mod tests {
                 PaneHit {
                     side: PaneSide::Right,
                     area: Rect::new(40, 0, 40, 20),
+                    title: Rect::new(41, 0, 12, 1),
+                    headers: vec![(Rect::new(40, 1, 20, 1), SortKey::Name)],
                     rows: Rect::new(40, 2, 40, 17),
                     first_visible: 10,
                     enterable: vec![false, true],
@@ -714,39 +744,30 @@ mod tests {
             (key(KeyCode::Insert), ToggleSelect),
             (ctrl('a'), SelectAll),
             (ch('*'), InvertSelection),
-            (key(KeyCode::F(5)), Copy),
             (ch('c'), Copy),
-            (key(KeyCode::F(6)), Move),
             (ch('m'), Move),
-            (key(KeyCode::F(7)), MakeDir),
             (ch('n'), MakeDir),
-            (key(KeyCode::F(8)), Delete),
             (key(KeyCode::Delete), Delete),
             (ch('d'), Delete),
-            (key(KeyCode::F(2)), Rename),
             (ch('r'), Rename),
-            (key(KeyCode::F(4)), Edit),
             (ch('e'), Edit),
-            (key(KeyCode::F(3)), Preview),
             (ch('v'), Preview),
             (ch('i'), ToggleQuickView),
             (ch('p'), Chmod),
             (ch('R'), Reveal),
             (ch('/'), StartFilter),
             (ch('.'), ToggleHidden),
-            (ch('s'), CycleSort),
+            (ch('s'), SortMenu),
+            (ch('x'), ContextMenu(None)),
             (ch('o'), OpenEndpointPicker),
             (ch('S'), ReconnectWithSudo),
             (ch('b'), ShowBookmarks),
             (ch('B'), AddBookmark),
             (ch('='), Compare),
             (ch('t'), OpenShell),
-            (key(KeyCode::F(9)), ToggleQueue),
             (ch('Q'), ToggleQueue),
-            (key(KeyCode::F(1)), Help),
             (ch('?'), Help),
             (ch('q'), Quit),
-            (key(KeyCode::F(10)), Quit),
             (ctrl('c'), Quit),
             (key(KeyCode::Esc), Cancel),
         ];
@@ -818,7 +839,7 @@ mod tests {
             None
         );
         assert_eq!(map(InputMode::Browse, ctrl('z')), None);
-        assert_eq!(map(InputMode::Browse, ch('x')), None);
+        assert_eq!(map(InputMode::Browse, ch('z')), None);
         assert_eq!(map(InputMode::Browse, key(KeyCode::F(11))), None);
         assert_eq!(map(InputMode::Browse, key(KeyCode::BackTab)), None);
     }
@@ -1013,10 +1034,8 @@ mod tests {
             (key(KeyCode::Tab), Action::SwitchFocus),
             (key(KeyCode::Esc), Action::Cancel),
             (ch('Q'), Action::ToggleQueue),
-            (key(KeyCode::F(9)), Action::ToggleQueue),
             (ch('?'), Action::Help),
             (ch('q'), Action::Quit),
-            (key(KeyCode::F(10)), Action::Quit),
             (ctrl('c'), Action::Quit),
         ];
         for (event, expected) in others {
@@ -1024,6 +1043,32 @@ mod tests {
         }
         assert_eq!(map(mode, ch('m')), None);
         assert_eq!(map(mode, key(KeyCode::Enter)), None);
+        assert_eq!(map(mode, key(KeyCode::F(9))), None);
+        assert_eq!(map(mode, key(KeyCode::F(10))), None);
+    }
+
+    #[test]
+    fn no_function_key_is_mapped_in_any_mode() {
+        let modes = [
+            InputMode::Browse,
+            InputMode::Filter,
+            InputMode::TextField,
+            InputMode::Dialog,
+            InputMode::Picker,
+            InputMode::Viewer,
+            InputMode::Queue,
+            InputMode::SyncView,
+        ];
+        for mode in modes {
+            for n in 1..=12 {
+                assert_eq!(map(mode, key(KeyCode::F(n))), None, "{mode:?} F{n}");
+                assert_eq!(
+                    map(mode, key_with(KeyCode::F(n), KeyModifiers::SHIFT)),
+                    None,
+                    "{mode:?} Shift+F{n}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1148,7 +1193,6 @@ mod tests {
             (KeyModifiers::SUPER, true, false),
             (KeyModifiers::SHIFT, false, true),
             (KeyModifiers::CONTROL | KeyModifiers::SHIFT, true, true),
-            (KeyModifiers::ALT, false, false),
         ];
         for (modifiers, toggle, range) in cases {
             let event = mouse(MouseEventKind::Down(MouseButton::Left), 5, 2, modifiers);
@@ -1243,6 +1287,95 @@ mod tests {
         assert_eq!(
             InputState::new().handle(&down(5, 3), InputMode::Dialog, &map, t0),
             None
+        );
+    }
+
+    #[test]
+    fn title_header_and_bar_clicks_and_alt_click_menus() {
+        let t0 = Instant::now();
+        let mut map = hits();
+        map.bar = vec![(Rect::new(0, 24, 8, 1), Action::Copy)];
+        let mut state = InputState::new();
+        assert_eq!(
+            state.handle(&down(45, 0), InputMode::Browse, &map, t0),
+            click(ClickTarget::PaneTitle(PaneSide::Right), t0)
+        );
+        assert_eq!(
+            state.handle(&down(45, 1), InputMode::Browse, &map, t0),
+            click(
+                ClickTarget::ColumnHeader {
+                    side: PaneSide::Right,
+                    key: SortKey::Name
+                },
+                t0
+            )
+        );
+        // Bar buttons are their key's action, never half of a double click.
+        assert_eq!(
+            state.handle(&down(3, 24), InputMode::Browse, &map, t0),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            state.handle(&down(3, 24), InputMode::Browse, &map, t0),
+            Some(Action::Copy)
+        );
+        // Alt+click on a row opens its context menu at the pointer and
+        // starts no drag.
+        let alt = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            7,
+            3,
+            KeyModifiers::ALT,
+        );
+        assert_eq!(
+            state.handle(&alt, InputMode::Browse, &map, t0),
+            Some(Action::ContextMenu(Some(MenuAnchor {
+                side: PaneSide::Left,
+                index: 1,
+                column: 7,
+                row: 3
+            })))
+        );
+        let moved = mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            9,
+            3,
+            KeyModifiers::ALT,
+        );
+        assert_eq!(state.handle(&moved, InputMode::Browse, &map, t0), None);
+        // Alt elsewhere in a pane is a plain click.
+        let alt = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            5,
+            0,
+            KeyModifiers::ALT,
+        );
+        assert_eq!(
+            state.handle(&alt, InputMode::Browse, &map, t0),
+            click(ClickTarget::PaneArea(PaneSide::Left), t0)
+        );
+    }
+
+    #[test]
+    fn the_right_button_does_nothing() {
+        let t0 = Instant::now();
+        let map = hits();
+        let mut state = InputState::new();
+        let none = KeyModifiers::NONE;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            assert_eq!(
+                state.handle(&mouse(kind, 5, 3, none), InputMode::Browse, &map, t0),
+                None
+            );
+        }
+        // A right press does not count as the first half of a double click.
+        assert_eq!(
+            state.handle(&down(5, 3), InputMode::Browse, &map, t0),
+            click(row(PaneSide::Left, 1), t0)
         );
     }
 

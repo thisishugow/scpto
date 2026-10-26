@@ -18,6 +18,7 @@ use crate::edit::EditOutcome;
 use crate::error::{ConnectError, Error, FsError};
 use crate::hosts::ResolvedHost;
 use crate::preview::{ImageResized, PreviewData};
+use crate::state::{Sort, SortKey};
 use crate::sync::{Comparison, SyncDirection};
 use crate::transfer::model::{JobId, QueueTarget, TransferCommand, TransferEvent};
 use crate::vfs::{Endpoint, Entry, Location};
@@ -83,8 +84,9 @@ pub enum InputMode {
     /// characters edit the field, Tab moves focus, Enter confirms, Esc
     /// cancels. Bookmarks have no name, so `B` never opens one.
     TextField,
-    /// A dialog with buttons only: Tab/arrows move focus, Space toggles the
-    /// focused option, Enter confirms, Esc cancels, letters are hotkeys.
+    /// A dialog with buttons only, or a popup menu (sort menu, context
+    /// menu): Tab/arrows move focus, Space toggles the focused option,
+    /// Enter confirms, Esc cancels, letters are hotkeys.
     Dialog,
     /// A filterable list (host picker, bookmarks): characters filter,
     /// arrows move, Enter picks, Esc closes.
@@ -185,6 +187,19 @@ pub enum DialogButton {
     Retry,
 }
 
+/// Where a context menu opens (plan 8.9: Option/Alt+click on a pane row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuAnchor {
+    /// The pane clicked in.
+    pub side: PaneSide,
+    /// Visible row index clicked.
+    pub index: usize,
+    /// Pointer column; the menu opens at the pointer.
+    pub column: u16,
+    /// Pointer row.
+    pub row: u16,
+}
+
 /// Keyboard modifiers of a mouse click, as reported by the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClickModifiers {
@@ -206,8 +221,20 @@ pub enum ClickTarget {
         /// Visible row index.
         index: usize,
     },
-    /// Any other part of a pane (header, blank space below the rows).
+    /// Any other part of a pane (border, path line, blank space below the
+    /// rows).
     PaneArea(PaneSide),
+    /// The endpoint button in a pane's title: opens the host picker for
+    /// that pane, like `o`.
+    PaneTitle(PaneSide),
+    /// A column header of a pane: sorts by that column, or reverses the
+    /// order when it is already the sort column.
+    ColumnHeader {
+        /// The pane.
+        side: PaneSide,
+        /// The column's sort key.
+        key: SortKey,
+    },
     /// A job or item row in the queue panel.
     QueueRow(QueueTarget),
     /// A button in the open dialog.
@@ -216,6 +243,8 @@ pub enum ClickTarget {
     PickerRow(usize),
     /// A row of the comparison view (visible index).
     SyncRow(usize),
+    /// An item of the open popup menu (index in the menu).
+    MenuRow(usize),
 }
 
 /// A scrollable area under the mouse wheel.
@@ -273,12 +302,13 @@ pub enum QueueControl {
 /// `Instant` of the input event so the state machine stays testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    // Navigation (plan 2.4).
+    // Navigation (plan 2.4, 8.9: letter keys only, no function keys).
     /// Tab: switch the focused pane (and the queue panel when visible).
     SwitchFocus,
     /// Move the cursor or scroll a viewer.
     MoveCursor(CursorMove),
-    /// Enter / Right / l: enter a directory, preview a file.
+    /// Enter / Right / l: enter a directory (the `..` row: the parent),
+    /// preview a file.
     Open,
     /// Backspace / Left / h: go to the parent directory.
     Parent,
@@ -290,19 +320,19 @@ pub enum Action {
     InvertSelection,
 
     // File operations.
-    /// F5 / c: copy to the other pane's current directory.
+    /// c: copy to the other pane's current directory.
     Copy,
-    /// F6 / m: move to the other pane's current directory.
+    /// m: move to the other pane's current directory.
     Move,
-    /// F7 / n: create a directory.
+    /// n: create a directory.
     MakeDir,
-    /// F8 / Delete / d: delete after confirmation.
+    /// d / Delete: delete after confirmation.
     Delete,
-    /// F2 / r: rename.
+    /// r: rename.
     Rename,
-    /// F4 / e: edit.
+    /// e: edit.
     Edit,
-    /// F3 / v: full-screen preview.
+    /// v: full-screen preview.
     Preview,
     /// i: toggle quick view in the non-focused pane.
     ToggleQuickView,
@@ -318,11 +348,19 @@ pub enum Action {
     StartFilter,
     /// `.`: toggle hidden files.
     ToggleHidden,
-    /// s: cycle the sort key (name, size, modified time).
-    CycleSort,
-    /// F9 / Q: toggle the queue panel.
+    /// s: open the sort menu of the focused pane.
+    SortMenu,
+    /// Sort the focused pane by a key in its natural order
+    /// (`state::Sort::by`); nothing changes when it already sorts by it.
+    SortBy(SortKey),
+    /// Reverse the focused pane's sort order.
+    ReverseSort,
+    /// x (on the cursor row of the focused pane, `None`) or Option/Alt+click
+    /// on a pane row: open the context menu listing that entry's actions.
+    ContextMenu(Option<MenuAnchor>),
+    /// Q: toggle the queue panel.
     ToggleQueue,
-    /// `?` / F1: help.
+    /// `?`: help.
     Help,
 
     // Endpoints and tools.
@@ -341,7 +379,7 @@ pub enum Action {
     StartSync(SyncDirection),
     /// t: open a shell in the focused pane's directory.
     OpenShell,
-    /// q / F10: quit (asks when transfers are in progress).
+    /// q: quit (asks when transfers are in progress).
     Quit,
 
     // Queue panel.
@@ -603,6 +641,13 @@ pub enum Effect {
     // State, timers, control.
     /// Remember the last directory of an endpoint.
     RememberDirectory(Location),
+    /// Remember the last pane sort of an endpoint.
+    RememberSort {
+        /// The endpoint.
+        endpoint: Endpoint,
+        /// Its sort.
+        sort: Sort,
+    },
     /// Add a bookmark.
     SaveBookmark(Location),
     /// Remove a bookmark.

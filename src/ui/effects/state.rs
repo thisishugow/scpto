@@ -1,11 +1,11 @@
-//! Executes `Effect::RememberDirectory`, `Effect::SaveBookmark`, and
-//! `Effect::RemoveBookmark` using `state`.
+//! Executes `Effect::RememberDirectory`, `Effect::RememberSort`,
+//! `Effect::SaveBookmark`, and `Effect::RemoveBookmark` using `state`.
 //!
 //! # Behavior
 //!
 //! Each entry point spawns a task that locks `ctx.persisted`, applies the
-//! change (`PersistedState::remember_directory`, `add_bookmark`,
-//! `remove_bookmark`), and, when `ctx.state_dir` is set, saves the whole
+//! change (`PersistedState::remember_directory`, `remember_sort`,
+//! `add_bookmark`, `remove_bookmark`), and, when `ctx.state_dir` is set, saves the whole
 //! value with `state::save_state` in `spawn_blocking` while still holding
 //! the lock, so saves never overtake each other. A failed save is sent as
 //! `StateWriteFailed`. Without a state directory nothing is saved (startup
@@ -15,20 +15,29 @@
 //!
 //! ```text
 //! pub fn remember_directory(ctx: &Ctx, location: Location);
+//! pub fn remember_sort(ctx: &Ctx, endpoint: Endpoint, sort: Sort);
 //! pub fn save_bookmark(ctx: &Ctx, location: Location);
 //! pub fn remove_bookmark(ctx: &Ctx, location: Location);
 //! ```
 
 use super::Ctx;
 use crate::error::Error;
-use crate::state::{self, PersistedState};
+use crate::state::{self, PersistedState, Sort};
 use crate::ui::action::BgEvent;
-use crate::vfs::Location;
+use crate::vfs::{Endpoint, Location};
 
 /// Remembers `location` as its endpoint's last directory and saves the
 /// state (`Effect::RememberDirectory`).
 pub fn remember_directory(ctx: &Ctx, location: Location) {
     change(ctx, move |persisted| persisted.remember_directory(location));
+}
+
+/// Remembers `sort` as its endpoint's last pane sort and saves the state
+/// (`Effect::RememberSort`).
+pub fn remember_sort(ctx: &Ctx, endpoint: Endpoint, sort: Sort) {
+    change(ctx, move |persisted| {
+        persisted.remember_sort(endpoint, sort)
+    });
 }
 
 /// Adds a bookmark for `location` unless present and saves the state
@@ -92,7 +101,7 @@ mod tests {
     use super::super::session::testing::Harness;
     use super::*;
     use crate::connections::SshClient;
-    use crate::vfs::Endpoint;
+    use crate::state::{EndpointSort, SortKey};
 
     fn local(path: &str) -> Location {
         Location {
@@ -139,9 +148,14 @@ mod tests {
         save_bookmark(&harness.ctx, local("/x"));
         save_bookmark(&harness.ctx, remote("web", "/y"));
         save_bookmark(&harness.ctx, local("/x"));
+        remember_sort(&harness.ctx, Endpoint::Local, Sort::by(SortKey::Size));
         let expected = PersistedState {
             last_directories: vec![local("/b"), remote("web", "/srv")],
             bookmarks: vec![local("/x"), remote("web", "/y")],
+            sorts: vec![EndpointSort {
+                endpoint: Endpoint::Local,
+                sort: Sort::by(SortKey::Size),
+            }],
         };
         saved_state_becomes(&dir, &expected).await;
         assert_eq!(*harness.ctx.persisted.lock().await, expected);

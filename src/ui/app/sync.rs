@@ -885,16 +885,17 @@ mod tests {
     fn cursor_moves_page_by_page_and_stays_on_screen() {
         let mut app = two_local();
         open_view(&mut app, files(50));
-        // 24 rows: 23 above the status bar, minus 3 rows of chrome.
-        assert_eq!(app.sync_page_height(), 20);
+        // 24 rows: 22 above the status and button bars, minus 3 rows of
+        // chrome.
+        assert_eq!(app.sync_page_height(), 19);
         act(&mut app, Action::MoveCursor(CursorMove::PageDown));
-        assert_eq!(cursor_and_first(&app), (20, 1));
+        assert_eq!(cursor_and_first(&app), (19, 1));
         act(&mut app, Action::MoveCursor(CursorMove::End));
-        assert_eq!(cursor_and_first(&app), (49, 30));
+        assert_eq!(cursor_and_first(&app), (49, 31));
         act(&mut app, Action::MoveCursor(CursorMove::Down));
-        assert_eq!(cursor_and_first(&app), (49, 30));
+        assert_eq!(cursor_and_first(&app), (49, 31));
         act(&mut app, Action::MoveCursor(CursorMove::PageUp));
-        assert_eq!(cursor_and_first(&app), (29, 29));
+        assert_eq!(cursor_and_first(&app), (30, 30));
         act(&mut app, Action::MoveCursor(CursorMove::Home));
         assert_eq!(cursor_and_first(&app), (0, 0));
         act(&mut app, Action::MoveCursor(CursorMove::Up));
@@ -912,12 +913,12 @@ mod tests {
         act(&mut app, scroll(5));
         assert_eq!(cursor_and_first(&app), (5, 5));
         act(&mut app, scroll(100));
-        assert_eq!(cursor_and_first(&app), (30, 30));
+        assert_eq!(cursor_and_first(&app), (31, 31));
         act(&mut app, Action::MoveCursor(CursorMove::End));
         act(&mut app, scroll(-3));
-        assert_eq!(cursor_and_first(&app), (46, 27));
+        assert_eq!(cursor_and_first(&app), (46, 28));
         act(&mut app, scroll(-100));
-        assert_eq!(cursor_and_first(&app), (19, 0));
+        assert_eq!(cursor_and_first(&app), (18, 0));
         // The wheel over another region is claimed and ignored.
         act(
             &mut app,
@@ -926,7 +927,7 @@ mod tests {
                 lines: 5,
             },
         );
-        assert_eq!(cursor_and_first(&app), (19, 0));
+        assert_eq!(cursor_and_first(&app), (18, 0));
     }
 
     #[test]
@@ -954,10 +955,10 @@ mod tests {
             width: 80,
             height: 10,
         });
-        // 9 rows above the status bar leave 6 list rows.
+        // 8 rows above the status bar leave 5 list rows.
         let shown = app.sync_view().unwrap();
         assert_eq!(shown.cursor, 49);
-        assert_eq!(shown.first_visible, 44);
+        assert_eq!(shown.first_visible, 45);
         assert_eq!(shown.visible, view(&app).visible.as_slice());
         assert_eq!(shown.selected, view(&app).selected.as_slice());
         assert_eq!(shown.comparison, view(&app).comparison.as_ref());

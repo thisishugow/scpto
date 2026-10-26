@@ -2,8 +2,8 @@
 //! `$XDG_STATE_HOME` is ignored per the XDG spec; default
 //! `~/.local/state/scpto`):
 //!
-//! - `state.json`: [`PersistedState`], the last directory per endpoint and
-//!   the bookmarks.
+//! - `state.json`: [`PersistedState`], the last directory and the last
+//!   pane sort per endpoint, and the bookmarks.
 //! - `partials.json`: [`Partials`], the source size and mtime recorded for
 //!   each `.scpto-part` file (plan 7.5 S12).
 //!
@@ -44,6 +44,17 @@
 //!     pub fn add_bookmark(&mut self, location: Location) -> bool;
 //!     /// Returns whether it was present.
 //!     pub fn remove_bookmark(&mut self, location: &Location) -> bool;
+//!     /// Replaces the sort remembered for `endpoint` (one per endpoint).
+//!     pub fn remember_sort(&mut self, endpoint: Endpoint, sort: Sort);
+//!     pub fn last_sort(&self, endpoint: &Endpoint) -> Option<Sort>;
+//! }
+//!
+//! impl Sort {
+//!     /// `key` in its natural order: names and extensions A first, sizes
+//!     /// and times largest and newest first.
+//!     pub fn by(key: SortKey) -> Sort;
+//!     /// The same key in the other order.
+//!     pub fn reversed(self) -> Sort;
 //! }
 //!
 //! impl Partials {
@@ -68,8 +79,8 @@
 //! ```
 //!
 //! `ui/effects/state.rs` keeps the loaded `PersistedState` in memory, applies
-//! `RememberDirectory`, `SaveBookmark`, and `RemoveBookmark` to it, and saves
-//! the whole value after each change.
+//! `RememberDirectory`, `RememberSort`, `SaveBookmark`, and `RemoveBookmark`
+//! to it, and saves the whole value after each change.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -111,6 +122,80 @@ pub struct PersistedState {
     /// Bookmarks in the order they were added, without names and without
     /// duplicates.
     pub bookmarks: Vec<Location>,
+    /// The last sort a pane used for each endpoint, at most one entry per
+    /// endpoint.
+    pub sorts: Vec<EndpointSort>,
+}
+
+/// What a pane sorts by (plan 8.9). Directories always come first,
+/// whatever the key and order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortKey {
+    /// File name.
+    Name,
+    /// File name extension (the text after the last `.`; none for
+    /// dotfiles such as `.bashrc`), then name.
+    Extension,
+    /// Size in bytes (directories sort as 0 among themselves by name).
+    Size,
+    /// Modification time.
+    Modified,
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    /// Smallest, oldest, or A first.
+    Ascending,
+    /// Largest, newest, or Z first.
+    Descending,
+}
+
+/// A pane's sort setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Sort {
+    /// What to sort by.
+    pub key: SortKey,
+    /// Which way.
+    pub order: SortOrder,
+}
+
+impl Default for Sort {
+    fn default() -> Self {
+        Sort::by(SortKey::Name)
+    }
+}
+
+impl Sort {
+    /// `key` in its natural order: names and extensions A first, sizes and
+    /// times largest and newest first.
+    pub fn by(key: SortKey) -> Sort {
+        let order = match key {
+            SortKey::Name | SortKey::Extension => SortOrder::Ascending,
+            SortKey::Size | SortKey::Modified => SortOrder::Descending,
+        };
+        Sort { key, order }
+    }
+
+    /// The same key in the other order.
+    pub fn reversed(self) -> Sort {
+        let order = match self.order {
+            SortOrder::Ascending => SortOrder::Descending,
+            SortOrder::Descending => SortOrder::Ascending,
+        };
+        Sort { order, ..self }
+    }
+}
+
+/// One entry of [`PersistedState::sorts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointSort {
+    /// The endpoint.
+    pub endpoint: Endpoint,
+    /// Its last sort.
+    pub sort: Sort,
 }
 
 /// One record of `partials.json`.
@@ -182,6 +267,26 @@ impl PersistedState {
         let before = self.bookmarks.len();
         self.bookmarks.retain(|entry| entry != location);
         self.bookmarks.len() != before
+    }
+
+    /// Replaces the sort remembered for `endpoint` (one per endpoint).
+    pub fn remember_sort(&mut self, endpoint: Endpoint, sort: Sort) {
+        match self
+            .sorts
+            .iter_mut()
+            .find(|entry| entry.endpoint == endpoint)
+        {
+            Some(entry) => entry.sort = sort,
+            None => self.sorts.push(EndpointSort { endpoint, sort }),
+        }
+    }
+
+    /// The last remembered sort of an endpoint.
+    pub fn last_sort(&self, endpoint: &Endpoint) -> Option<Sort> {
+        self.sorts
+            .iter()
+            .find(|entry| entry.endpoint == *endpoint)
+            .map(|entry| entry.sort)
     }
 }
 
@@ -445,8 +550,13 @@ mod tests {
                 },
             ],
             bookmarks: vec![sudo_location()],
+            sorts: vec![EndpointSort {
+                endpoint: sudo_location().endpoint,
+                sort: Sort::by(SortKey::Extension).reversed(),
+            }],
         };
         let json = serde_json::to_string(&state).expect("serialize");
+        assert!(json.contains(r#""sort":{"key":"extension","order":"descending"}"#));
         let back: PersistedState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, state);
     }
@@ -534,6 +644,35 @@ mod tests {
             sudo: false,
         };
         assert_eq!(state.last_directory(&plain), None);
+    }
+
+    #[test]
+    fn sorts_are_one_per_endpoint_with_natural_default_orders() {
+        assert_eq!(Sort::default(), Sort::by(SortKey::Name));
+        assert_eq!(Sort::by(SortKey::Name).order, SortOrder::Ascending);
+        assert_eq!(Sort::by(SortKey::Extension).order, SortOrder::Ascending);
+        assert_eq!(Sort::by(SortKey::Size).order, SortOrder::Descending);
+        assert_eq!(Sort::by(SortKey::Modified).order, SortOrder::Descending);
+        assert_eq!(
+            Sort::by(SortKey::Size).reversed().reversed(),
+            Sort::by(SortKey::Size)
+        );
+
+        let mut state = PersistedState::default();
+        let web = sudo_location().endpoint;
+        assert_eq!(state.last_sort(&web), None);
+        state.remember_sort(web.clone(), Sort::by(SortKey::Size));
+        state.remember_sort(Endpoint::Local, Sort::by(SortKey::Modified));
+        state.remember_sort(web.clone(), Sort::by(SortKey::Name).reversed());
+        assert_eq!(state.sorts.len(), 2);
+        assert_eq!(
+            state.last_sort(&web),
+            Some(Sort::by(SortKey::Name).reversed())
+        );
+        assert_eq!(
+            state.last_sort(&Endpoint::Local),
+            Some(Sort::by(SortKey::Modified))
+        );
     }
 
     #[test]

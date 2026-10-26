@@ -14,7 +14,13 @@
 //!   `show_hidden` (a leading `.` hides) and the fuzzy `filter`, sorted by
 //!   `sort`. Directories and symlinks to directories come first, in both
 //!   orders. Ties break by name compared case-insensitively, then bytewise.
-//! - `cursor < visible.len()` unless `visible` is empty (then 0);
+//! - Rows (plan 8.9): a listed pane whose `cwd` is not `/` shows a `..` row
+//!   first, then one row per `visible` entry. Every index called a row
+//!   (cursor, scroll, `row_entry`, clicks, drags) counts the `..` row. It
+//!   has no entry: it is never selected, marked, transferred, or counted
+//!   (select all and invert skip it, `targets` is empty while the cursor is
+//!   on it), and `Open` on it goes to the parent.
+//! - `cursor < row_count()` unless there are no rows (then 0);
 //!   `scroll <= cursor` and the cursor row stays within the last page height
 //!   passed in. A page height of 0 (a terminal too small to show rows) is
 //!   treated as 1.
@@ -33,7 +39,8 @@
 //! and the caller emits `Effect::ListDir` for it. The old listing stays on
 //! screen until `BgEvent::Listed` for the same `RequestId` arrives; success
 //! replaces `cwd`, `entries`, clears the filter and the selection, and puts
-//! the cursor on `reselect` when present (else the first row); failure
+//! the cursor on `reselect` when present (else the first entry, or the `..`
+//! row of an empty directory); failure
 //! keeps the old listing and is reported by the app. Results with any other
 //! id are stale and ignored. A refresh of the same directory keeps cursor
 //! (by name), selection, and filter.
@@ -68,12 +75,17 @@
 //!     /// Path of the parent of `cwd`, and the name to reselect there;
 //!     /// `None` at `/`.
 //!     pub fn parent(&self) -> Option<(PathBuf, OsString)>;
-//!     /// Absolute path of a visible row.
+//!     /// Absolute path of a row's entry; `None` for the `..` row.
 //!     pub fn path_of(&self, index: usize) -> Option<PathBuf>;
 //!
 //!     // Reading.
-//!     pub fn visible_len(&self) -> usize;
-//!     pub fn visible_entry(&self, index: usize) -> Option<&Entry>;
+//!     /// Whether the first row is `..` (listed, `cwd` not `/`).
+//!     pub fn has_parent_row(&self) -> bool;
+//!     pub fn is_parent_row(&self, index: usize) -> bool;
+//!     /// Rows including the `..` row.
+//!     pub fn row_count(&self) -> usize;
+//!     /// The entry of a row; `None` for the `..` row and past the end.
+//!     pub fn row_entry(&self, index: usize) -> Option<&Entry>;
 //!     pub fn cursor_entry(&self) -> Option<&Entry>;
 //!     pub fn is_selected(&self, entry: &Entry) -> bool;
 //!     /// Operation targets: the visible selected entries in visible order,
@@ -105,9 +117,9 @@
 //!     pub fn clear_selection(&mut self);
 //!
 //!     // View.
-//!     /// `s`: Name ascending -> Size descending -> Modified descending ->
-//!     /// Name ascending. Keeps the cursor on the same entry.
-//!     pub fn cycle_sort(&mut self, page: usize);
+//!     /// Sort menu and column headers: re-sorts, keeping the cursor on the
+//!     /// same entry.
+//!     pub fn set_sort(&mut self, sort: Sort, page: usize);
 //!     /// `.`: keeps the cursor on the same entry when it stays visible.
 //!     pub fn toggle_hidden(&mut self, page: usize);
 //!     pub fn edit_filter(&mut self, edit: TextEdit, page: usize);
@@ -124,58 +136,9 @@ use std::path::PathBuf;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::FsError;
+use crate::state::{Sort, SortKey, SortOrder};
 use crate::ui::action::{CursorMove, RequestId, TextEdit};
 use crate::vfs::{Endpoint, Entry, Location};
-
-/// What a pane sorts by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SortKey {
-    /// File name.
-    Name,
-    /// Size in bytes (directories sort as 0 among themselves by name).
-    Size,
-    /// Modification time.
-    Modified,
-}
-
-/// Sort direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SortOrder {
-    /// Smallest, oldest, or A first.
-    Ascending,
-    /// Largest, newest, or Z first.
-    Descending,
-}
-
-/// A pane's sort setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Sort {
-    /// What to sort by.
-    pub key: SortKey,
-    /// Which way.
-    pub order: SortOrder,
-}
-
-impl Default for Sort {
-    fn default() -> Self {
-        Sort {
-            key: SortKey::Name,
-            order: SortOrder::Ascending,
-        }
-    }
-}
-
-impl Sort {
-    /// The next setting of the `s` cycle.
-    fn next(self) -> Sort {
-        let (key, order) = match self.key {
-            SortKey::Name => (SortKey::Size, SortOrder::Descending),
-            SortKey::Size => (SortKey::Modified, SortOrder::Descending),
-            SortKey::Modified => (SortKey::Name, SortOrder::Ascending),
-        };
-        Sort { key, order }
-    }
-}
 
 /// A directory listing in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,11 +165,12 @@ pub struct Pane {
     pub cwd: Option<PathBuf>,
     /// Entries of `cwd` as listed (unsorted, `.` and `..` excluded).
     pub entries: Vec<Entry>,
-    /// Indices into `entries` of the rows shown, in display order.
+    /// Indices into `entries` of the entries shown, in display order (the
+    /// rows after the `..` row, if any).
     pub visible: Vec<usize>,
-    /// Cursor position in `visible`.
+    /// Cursor row.
     pub cursor: usize,
-    /// Index in `visible` of the first row on screen.
+    /// The first row on screen.
     pub scroll: usize,
     /// Names of selected entries.
     pub selection: HashSet<OsString>,
@@ -333,11 +297,12 @@ impl Pane {
             self.scroll = 0;
         }
         self.rebuild();
-        let found = reselect.as_deref().and_then(|name| self.find_visible(name));
+        let found = reselect.as_deref().and_then(|name| self.find_row(name));
         self.cursor = match found {
             Some(index) => index,
             None if pending.refresh => old_cursor,
-            None => 0,
+            None if self.visible.is_empty() => 0,
+            None => self.first_entry_row(),
         };
         self.clamp(self.page);
         Ok(true)
@@ -359,27 +324,41 @@ impl Pane {
         Some((cwd.parent()?.to_path_buf(), name))
     }
 
-    /// Absolute path of a visible row.
+    /// Absolute path of a row's entry; `None` for the `..` row.
     pub fn path_of(&self, index: usize) -> Option<PathBuf> {
-        let entry = self.visible_entry(index)?;
+        let entry = self.row_entry(index)?;
         Some(self.cwd.as_ref()?.join(&entry.name))
     }
 
     // Reading.
 
-    /// Number of visible rows.
-    pub fn visible_len(&self) -> usize {
-        self.visible.len()
+    /// Whether the first row is `..`: the pane is listed and `cwd` is not
+    /// `/`.
+    pub fn has_parent_row(&self) -> bool {
+        self.cwd.as_ref().is_some_and(|cwd| cwd.parent().is_some())
     }
 
-    /// The entry of visible row `index`.
-    pub fn visible_entry(&self, index: usize) -> Option<&Entry> {
-        self.visible.get(index).map(|&entry| &self.entries[entry])
+    /// Whether row `index` is the `..` row.
+    pub fn is_parent_row(&self, index: usize) -> bool {
+        index == 0 && self.has_parent_row()
+    }
+
+    /// Number of rows, including the `..` row.
+    pub fn row_count(&self) -> usize {
+        self.first_entry_row() + self.visible.len()
+    }
+
+    /// The entry of row `index`; `None` for the `..` row and past the end.
+    pub fn row_entry(&self, index: usize) -> Option<&Entry> {
+        let position = index.checked_sub(self.first_entry_row())?;
+        self.visible
+            .get(position)
+            .map(|&entry| &self.entries[entry])
     }
 
     /// The entry under the cursor.
     pub fn cursor_entry(&self) -> Option<&Entry> {
-        self.visible_entry(self.cursor)
+        self.row_entry(self.cursor)
     }
 
     /// Whether `entry` is selected.
@@ -406,10 +385,11 @@ impl Pane {
         self.path_of(self.cursor).into_iter().collect()
     }
 
-    /// Drag sources for a press on visible row `index`: every target when
-    /// that row is selected, else that row alone (plan 2.4).
+    /// Drag sources for a press on row `index`: every target when that row
+    /// is selected, else that row alone (plan 2.4); nothing for the `..`
+    /// row.
     pub fn drag_sources(&self, index: usize) -> Vec<PathBuf> {
-        match self.visible_entry(index) {
+        match self.row_entry(index) {
             Some(entry) if self.is_selected(entry) => self.targets(),
             Some(_) => self.path_of(index).into_iter().collect(),
             None => Vec::new(),
@@ -421,7 +401,7 @@ impl Pane {
     /// Moves the cursor; `page` is the number of list rows on screen.
     pub fn move_cursor(&mut self, movement: CursorMove, page: usize) {
         let page = page.max(1);
-        let last = self.visible.len().saturating_sub(1);
+        let last = self.row_count().saturating_sub(1);
         self.cursor = match movement {
             CursorMove::Up => self.cursor.saturating_sub(1),
             CursorMove::Down => (self.cursor + 1).min(last),
@@ -433,7 +413,7 @@ impl Pane {
         self.clamp(page);
     }
 
-    /// Puts the cursor on visible row `index` (clamped to the last row).
+    /// Puts the cursor on row `index` (clamped to the last row).
     pub fn set_cursor(&mut self, index: usize, page: usize) {
         self.cursor = index;
         self.clamp(page);
@@ -443,7 +423,7 @@ impl Pane {
     /// dragging the cursor along only when it would leave the page.
     pub fn scroll_by(&mut self, lines: i32, page: usize) {
         let page = page.max(1);
-        let max_scroll = self.visible.len().saturating_sub(page);
+        let max_scroll = self.row_count().saturating_sub(page);
         let distance = usize::try_from(lines.unsigned_abs()).unwrap_or(usize::MAX);
         self.scroll = if lines < 0 {
             self.scroll.saturating_sub(distance)
@@ -463,9 +443,10 @@ impl Pane {
         self.move_cursor(CursorMove::Down, page);
     }
 
-    /// Ctrl/Cmd+click: toggles the selection of visible row `index`.
+    /// Ctrl/Cmd+click: toggles the selection of row `index` (nothing for
+    /// the `..` row).
     pub fn toggle(&mut self, index: usize) {
-        let Some(name) = self.visible_entry(index).map(|entry| entry.name.clone()) else {
+        let Some(name) = self.row_entry(index).map(|entry| entry.name.clone()) else {
             return;
         };
         if !self.selection.remove(&name) {
@@ -479,29 +460,37 @@ impl Pane {
         if self.visible.is_empty() {
             return;
         }
-        let index = index.min(self.visible.len() - 1);
+        let index = index.min(self.row_count() - 1);
         let (low, high) = if index < self.cursor {
             (index, self.cursor)
         } else {
             (self.cursor, index)
         };
-        for &entry in &self.visible[low..=high] {
-            self.selection.insert(self.entries[entry].name.clone());
+        // Rows to entry positions; the `..` row has none.
+        let offset = self.first_entry_row();
+        let low = low.saturating_sub(offset);
+        if let Some(high) = high.checked_sub(offset) {
+            for &entry in &self.visible[low..=high] {
+                self.selection.insert(self.entries[entry].name.clone());
+            }
         }
         self.set_cursor(index, page);
     }
 
-    /// Selects every visible row.
+    /// Selects every visible entry (never the `..` row).
     pub fn select_all(&mut self) {
         for &entry in &self.visible {
             self.selection.insert(self.entries[entry].name.clone());
         }
     }
 
-    /// Inverts the selection of every visible row.
+    /// Inverts the selection of every visible entry (never the `..` row).
     pub fn invert_selection(&mut self) {
-        for index in 0..self.visible.len() {
-            self.toggle(index);
+        for &entry in &self.visible {
+            let name = &self.entries[entry].name;
+            if !self.selection.remove(name) {
+                self.selection.insert(name.clone());
+            }
         }
     }
 
@@ -513,10 +502,10 @@ impl Pane {
 
     // View.
 
-    /// `s`: Name ascending -> Size descending -> Modified descending -> Name
-    /// ascending. Keeps the cursor on the same entry.
-    pub fn cycle_sort(&mut self, page: usize) {
-        self.sort = self.sort.next();
+    /// Sort menu and column headers: re-sorts, keeping the cursor on the
+    /// same entry.
+    pub fn set_sort(&mut self, sort: Sort, page: usize) {
+        self.sort = sort;
         self.rebuild_keeping_cursor(page);
     }
 
@@ -575,6 +564,7 @@ impl Pane {
             .collect();
         let rank = |i: usize| !entries[i].is_enterable();
         let name = |i: usize| (folded[i].as_str(), entries[i].name.as_bytes());
+        let extension = |i: usize| extension(&folded[i]);
         let size = |i: usize| {
             if entries[i].is_enterable() {
                 None
@@ -590,6 +580,12 @@ impl Pane {
             }
             (SortKey::Name, SortOrder::Descending) => {
                 visible.sort_by_cached_key(|&i| (rank(i), Reverse(name(i))));
+            }
+            (SortKey::Extension, SortOrder::Ascending) => {
+                visible.sort_by_cached_key(|&i| (rank(i), extension(i), name(i)));
+            }
+            (SortKey::Extension, SortOrder::Descending) => {
+                visible.sort_by_cached_key(|&i| (rank(i), Reverse((extension(i), name(i)))));
             }
             (SortKey::Size, SortOrder::Ascending) => {
                 visible.sort_by_cached_key(|&i| (rank(i), size(i), name(i)));
@@ -607,30 +603,42 @@ impl Pane {
     }
 
     /// Rebuilds `visible` and keeps the cursor on the same entry when it is
-    /// still visible, else at the same position (clamped).
+    /// still visible (on the `..` row when it was there), else at the same
+    /// row (clamped).
     fn rebuild_keeping_cursor(&mut self, page: usize) {
-        let current = self.visible.get(self.cursor).copied();
+        let offset = self.first_entry_row();
+        let current = self
+            .cursor
+            .checked_sub(offset)
+            .and_then(|position| self.visible.get(position).copied());
         self.rebuild();
-        if let Some(index) = current.and_then(|entry| self.visible.iter().position(|&v| v == entry))
+        if let Some(position) =
+            current.and_then(|entry| self.visible.iter().position(|&v| v == entry))
         {
-            self.cursor = index;
+            self.cursor = offset + position;
         }
         self.clamp(page);
     }
 
-    /// Visible index of the entry named `name`: an exact match first, else
-    /// one whose NFC form equals the NFC form of `name`.
-    fn find_visible(&self, name: &OsStr) -> Option<usize> {
+    /// The row of the first entry: 1 below a `..` row, else 0.
+    fn first_entry_row(&self) -> usize {
+        usize::from(self.has_parent_row())
+    }
+
+    /// Row of the entry named `name`: an exact match first, else one whose
+    /// NFC form equals the NFC form of `name`.
+    fn find_row(&self, name: &OsStr) -> Option<usize> {
         let exact = self
             .visible
             .iter()
             .position(|&entry| self.entries[entry].name == name);
-        exact.or_else(|| {
+        let position = exact.or_else(|| {
             let wanted = nfc(name);
             self.visible
                 .iter()
                 .position(|&entry| nfc(&self.entries[entry].name) == wanted)
-        })
+        })?;
+        Some(self.first_entry_row() + position)
     }
 
     /// Restores the cursor and scroll invariants for `page` rows and
@@ -638,13 +646,14 @@ impl Pane {
     fn clamp(&mut self, page: usize) {
         let page = page.max(1);
         self.page = page;
-        if self.visible.is_empty() {
+        let rows = self.row_count();
+        if rows == 0 {
             self.cursor = 0;
             self.scroll = 0;
             return;
         }
-        self.cursor = self.cursor.min(self.visible.len() - 1);
-        self.scroll = self.scroll.min(self.visible.len().saturating_sub(page));
+        self.cursor = self.cursor.min(rows - 1);
+        self.scroll = self.scroll.min(rows.saturating_sub(page));
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
         } else if self.cursor >= self.scroll + page {
@@ -661,6 +670,15 @@ fn nfc(name: &OsStr) -> String {
 /// The form names and filter text are compared in: NFC, then lowercase.
 fn fold(name: &OsStr) -> String {
     nfc(name).to_lowercase()
+}
+
+/// The extension of a folded name: the text after the last `.`, empty for
+/// names without one and for dotfiles without a second dot.
+fn extension(folded: &str) -> &str {
+    match folded.rfind('.') {
+        Some(0) | None => "",
+        Some(dot) => &folded[dot + 1..],
+    }
 }
 
 /// Whether every character of `needle` occurs in `haystack` in order.
@@ -721,24 +739,22 @@ mod tests {
         ]
     }
 
-    /// A local pane listed at `/home/u` with `entries`.
+    /// A local pane listed at `/home/u` with `entries`, told the page
+    /// height first like the app does on its first resize.
     fn listed(entries: Vec<Entry>) -> Pane {
         let mut pane = Pane::new(Endpoint::Local, false);
+        pane.set_cursor(0, PAGE);
         pane.begin_list(RequestId(1), "/home/u".into(), None);
         assert_eq!(pane.finish_list(RequestId(1), Ok(entries)), Ok(true));
         assert_invariants(&pane, PAGE);
         pane
     }
 
+    /// Names of the entry rows in order (the `..` row has no entry).
     fn names(pane: &Pane) -> Vec<String> {
-        (0..pane.visible_len())
-            .map(|i| {
-                pane.visible_entry(i)
-                    .expect("row")
-                    .name
-                    .to_string_lossy()
-                    .into_owned()
-            })
+        (0..pane.row_count())
+            .filter_map(|i| pane.row_entry(i))
+            .map(|entry| entry.name.to_string_lossy().into_owned())
             .collect()
     }
 
@@ -753,10 +769,14 @@ mod tests {
     fn assert_invariants(pane: &Pane, page: usize) {
         let page = page.max(1);
         assert!(pane.visible.iter().all(|&i| i < pane.entries.len()));
-        if pane.visible.is_empty() {
+        assert_eq!(
+            pane.row_count(),
+            pane.visible.len() + usize::from(pane.has_parent_row())
+        );
+        if pane.row_count() == 0 {
             assert_eq!((pane.cursor, pane.scroll), (0, 0));
         } else {
-            assert!(pane.cursor < pane.visible.len());
+            assert!(pane.cursor < pane.row_count());
             assert!(pane.scroll <= pane.cursor);
             assert!(pane.cursor < pane.scroll + page);
         }
@@ -775,6 +795,85 @@ mod tests {
     }
 
     #[test]
+    fn panes_below_the_root_start_with_a_parent_row() {
+        let pane = listed(sample());
+        assert!(pane.has_parent_row());
+        assert!(pane.is_parent_row(0));
+        assert!(!pane.is_parent_row(1));
+        assert_eq!(pane.row_count(), 6);
+        assert_eq!(pane.row_entry(0), None);
+        assert_eq!(pane.path_of(0), None);
+        assert_eq!(pane.row_entry(1).expect("row").name, "adir");
+        assert_eq!(pane.row_entry(6), None);
+        // A new listing puts the cursor on the first entry, not on `..`.
+        assert_eq!(pane.cursor, 1);
+
+        // An empty directory has only the `..` row, with the cursor on it.
+        let empty = listed(Vec::new());
+        assert_eq!((empty.row_count(), empty.cursor), (1, 0));
+        assert!(empty.targets().is_empty());
+
+        // The root has no parent row; neither has an unlisted pane.
+        let mut root = Pane::new(Endpoint::Local, false);
+        assert!(!root.has_parent_row());
+        root.begin_list(RequestId(1), "/".into(), None);
+        assert_eq!(root.finish_list(RequestId(1), Ok(sample())), Ok(true));
+        assert!(!root.has_parent_row());
+        assert_eq!((root.row_count(), root.cursor), (5, 0));
+    }
+
+    #[test]
+    fn the_parent_row_is_never_selected_targeted_or_dragged() {
+        let mut pane = listed(sample());
+        pane.set_cursor(0, PAGE);
+        assert!(pane.cursor_entry().is_none());
+        assert!(pane.targets().is_empty());
+        assert!(pane.drag_sources(0).is_empty());
+        pane.toggle(0);
+        assert!(pane.selection.is_empty());
+        // Space on `..` selects nothing and moves down.
+        pane.toggle_and_advance(PAGE);
+        assert!(pane.selection.is_empty());
+        assert_eq!(pane.cursor, 1);
+        // Select all and invert only cover entries.
+        pane.select_all();
+        assert_eq!(pane.selection.len(), 5);
+        pane.invert_selection();
+        assert!(pane.selection.is_empty());
+        // A range starting on `..` covers the entries up to the row.
+        pane.set_cursor(0, PAGE);
+        pane.select_range(2, PAGE);
+        let mut selected: Vec<_> = pane.selection.iter().cloned().collect();
+        selected.sort();
+        assert_eq!(selected, ["adir", "zdir"]);
+        // A range ending on `..` from the first entry selects that entry.
+        pane.clear_selection();
+        pane.set_cursor(1, PAGE);
+        pane.select_range(0, PAGE);
+        assert_eq!(pane.selection.len(), 1);
+        assert_eq!(pane.cursor, 0);
+        // While the cursor is on `..`, a selection is still the target.
+        assert_eq!(pane.targets(), [PathBuf::from("/home/u/adir")]);
+        assert_invariants(&pane, PAGE);
+    }
+
+    #[test]
+    fn the_parent_row_stays_on_top_through_sort_and_filter() {
+        let mut pane = listed(sample());
+        pane.set_cursor(0, PAGE);
+        pane.set_sort(Sort::by(SortKey::Size), PAGE);
+        assert_eq!(pane.cursor, 0);
+        assert!(pane.is_parent_row(0));
+        pane.edit_filter(TextEdit::Insert('z'), PAGE);
+        assert_eq!(names(&pane), ["zdir"]);
+        assert_eq!(pane.row_count(), 2);
+        pane.edit_filter(TextEdit::Insert('q'), PAGE);
+        assert_eq!(pane.row_count(), 1);
+        assert_eq!(pane.cursor, 0);
+        assert_invariants(&pane, PAGE);
+    }
+
+    #[test]
     fn new_pane_is_empty_until_listed() {
         let pane = Pane::new(Endpoint::Local, true);
         assert_eq!(pane.cwd, None);
@@ -790,7 +889,7 @@ mod tests {
         let pane = listed(sample());
         assert_eq!(names(&pane), ["adir", "zdir", "A.txt", "b.txt", "c.log"]);
         assert_eq!(pane.cwd, Some(PathBuf::from("/home/u")));
-        assert_eq!(pane.cursor, 0);
+        assert_eq!(pane.cursor, 1);
     }
 
     #[test]
@@ -806,12 +905,12 @@ mod tests {
     }
 
     #[test]
-    fn sort_cycle_keeps_dirs_first_and_the_cursor_entry() {
+    fn sorting_keeps_dirs_first_and_the_cursor_entry() {
         let mut pane = listed(sample());
-        pane.set_cursor(3, PAGE);
+        pane.set_cursor(4, PAGE);
         assert_eq!(cursor_name(&pane), "b.txt");
 
-        pane.cycle_sort(PAGE);
+        pane.set_sort(Sort::by(SortKey::Size), PAGE);
         assert_eq!(
             pane.sort,
             Sort {
@@ -824,7 +923,7 @@ mod tests {
         assert_eq!(cursor_name(&pane), "b.txt");
         assert_invariants(&pane, PAGE);
 
-        pane.cycle_sort(PAGE);
+        pane.set_sort(Sort::by(SortKey::Modified), PAGE);
         assert_eq!(
             pane.sort,
             Sort {
@@ -835,7 +934,7 @@ mod tests {
         assert_eq!(names(&pane), ["zdir", "adir", "b.txt", "c.log", "A.txt"]);
         assert_eq!(cursor_name(&pane), "b.txt");
 
-        pane.cycle_sort(PAGE);
+        pane.set_sort(Sort::by(SortKey::Name), PAGE);
         assert_eq!(pane.sort, Sort::default());
         assert_eq!(names(&pane), ["adir", "zdir", "A.txt", "b.txt", "c.log"]);
         assert_eq!(cursor_name(&pane), "b.txt");
@@ -861,12 +960,43 @@ mod tests {
                 SortOrder::Ascending,
                 ["adir", "zdir", "A.txt", "c.log", "b.txt"],
             ),
+            (
+                SortKey::Extension,
+                SortOrder::Ascending,
+                ["adir", "zdir", "c.log", "A.txt", "b.txt"],
+            ),
+            (
+                SortKey::Extension,
+                SortOrder::Descending,
+                ["zdir", "adir", "b.txt", "A.txt", "c.log"],
+            ),
         ];
         for (key, order, expected) in cases {
             pane.sort = Sort { key, order };
             pane.rebuild_keeping_cursor(PAGE);
             assert_eq!(names(&pane), expected, "{key:?} {order:?}");
         }
+    }
+
+    #[test]
+    fn extensions_are_the_text_after_the_last_dot() {
+        assert_eq!(extension("archive.tar.gz"), "gz");
+        assert_eq!(extension("readme"), "");
+        assert_eq!(extension(".bashrc"), "");
+        assert_eq!(extension(".config.toml"), "toml");
+        assert_eq!(extension("trailing."), "");
+        let pane = {
+            let mut pane = listed(vec![
+                file("b.rs", 1, 1),
+                file("Makefile", 1, 1),
+                file("a.toml", 1, 1),
+                file("c.RS", 1, 1),
+            ]);
+            pane.set_sort(Sort::by(SortKey::Extension), PAGE);
+            pane
+        };
+        // No extension first, then extensions compared case-insensitively.
+        assert_eq!(names(&pane), ["Makefile", "b.rs", "c.RS", "a.toml"]);
     }
 
     #[test]
@@ -907,11 +1037,11 @@ mod tests {
             })
             .collect();
         let mut pane = listed(entries);
-        assert_eq!(pane.visible_len(), 100_000);
+        assert_eq!(pane.visible.len(), 100_000);
 
         let started = Instant::now();
-        for _ in 0..3 {
-            pane.cycle_sort(PAGE);
+        for key in [SortKey::Size, SortKey::Modified, SortKey::Name] {
+            pane.set_sort(Sort::by(key), PAGE);
         }
         let elapsed = started.elapsed();
 
@@ -948,7 +1078,7 @@ mod tests {
     #[test]
     fn hidden_toggle_keeps_the_cursor_entry() {
         let mut pane = listed(sample());
-        pane.set_cursor(2, PAGE);
+        pane.set_cursor(3, PAGE);
         assert_eq!(cursor_name(&pane), "A.txt");
         pane.toggle_hidden(PAGE);
         assert_eq!(
@@ -957,11 +1087,11 @@ mod tests {
         );
         assert_eq!(cursor_name(&pane), "A.txt");
 
-        pane.set_cursor(2, PAGE);
+        pane.set_cursor(3, PAGE);
         assert_eq!(cursor_name(&pane), ".hidden");
         pane.toggle_hidden(PAGE);
         // The entry disappeared; the cursor stays at its position.
-        assert_eq!(pane.cursor, 2);
+        assert_eq!(pane.cursor, 3);
         assert_invariants(&pane, PAGE);
     }
 
@@ -993,10 +1123,10 @@ mod tests {
         assert_eq!(names(&pane), ["adir", "zdir"]);
 
         pane.edit_filter(TextEdit::Insert('x'), PAGE);
-        assert_eq!(pane.visible_len(), 0);
+        assert!(pane.visible.is_empty());
         assert_invariants(&pane, PAGE);
         pane.clear_filter(PAGE);
-        assert_eq!(pane.visible_len(), 5);
+        assert_eq!(pane.visible.len(), 5);
         assert_invariants(&pane, PAGE);
     }
 
@@ -1024,26 +1154,27 @@ mod tests {
 
     #[test]
     fn cursor_moves_and_scroll_follows_the_page() {
+        // Ten entries below the `..` row: rows 0..=10.
         let entries: Vec<Entry> = (0..10).map(|i| file(&format!("f{i}"), 1, 1)).collect();
         let mut pane = listed(entries);
         pane.move_cursor(CursorMove::Down, PAGE);
-        assert_eq!((pane.cursor, pane.scroll), (1, 0));
+        assert_eq!((pane.cursor, pane.scroll), (2, 0));
         pane.move_cursor(CursorMove::PageDown, PAGE);
-        assert_eq!((pane.cursor, pane.scroll), (4, 2));
+        assert_eq!((pane.cursor, pane.scroll), (5, 3));
         pane.move_cursor(CursorMove::End, PAGE);
-        assert_eq!((pane.cursor, pane.scroll), (9, 7));
+        assert_eq!((pane.cursor, pane.scroll), (10, 8));
         pane.move_cursor(CursorMove::Down, PAGE);
-        assert_eq!(pane.cursor, 9);
+        assert_eq!(pane.cursor, 10);
         pane.move_cursor(CursorMove::PageUp, PAGE);
-        assert_eq!((pane.cursor, pane.scroll), (6, 6));
+        assert_eq!((pane.cursor, pane.scroll), (7, 7));
         pane.move_cursor(CursorMove::Up, PAGE);
-        assert_eq!((pane.cursor, pane.scroll), (5, 5));
+        assert_eq!((pane.cursor, pane.scroll), (6, 6));
         pane.move_cursor(CursorMove::Home, PAGE);
         assert_eq!((pane.cursor, pane.scroll), (0, 0));
         pane.move_cursor(CursorMove::Up, PAGE);
         assert_eq!(pane.cursor, 0);
         pane.set_cursor(99, PAGE);
-        assert_eq!((pane.cursor, pane.scroll), (9, 7));
+        assert_eq!((pane.cursor, pane.scroll), (10, 8));
         assert_invariants(&pane, PAGE);
     }
 
@@ -1066,7 +1197,7 @@ mod tests {
         assert_invariants(&pane, 0);
         pane.toggle_and_advance(0);
         pane.select_range(0, 0);
-        pane.cycle_sort(0);
+        pane.set_sort(Sort::by(SortKey::Size), 0);
         assert_invariants(&pane, 0);
 
         let mut empty = listed(Vec::new());
@@ -1090,9 +1221,9 @@ mod tests {
         pane.scroll_by(3, PAGE);
         assert_eq!((pane.scroll, pane.cursor), (4, 4));
         pane.scroll_by(100, PAGE);
-        assert_eq!((pane.scroll, pane.cursor), (7, 7));
+        assert_eq!((pane.scroll, pane.cursor), (8, 8));
         pane.scroll_by(-1, PAGE);
-        assert_eq!((pane.scroll, pane.cursor), (6, 7));
+        assert_eq!((pane.scroll, pane.cursor), (7, 8));
         pane.scroll_by(-100, PAGE);
         assert_eq!((pane.scroll, pane.cursor), (0, 2));
         assert_invariants(&pane, PAGE);
@@ -1102,15 +1233,15 @@ mod tests {
     fn selection_toggle_range_all_and_invert() {
         let mut pane = listed(sample());
         pane.toggle_and_advance(PAGE);
-        assert_eq!(pane.cursor, 1);
+        assert_eq!(pane.cursor, 2);
         assert!(pane.is_selected(&dir("adir", 0)));
 
-        pane.toggle(0);
+        pane.toggle(1);
         assert!(pane.selection.is_empty());
 
-        pane.set_cursor(1, PAGE);
-        pane.select_range(3, PAGE);
-        assert_eq!(pane.cursor, 3);
+        pane.set_cursor(2, PAGE);
+        pane.select_range(4, PAGE);
+        assert_eq!(pane.cursor, 4);
         let mut selected: Vec<_> = pane.selection.iter().cloned().collect();
         selected.sort();
         assert_eq!(selected, ["A.txt", "b.txt", "zdir"]);
@@ -1135,11 +1266,11 @@ mod tests {
     #[test]
     fn targets_use_visible_selection_else_the_cursor() {
         let mut pane = listed(sample());
-        pane.set_cursor(2, PAGE);
+        pane.set_cursor(3, PAGE);
         assert_eq!(pane.targets(), [PathBuf::from("/home/u/A.txt")]);
 
-        pane.toggle(4);
-        pane.toggle(0);
+        pane.toggle(5);
+        pane.toggle(1);
         assert_eq!(
             pane.targets(),
             [
@@ -1159,16 +1290,17 @@ mod tests {
     #[test]
     fn drag_sources_follow_plan_2_4() {
         let mut pane = listed(sample());
-        pane.toggle(2);
         pane.toggle(3);
+        pane.toggle(4);
         assert_eq!(
-            pane.drag_sources(3),
+            pane.drag_sources(4),
             [
                 PathBuf::from("/home/u/A.txt"),
                 PathBuf::from("/home/u/b.txt")
             ]
         );
-        assert_eq!(pane.drag_sources(4), [PathBuf::from("/home/u/c.log")]);
+        assert_eq!(pane.drag_sources(5), [PathBuf::from("/home/u/c.log")]);
+        assert!(pane.drag_sources(0).is_empty());
         assert!(pane.drag_sources(99).is_empty());
     }
 
@@ -1184,7 +1316,7 @@ mod tests {
             }
         );
         // The old listing stays until the result arrives.
-        assert_eq!(pane.visible_len(), 5);
+        assert_eq!(pane.visible.len(), 5);
         assert_eq!(
             pane.finish_list(RequestId(2), Ok(vec![file("inner", 1, 1)])),
             Ok(true)
@@ -1227,35 +1359,36 @@ mod tests {
         pane.set_cursor(0, 4);
         pane.begin_list(RequestId(1), "/v".into(), Some("f8".into()));
         assert_eq!(pane.finish_list(RequestId(1), Ok(entries)), Ok(true));
-        assert_eq!((pane.cursor, pane.scroll), (8, 5));
+        // `f8` is row 9, below the `..` row.
+        assert_eq!((pane.cursor, pane.scroll), (9, 6));
         assert_invariants(&pane, 4);
     }
 
     #[test]
     fn new_directory_clears_filter_and_selection() {
         let mut pane = listed(sample());
-        pane.toggle(0);
+        pane.toggle(1);
         pane.edit_filter(TextEdit::Insert('t'), PAGE);
         pane.begin_list(RequestId(2), "/other".into(), None);
         assert_eq!(pane.finish_list(RequestId(2), Ok(sample())), Ok(true));
         assert!(pane.selection.is_empty());
         assert!(pane.filter.is_empty());
-        assert_eq!(pane.cursor, 0);
+        assert_eq!(pane.cursor, 1);
     }
 
     #[test]
     fn refresh_keeps_cursor_selection_and_filter_and_drops_vanished_names() {
         let mut pane = listed(sample());
-        pane.toggle(3);
         pane.toggle(4);
+        pane.toggle(5);
         pane.edit_filter(TextEdit::Insert('.'), PAGE);
         assert_eq!(names(&pane), ["A.txt", "b.txt", "c.log"]);
-        pane.set_cursor(1, PAGE);
+        pane.set_cursor(2, PAGE);
 
         let location = pane.begin_refresh(RequestId(2)).expect("listed");
         assert_eq!(location.path, PathBuf::from("/home/u"));
         // The user moves while the refresh is in flight.
-        pane.set_cursor(2, PAGE);
+        pane.set_cursor(3, PAGE);
         let mut fresh = sample();
         fresh.retain(|e| e.name != "b.txt");
         fresh.push(file("0new.txt", 1, 1));
@@ -1272,7 +1405,7 @@ mod tests {
     #[test]
     fn refresh_keeps_the_position_when_the_cursor_entry_vanished() {
         let mut pane = listed(sample());
-        pane.set_cursor(4, PAGE);
+        pane.set_cursor(5, PAGE);
         pane.begin_refresh(RequestId(2)).expect("listed");
         let mut fresh = sample();
         fresh.retain(|e| e.name != "c.log");
@@ -1293,7 +1426,7 @@ mod tests {
         pane.begin_list(RequestId(2), "/a".into(), None);
         pane.begin_list(RequestId(3), "/b".into(), None);
         assert_eq!(pane.finish_list(RequestId(2), Ok(Vec::new())), Ok(false));
-        assert_eq!(pane.visible_len(), 5);
+        assert_eq!(pane.visible.len(), 5);
 
         let error = FsError::PermissionDenied { path: "/b".into() };
         assert_eq!(
@@ -1301,7 +1434,7 @@ mod tests {
             Err(error)
         );
         assert_eq!(pane.cwd, Some(PathBuf::from("/home/u")));
-        assert_eq!(pane.visible_len(), 5);
+        assert_eq!(pane.visible.len(), 5);
         assert_eq!(pane.pending, None);
         // A late duplicate of a finished request is stale.
         assert_eq!(pane.finish_list(RequestId(3), Ok(Vec::new())), Ok(false));
@@ -1310,9 +1443,9 @@ mod tests {
     #[test]
     fn set_endpoint_keeps_only_sort_and_hidden() {
         let mut pane = listed(sample());
-        pane.cycle_sort(PAGE);
+        pane.set_sort(Sort::by(SortKey::Size), PAGE);
         pane.toggle_hidden(PAGE);
-        pane.toggle(0);
+        pane.toggle(1);
         pane.begin_list(RequestId(5), "/x".into(), None);
         let remote = Endpoint::Remote {
             host: "web".into(),

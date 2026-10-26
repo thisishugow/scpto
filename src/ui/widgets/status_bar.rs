@@ -1,9 +1,9 @@
-//! Status bar widget: messages, selection summary, transfer summary, key
-//! hints.
+//! Status bar widget: messages, selection summary, transfer summary. The
+//! keys of the current mode are the button bar's (`widgets::button_bar`).
 //!
 //! One row: the message (error style when `message_is_error`) on the left,
-//! then the selection and transfer summaries, then key hints truncated to
-//! the remaining width. Empty parts are left out; the parts drawn are
+//! then the selection and transfer summaries. Empty parts are left out; the
+//! parts drawn are
 //! separated by a dimmed bar, and each is cut with an ellipsis when it does
 //! not fit, so the message always wins the space.
 //!
@@ -17,7 +17,6 @@
 //!     pub selection: &'a str,
 //!     /// For example `2 running, 1 failed`.
 //!     pub transfers: &'a str,
-//!     pub hints: &'a str,
 //! }
 //!
 //! pub fn render(view: &StatusBarView<'_>, area: Rect, buf: &mut Buffer);
@@ -36,7 +35,6 @@ const SEPARATOR: &str = " \u{2502} ";
 const MESSAGE: Style = Style::new();
 const MESSAGE_ERROR: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
 const SUMMARY: Style = Style::new().fg(Color::Cyan);
-const HINTS: Style = Style::new().fg(Color::DarkGray);
 const SEPARATOR_STYLE: Style = Style::new().fg(Color::DarkGray);
 
 /// The status bar to draw, borrowed from the app state.
@@ -50,8 +48,6 @@ pub struct StatusBarView<'a> {
     pub selection: &'a str,
     /// For example `2 running, 1 failed`.
     pub transfers: &'a str,
-    /// Key hints, cut to the width left after the other parts.
-    pub hints: &'a str,
 }
 
 /// Draws the status bar into the first row of `area`.
@@ -71,7 +67,6 @@ pub fn render(view: &StatusBarView<'_>, area: Rect, buf: &mut Buffer) {
         (view.message, message_style),
         (view.selection, SUMMARY),
         (view.transfers, SUMMARY),
-        (view.hints, HINTS),
     ];
     let separator_width = cell_width(SEPARATOR);
     let mut x = row.x;
@@ -123,7 +118,6 @@ mod tests {
             message_is_error: false,
             selection: "3 selected, 12.4 MiB",
             transfers: "2 running, 1 failed",
-            hints: "F1 help  F5 copy  q quit",
         }
     }
 
@@ -132,25 +126,25 @@ mod tests {
         let buf = draw(&full(), 90);
         assert_eq!(
             row_text(&buf, 0).trim_end(),
-            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 running, 1 failed \u{2502} F1 help  F5 copy  q quit"
+            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 running, 1 failed"
         );
         assert_eq!(buf[(0, 0)].fg, Color::Reset);
         assert_eq!(buf[(17, 0)].fg, Color::Cyan);
-        assert_eq!(buf[(70, 0)].fg, Color::DarkGray);
+        assert_eq!(buf[(15, 0)].fg, Color::DarkGray);
     }
 
     #[test]
-    fn hints_are_cut_to_the_remaining_width() {
-        let buf = draw(&full(), 70);
+    fn later_parts_are_cut_to_the_remaining_width() {
+        let buf = draw(&full(), 50);
         assert_eq!(
             row_text(&buf, 0),
-            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 running, 1 failed \u{2502} F1 help\u{2026}"
+            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 running\u{2026}"
         );
-        // No room after the separator: the hints are left out entirely.
-        let buf = draw(&full(), 61);
+        // No room after the separator: the part is left out entirely.
+        let buf = draw(&full(), 40);
         assert_eq!(
             row_text(&buf, 0),
-            "Copied 3 items \u{2502} 3 selected, 12.4 MiB \u{2502} 2 running, 1 failed  "
+            "Copied 3 items \u{2502} 3 selected, 12.4 MiB   "
         );
     }
 
@@ -174,10 +168,9 @@ mod tests {
             message_is_error: false,
             selection: "",
             transfers: "1 running",
-            hints: "? help",
         };
         let buf = draw(&view, 30);
-        assert_eq!(row_text(&buf, 0).trim_end(), "1 running \u{2502} ? help");
+        assert_eq!(row_text(&buf, 0).trim_end(), "1 running");
     }
 
     #[test]
@@ -190,7 +183,6 @@ mod tests {
             message_is_error: false,
             selection: "",
             transfers: "",
-            hints: "",
         };
         render(&view, area, &mut buf);
         assert_eq!(row_text(&buf, 0).trim_end(), "ok");
@@ -203,7 +195,6 @@ mod tests {
             message_is_error: true,
             selection: "",
             transfers: "",
-            hints: "",
         };
         let buf = draw(&view, 20);
         assert_eq!(row_text(&buf, 0).trim_end(), "bad?[2Jname?");

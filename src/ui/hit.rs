@@ -6,10 +6,19 @@
 //! queue button, [`ScrollRegion`], or [`DropTarget`]. Neither side computes
 //! layout on its own, so a click always resolves against what is on screen.
 //!
-//! Layers are resolved top-down: dialog, picker, viewer, comparison view,
-//! queue panel, pane tabs, panes. A layer claims every point inside its
-//! `area`. The dialog and the picker are modal: while one is recorded,
-//! points outside it hit nothing.
+//! The button bar (plan 8.9, the last row) is checked before every layer:
+//! [`HitMap::bar_button`] gives the `Action` of the button under the
+//! pointer, the same one its key produces in the current mode, so input
+//! emits it directly. Then layers are resolved top-down: dialog, popup
+//! menu, picker, viewer, comparison view, queue panel, pane tabs, panes.
+//! A layer claims every point inside its `area`. The dialog, the menu, and
+//! the picker are modal: while one is recorded, points outside it hit
+//! nothing.
+//!
+//! Inside a pane, the endpoint button of the title resolves to
+//! `ClickTarget::PaneTitle`, a column header to `ClickTarget::ColumnHeader`,
+//! and a list row to `ClickTarget::PaneRow` (the `..` row is row 0 like any
+//! other; it is never a folder drop target).
 //!
 //! In single-pane mode (plan 8.8) each pane has a tab in the tab row: a
 //! click on a tab is `ClickTarget::PaneArea` of its pane (which focuses and
@@ -18,9 +27,10 @@
 
 use ratatui::layout::{Position, Rect};
 
+use crate::state::SortKey;
 use crate::transfer::model::QueueTarget;
 use crate::ui::action::{
-    ClickTarget, DialogButton, DropTarget, PaneSide, QueueControl, ScrollRegion,
+    Action, ClickTarget, DialogButton, DropTarget, PaneSide, QueueControl, ScrollRegion,
 };
 
 /// A pane's file list as drawn.
@@ -31,13 +41,26 @@ pub struct PaneHit {
     /// The whole pane, including its header and the blank space below the
     /// rows.
     pub area: Rect,
+    /// The endpoint button in the title; empty when not drawn.
+    pub title: Rect,
+    /// The column headers drawn, each with the key it sorts by.
+    pub headers: Vec<(Rect, SortKey)>,
     /// The list body; row `n` of the body is screen row `rows.y + n`.
     pub rows: Rect,
-    /// Visible-list index of the first drawn row.
+    /// Row index (`Pane` rows, counting `..`) of the first drawn row.
     pub first_visible: usize,
-    /// One flag per drawn row: whether that row is enterable (a directory or
-    /// a symlink to one), which makes it a folder drop target.
+    /// One flag per drawn row: whether that row is a folder drop target (a
+    /// directory or a symlink to one; never the `..` row).
     pub enterable: Vec<bool>,
+}
+
+/// The popup menu as drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuHit {
+    /// The menu box, including its border.
+    pub area: Rect,
+    /// Each drawn item row and its index in the menu.
+    pub items: Vec<(Rect, usize)>,
 }
 
 /// A scrolled list (host picker, bookmark list, comparison view) as drawn.
@@ -120,10 +143,15 @@ pub struct HitMap {
     pub picker: Option<ListHit>,
     /// The open dialog.
     pub dialog: Option<DialogHit>,
+    /// The open popup menu (sort menu, context menu).
+    pub menu: Option<MenuHit>,
+    /// The button bar: each drawn button and the action it stands for.
+    pub bar: Vec<(Rect, Action)>,
 }
 
 /// The layer that owns a point.
 enum Layer<'a> {
+    Menu(&'a MenuHit),
     Dialog(&'a DialogHit),
     Picker(&'a ListHit),
     Viewer(&'a ViewerHit),
@@ -139,20 +167,39 @@ impl HitMap {
     pub fn resolve(&self, column: u16, row: u16) -> Option<ClickTarget> {
         let point = Position::new(column, row);
         match self.layer_at(point)? {
+            Layer::Menu(menu) => find(&menu.items, point).map(ClickTarget::MenuRow),
             Layer::Dialog(dialog) => find(&dialog.buttons, point).map(ClickTarget::DialogButton),
             Layer::Picker(list) => list_index(list, point).map(ClickTarget::PickerRow),
             Layer::Viewer(_) => None,
             Layer::SyncView(list) => list_index(list, point).map(ClickTarget::SyncRow),
             Layer::Queue(queue) => find(&queue.rows, point).map(ClickTarget::QueueRow),
             Layer::Tab(tab) => Some(ClickTarget::PaneArea(tab.side)),
-            Layer::Pane(pane) => Some(match pane_index(pane, point) {
-                Some(index) => ClickTarget::PaneRow {
+            Layer::Pane(pane) => Some(if pane.title.contains(point) {
+                ClickTarget::PaneTitle(pane.side)
+            } else if let Some(key) = find(&pane.headers, point) {
+                ClickTarget::ColumnHeader {
                     side: pane.side,
-                    index,
-                },
-                None => ClickTarget::PaneArea(pane.side),
+                    key,
+                }
+            } else {
+                match pane_index(pane, point) {
+                    Some(index) => ClickTarget::PaneRow {
+                        side: pane.side,
+                        index,
+                    },
+                    None => ClickTarget::PaneArea(pane.side),
+                }
             }),
         }
+    }
+
+    /// The action of the button-bar button at (`column`, `row`), if any.
+    pub fn bar_button(&self, column: u16, row: u16) -> Option<Action> {
+        let point = Position::new(column, row);
+        self.bar
+            .iter()
+            .find(|(rect, _)| rect.contains(point))
+            .map(|(_, action)| action.clone())
     }
 
     /// The queue row button at (`column`, `row`), if any; a click on it
@@ -172,7 +219,7 @@ impl HitMap {
     /// The area the mouse wheel scrolls at (`column`, `row`), if any.
     pub fn scroll_region(&self, column: u16, row: u16) -> Option<ScrollRegion> {
         Some(match self.layer_at(Position::new(column, row))? {
-            Layer::Dialog(_) | Layer::Tab(_) => return None,
+            Layer::Menu(_) | Layer::Dialog(_) | Layer::Tab(_) => return None,
             Layer::Picker(_) => ScrollRegion::Picker,
             Layer::Viewer(viewer) => match viewer.kind {
                 ViewerKind::Preview => ScrollRegion::Preview,
@@ -203,6 +250,9 @@ impl HitMap {
     fn layer_at(&self, point: Position) -> Option<Layer<'_>> {
         if let Some(dialog) = &self.dialog {
             return dialog.area.contains(point).then_some(Layer::Dialog(dialog));
+        }
+        if let Some(menu) = &self.menu {
+            return menu.area.contains(point).then_some(Layer::Menu(menu));
         }
         if let Some(picker) = &self.picker {
             return picker.area.contains(point).then_some(Layer::Picker(picker));
@@ -257,10 +307,81 @@ mod tests {
         PaneHit {
             side: PaneSide::Left,
             area: Rect::new(0, 0, 40, 20),
+            title: Rect::new(1, 0, 10, 1),
+            headers: vec![
+                (Rect::new(1, 1, 20, 1), SortKey::Name),
+                (Rect::new(22, 1, 8, 1), SortKey::Size),
+            ],
             rows: Rect::new(1, 2, 38, 17),
             first_visible: 100,
             enterable: vec![true, false, false],
         }
+    }
+
+    #[test]
+    fn title_button_and_column_headers_resolve_inside_the_pane() {
+        let map = HitMap {
+            panes: vec![left_pane()],
+            ..HitMap::default()
+        };
+        assert_eq!(
+            map.resolve(3, 0),
+            Some(ClickTarget::PaneTitle(PaneSide::Left))
+        );
+        // The border outside the button is the pane area.
+        assert_eq!(
+            map.resolve(20, 0),
+            Some(ClickTarget::PaneArea(PaneSide::Left))
+        );
+        assert_eq!(
+            map.resolve(5, 1),
+            Some(ClickTarget::ColumnHeader {
+                side: PaneSide::Left,
+                key: SortKey::Name
+            })
+        );
+        assert_eq!(
+            map.resolve(25, 1),
+            Some(ClickTarget::ColumnHeader {
+                side: PaneSide::Left,
+                key: SortKey::Size
+            })
+        );
+        assert_eq!(map.drop_target(3, 0), DropTarget::Pane(PaneSide::Left));
+    }
+
+    #[test]
+    fn bar_buttons_resolve_before_every_layer_and_menus_are_modal() {
+        let map = HitMap {
+            panes: vec![left_pane()],
+            dialog: Some(DialogHit {
+                area: Rect::new(10, 5, 20, 6),
+                buttons: Vec::new(),
+            }),
+            bar: vec![
+                (Rect::new(0, 23, 8, 1), Action::Confirm),
+                (Rect::new(9, 23, 10, 1), Action::Cancel),
+            ],
+            ..HitMap::default()
+        };
+        assert_eq!(map.bar_button(3, 23), Some(Action::Confirm));
+        assert_eq!(map.bar_button(12, 23), Some(Action::Cancel));
+        assert_eq!(map.bar_button(8, 23), None);
+        assert_eq!(map.bar_button(3, 22), None);
+
+        let map = HitMap {
+            panes: vec![left_pane()],
+            menu: Some(MenuHit {
+                area: Rect::new(5, 3, 12, 4),
+                items: vec![(Rect::new(6, 4, 10, 1), 0), (Rect::new(6, 5, 10, 1), 1)],
+            }),
+            ..HitMap::default()
+        };
+        assert_eq!(map.resolve(7, 5), Some(ClickTarget::MenuRow(1)));
+        assert_eq!(map.resolve(5, 3), None);
+        assert_eq!(map.resolve(2, 10), None);
+        assert_eq!(map.scroll_region(7, 5), None);
+        assert_eq!(map.drop_target(2, 10), DropTarget::Invalid);
     }
 
     #[test]
@@ -276,9 +397,9 @@ mod tests {
                 index: 101
             })
         );
-        // Header and blank space below the drawn rows.
+        // Border and blank space below the drawn rows.
         assert_eq!(
-            map.resolve(5, 0),
+            map.resolve(30, 0),
             Some(ClickTarget::PaneArea(PaneSide::Left))
         );
         assert_eq!(

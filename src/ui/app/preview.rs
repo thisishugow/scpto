@@ -5,7 +5,7 @@
 //!
 //! # Behavior
 //!
-//! - `v` / F3, and `Open` on an entry that is not enterable (core hands it
+//! - `v`, and `Open` on an entry that is not enterable (core hands it
 //!   over through `App::preview_open`): opens [`PreviewState::full`] for
 //!   the focused pane's cursor entry with `ViewerContent::Loading` and emits
 //!   `Effect::LoadPreview`; an earlier load still in flight is canceled with
@@ -28,7 +28,7 @@
 //!   it (`update_resized_protocol`).
 //! - Viewer mode (`InputMode::Viewer`): `MoveCursor` and `Scroll { region:
 //!   ScrollRegion::Preview | ScrollRegion::Help }` scroll (a page is the
-//!   screen height minus the two border rows); `ToggleMarkdown` switches a
+//!   rows above the button bar minus the two border rows); `ToggleMarkdown` switches a
 //!   Markdown viewer between rendered and raw (raw is highlighted);
 //!   `Cancel` closes the help screen if open, else the full preview.
 //! - Opening the full preview on the file quick view shows takes over the
@@ -42,7 +42,7 @@
 //!   (`update_resized_protocol`), `Err` turns the viewer into
 //!   `ViewerContent::Failed`. A response with no awaiting viewer belongs to
 //!   a viewer that was closed or replaced and is dropped.
-//! - `?` / F1 opens the help screen ([`PreviewState::help`], scroll 0) over
+//! - `?` opens the help screen ([`PreviewState::help`], scroll 0) over
 //!   whatever is shown, including the comparison view.
 //! - The runtime takes [`PreviewState::resize_requests`] once at startup and
 //!   hands it to `ui::effects::preview::spawn_resize_worker`.
@@ -687,10 +687,10 @@ impl App {
 
     // Pages.
 
-    /// Text rows of a full-screen viewer: the screen height minus the
-    /// border.
+    /// Text rows of a full-screen viewer: the rows above the button bar
+    /// minus the border.
     fn screen_page(&self) -> usize {
-        let height = self.core.layout().status_bar.bottom();
+        let height = self.core.layout().button_bar.y;
         usize::from(height.saturating_sub(BORDER_ROWS))
     }
 
@@ -859,8 +859,8 @@ mod tests {
     /// Puts the left pane's cursor on `name`.
     fn select(app: &mut App, name: &str) {
         let pane = app.core.pane(PaneSide::Left);
-        let index = (0..pane.visible_len())
-            .find(|&index| pane.visible_entry(index).is_some_and(|e| e.name == name))
+        let index = (0..pane.row_count())
+            .find(|&index| pane.row_entry(index).is_some_and(|e| e.name == name))
             .expect("entry is listed");
         let page = app.core.page_height(PaneSide::Left);
         app.core.pane_mut(PaneSide::Left).set_cursor(index, page);
@@ -1081,7 +1081,8 @@ mod tests {
         let request = load_of(&app.preview_open(PaneSide::Left)[0], "/l/a.rs");
         let source: String = (1..=100).map(|n| format!("line {n}\n")).collect();
         app.preview_loaded(request, local("/l/a.rs"), text(source.as_bytes()));
-        // 24 rows minus the border: a page is 22 lines, the last start 78.
+        // 23 rows above the button bar minus the border: a page is 21
+        // lines, the last start 79.
         let scroll = |app: &mut App, action: Action| {
             app.preview_action(action).expect("claimed");
             app.preview.full.as_ref().expect("full").scroll
@@ -1089,19 +1090,19 @@ mod tests {
         assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::Down)), 1);
         assert_eq!(
             scroll(&mut app, Action::MoveCursor(CursorMove::PageDown)),
-            23
+            22
         );
-        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::End)), 78);
-        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::Down)), 78);
-        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::PageUp)), 56);
-        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::Up)), 55);
+        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::End)), 79);
+        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::Down)), 79);
+        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::PageUp)), 58);
+        assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::Up)), 57);
         let wheel = |lines| Action::Scroll {
             region: ScrollRegion::Preview,
             lines,
         };
-        assert_eq!(scroll(&mut app, wheel(3)), 58);
+        assert_eq!(scroll(&mut app, wheel(3)), 60);
         assert_eq!(scroll(&mut app, wheel(-100)), 0);
-        assert_eq!(scroll(&mut app, wheel(1000)), 78);
+        assert_eq!(scroll(&mut app, wheel(1000)), 79);
         assert_eq!(scroll(&mut app, Action::MoveCursor(CursorMove::Home)), 0);
         // Other actions are claimed and do nothing.
         assert_eq!(app.preview_action(Action::Copy), Ok(Vec::new()));
@@ -1116,7 +1117,7 @@ mod tests {
         assert_eq!(app.preview_input_mode(), Some(InputMode::Viewer));
         app.preview_action(Action::MoveCursor(CursorMove::End))
             .expect("claimed");
-        let last = help::line_count().saturating_sub(22);
+        let last = help::line_count().saturating_sub(21);
         assert_eq!(app.help_view(), Some(HelpView { scroll: last }));
         app.preview_action(Action::Scroll {
             region: ScrollRegion::Help,
@@ -1282,11 +1283,11 @@ mod tests {
             region: ScrollRegion::Preview,
             lines,
         };
-        // The right pane is 23 rows: 21 text rows, the last start 29.
+        // The right pane is 22 rows: 20 text rows, the last start 30.
         app.preview_action(wheel(5)).expect("claimed");
         assert_eq!(app.preview.quick.as_ref().expect("quick").scroll, 5);
         app.preview_action(wheel(100)).expect("claimed");
-        assert_eq!(app.preview.quick.as_ref().expect("quick").scroll, 29);
+        assert_eq!(app.preview.quick.as_ref().expect("quick").scroll, 30);
     }
 
     #[test]

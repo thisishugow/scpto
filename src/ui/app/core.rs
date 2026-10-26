@@ -23,9 +23,9 @@
 //!   action other than text, cursor moves, Enter, and Esc stops typing
 //!   (keeping the filter) and is handled as in browse mode. Esc in browse
 //!   mode clears a kept filter.
-//! - Navigation: Enter on an enterable row lists it; on a file it is the
-//!   preview feature's. Parent lists the parent and reselects the directory
-//!   left. A successful (non-refresh) listing emits `RememberDirectory`.
+//! - Navigation: Enter on an enterable row lists it; on the `..` row it is
+//!   Parent; on a file it is the preview feature's. Parent lists the parent
+//!   and reselects the directory left. A successful (non-refresh) listing emits `RememberDirectory`.
 //!   A failed listing is reported in the status bar; when it was a pane's
 //!   first listing (for example a remembered directory that no longer
 //!   exists) and the endpoint's home is known, the pane lists its home
@@ -34,6 +34,21 @@
 //!   toggles that row (and moves the cursor there, so a later range starts
 //!   from it); with the range modifier it selects from the cursor to the
 //!   row. Double click opens. The wheel scrolls the pane under the pointer.
+//!   A click on a pane's endpoint button (`ClickTarget::PaneTitle`) focuses
+//!   it and opens the host picker for it (`connection_open_picker`), like
+//!   `o`. Right clicks never reach the app (plan 8.9).
+//! - Sorting (plan 8.9): `SortBy(key)` sorts the focused pane by `key` in
+//!   its natural order (`state::Sort::by`) unless it already sorts by it;
+//!   `ReverseSort` flips the order; a click on a column header
+//!   (`ClickTarget::ColumnHeader`, also a double click, so quick clicks
+//!   keep flipping) focuses the pane and reverses the order when `key` is
+//!   the current key, else sorts by it. The cursor stays on the same entry.
+//!   Every change emits `Effect::RememberSort` for the pane's endpoint (and
+//!   updates `App::persisted`); a pane shown on an endpoint with a
+//!   remembered sort (`App::new`, `switch_endpoint`) takes that sort, else
+//!   it keeps its own.
+//! - Menu answers: `Answer::Menu(action)` is handled with `handle_action`,
+//!   exactly as if the item's key had been pressed.
 //! - `B` bookmarks the focused pane's directory (`SaveBookmark`) unless it
 //!   is already bookmarked; `R` reveals the cursor entry; `t` opens a shell
 //!   in the focused pane's directory; `q` quits.
@@ -42,7 +57,8 @@
 //!   drawn at a time (the focused one) under a tab row; Tab or a click on
 //!   the other tab (`ClickTarget::PaneArea`) switches it. The queue panel
 //!   takes at most a third of the rows and is one summary row below 24
-//!   rows. Below 40x10 every action except `Quit` and `Resize` is ignored
+//!   rows. The last row is the button bar (plan 8.9) and the row above it
+//!   the status bar. Below 40x10 every action except `Quit` and `Resize` is ignored
 //!   and the state is kept for when the terminal grows. A resize that hides
 //!   the source pane of a drag ends the drag.
 //!
@@ -133,7 +149,10 @@
 //!     pub queue: Option<Rect>,
 //!     /// The queue panel is a one-row summary.
 //!     pub queue_collapsed: bool,
+//!     /// The row above the button bar.
 //!     pub status_bar: Rect,
+//!     /// The last row (plan 8.9).
+//!     pub button_bar: Rect,
 //! }
 //!
 //! pub struct StatusMessage {
@@ -276,7 +295,7 @@ use crate::groups::Groups;
 use crate::hosts::HostList;
 use crate::preview::Background;
 use crate::settings::Settings;
-use crate::state::PersistedState;
+use crate::state::{PersistedState, Sort, SortKey};
 use crate::transfer::model::JobId;
 use crate::ui::action::{
     Action, BgEvent, ClickModifiers, ClickTarget, DialogButton, Effect, InputMode, PaneSide,
@@ -318,8 +337,10 @@ pub struct AppLayout {
     pub queue: Option<Rect>,
     /// The queue panel is a one-row summary (short terminals).
     pub queue_collapsed: bool,
-    /// The status bar (the last row).
+    /// The status bar (the row above the button bar).
     pub status_bar: Rect,
+    /// The button bar (the last row).
+    pub button_bar: Rect,
 }
 
 /// A status bar message.
@@ -429,13 +450,15 @@ impl CoreState {
 
     /// Screen areas for the current size and panel visibility; render draws
     /// into exactly these so key paging and the screen agree (plan 8.8). The
-    /// status bar is the last row; the queue panel, when visible, takes the
+    /// button bar is the last row and the status bar the row above it; the
+    /// queue panel, when visible, takes the
     /// bottom third of the rest, or one summary row on terminals shorter
     /// than 24 rows; the panes share the remaining rows, side by side, or,
     /// below 60 columns, one at a time under a tab row.
     pub fn layout(&self) -> AppLayout {
-        let status_height = self.height.min(1);
-        let body = self.height - status_height;
+        let bar_height = self.height.min(1);
+        let status_height = (self.height - bar_height).min(1);
+        let body = self.height - bar_height - status_height;
         let queue_collapsed = self.queue_collapsed();
         let queue_height = match (self.queue_visible, queue_collapsed) {
             (false, _) => 0,
@@ -476,6 +499,7 @@ impl CoreState {
                 .then(|| Rect::new(0, panes_height, self.width, queue_height)),
             queue_collapsed,
             status_bar: Rect::new(0, body, self.width, status_height),
+            button_bar: Rect::new(0, body + status_height, self.width, bar_height),
         }
     }
 
@@ -616,7 +640,13 @@ impl App {
             let dir = left_dir.clone().filter(|_| left_endpoint.is_local());
             (Endpoint::Local, dir)
         });
-        let core = CoreState::new(left_endpoint, right_endpoint, settings.show_hidden);
+        let mut core = CoreState::new(left_endpoint, right_endpoint, settings.show_hidden);
+        for side in [PaneSide::Left, PaneSide::Right] {
+            let pane = core.pane_mut(side);
+            if let Some(sort) = state.last_sort(&pane.endpoint) {
+                pane.set_sort(sort, 1);
+            }
+        }
         let mut app = App {
             core,
             connection: Default::default(),
@@ -751,7 +781,13 @@ impl App {
         if self.core.focused == side {
             self.core.filtering = false;
         }
-        self.core.pane_mut(side).set_endpoint(endpoint);
+        let remembered = self.persisted.last_sort(&endpoint);
+        let page = self.core.page_height(side);
+        let pane = self.core.pane_mut(side);
+        pane.set_endpoint(endpoint);
+        if let Some(sort) = remembered {
+            pane.set_sort(sort, page);
+        }
         let mut effects = self.start_pane(side, dir);
         effects.extend(self.connection_release_unused());
         effects
@@ -822,6 +858,7 @@ impl App {
                 kind: PickerKind::Bookmarks { .. },
                 ..
             } => Vec::new(),
+            Answer::Menu(action) => self.handle_action(action),
         }
     }
 
@@ -965,7 +1002,15 @@ impl App {
             Action::InvertSelection => self.core.pane_mut(side).invert_selection(),
             Action::StartFilter => self.core.filtering = true,
             Action::ToggleHidden => self.core.pane_mut(side).toggle_hidden(page),
-            Action::CycleSort => self.core.pane_mut(side).cycle_sort(page),
+            Action::SortBy(key) => {
+                if self.core.pane(side).sort.key != key {
+                    return self.set_sort(side, Sort::by(key));
+                }
+            }
+            Action::ReverseSort => {
+                let sort = self.core.pane(side).sort.reversed();
+                return self.set_sort(side, sort);
+            }
             Action::ToggleQueue => self.core.toggle_queue(),
             Action::Cancel => self.core.pane_mut(side).clear_filter(page),
             Action::AddBookmark => return self.add_bookmark(side),
@@ -982,7 +1027,7 @@ impl App {
             Action::Quit => return self.transfer_quit_requested(),
             Action::Click {
                 target, modifiers, ..
-            } => self.click(target, modifiers),
+            } => return self.click(target, modifiers),
             Action::DoubleClick { target, .. } => return self.double_click(target),
             Action::Scroll { region, lines } => self.scroll(region, lines),
             // Owned by the transfer, dialog, preview, edit, connection, and
@@ -997,6 +1042,8 @@ impl App {
             | Action::ToggleQuickView
             | Action::ToggleMarkdown
             | Action::Chmod
+            | Action::SortMenu
+            | Action::ContextMenu(_)
             | Action::Help
             | Action::OpenEndpointPicker
             | Action::ReconnectWithSudo
@@ -1054,20 +1101,30 @@ impl App {
             | Action::Quit
             | Action::Scroll { .. }
             | Action::Click {
-                target: ClickTarget::PaneRow { .. } | ClickTarget::PaneArea(_),
+                target:
+                    ClickTarget::PaneRow { .. }
+                    | ClickTarget::PaneArea(_)
+                    | ClickTarget::PaneTitle(_)
+                    | ClickTarget::ColumnHeader { .. },
                 ..
             }
             | Action::DoubleClick {
-                target: ClickTarget::PaneRow { .. } | ClickTarget::PaneArea(_),
+                target:
+                    ClickTarget::PaneRow { .. }
+                    | ClickTarget::PaneArea(_)
+                    | ClickTarget::PaneTitle(_)
+                    | ClickTarget::ColumnHeader { .. },
                 ..
             } => return self.browse_action(action),
+            // Option/Alt+click on a pane row leaves the queue like a click.
+            Action::ContextMenu(Some(_)) => return self.browse_chain(action),
             // Queue navigation and controls are the transfer feature's.
             _ => {}
         }
         Vec::new()
     }
 
-    fn click(&mut self, target: ClickTarget, modifiers: ClickModifiers) {
+    fn click(&mut self, target: ClickTarget, modifiers: ClickModifiers) -> Vec<Effect> {
         match target {
             ClickTarget::PaneRow { side, index } => {
                 self.core.focus(side);
@@ -1083,13 +1140,44 @@ impl App {
                 }
             }
             ClickTarget::PaneArea(side) => self.core.focus(side),
-            // Rows and buttons of the queue, dialogs, pickers, and the
-            // comparison view belong to their features.
+            ClickTarget::PaneTitle(side) => {
+                self.core.focus(side);
+                return self.connection_open_picker(side);
+            }
+            ClickTarget::ColumnHeader { side, key } => return self.header_click(side, key),
+            // Rows and buttons of the queue, dialogs, menus, pickers, and
+            // the comparison view belong to their features.
             ClickTarget::QueueRow(_)
             | ClickTarget::DialogButton(_)
+            | ClickTarget::MenuRow(_)
             | ClickTarget::PickerRow(_)
             | ClickTarget::SyncRow(_) => {}
         }
+        Vec::new()
+    }
+
+    /// A click on a column header: reverses the order of the current key,
+    /// else sorts by the clicked one.
+    fn header_click(&mut self, side: PaneSide, key: SortKey) -> Vec<Effect> {
+        self.core.focus(side);
+        let current = self.core.pane(side).sort;
+        let sort = if current.key == key {
+            current.reversed()
+        } else {
+            Sort::by(key)
+        };
+        self.set_sort(side, sort)
+    }
+
+    /// Re-sorts a pane (keeping the cursor entry) and remembers the sort
+    /// for its endpoint.
+    fn set_sort(&mut self, side: PaneSide, sort: Sort) -> Vec<Effect> {
+        let page = self.core.page_height(side);
+        let pane = self.core.pane_mut(side);
+        pane.set_sort(sort, page);
+        let endpoint = pane.endpoint.clone();
+        self.persisted.remember_sort(endpoint.clone(), sort);
+        vec![Effect::RememberSort { endpoint, sort }]
     }
 
     fn double_click(&mut self, target: ClickTarget) -> Vec<Effect> {
@@ -1104,8 +1192,13 @@ impl App {
                 self.core.focus(side);
                 Vec::new()
             }
-            ClickTarget::QueueRow(_)
+            // Quick clicks on a header keep flipping the order.
+            ClickTarget::ColumnHeader { side, key } => self.header_click(side, key),
+            // The first click already opened the picker.
+            ClickTarget::PaneTitle(_)
+            | ClickTarget::QueueRow(_)
             | ClickTarget::DialogButton(_)
+            | ClickTarget::MenuRow(_)
             | ClickTarget::PickerRow(_)
             | ClickTarget::SyncRow(_) => Vec::new(),
         }
@@ -1125,9 +1218,13 @@ impl App {
         }
     }
 
-    /// Enters the cursor row when it is enterable, else previews it.
+    /// Enters the cursor row when it is enterable (the `..` row goes to the
+    /// parent), else previews it.
     fn open(&mut self, side: PaneSide) -> Vec<Effect> {
         let pane = self.core.pane(side);
+        if pane.is_parent_row(pane.cursor) {
+            return self.parent(side);
+        }
         match pane.cursor_entry() {
             None => return Vec::new(),
             Some(entry) if !entry.is_enterable() => return self.preview_open(side),
@@ -1460,7 +1557,7 @@ mod tests {
                 endpoint: web(),
                 path: "/gone".into(),
             }],
-            bookmarks: Vec::new(),
+            ..PersistedState::default()
         };
         let (mut app, _) = build(
             state,
@@ -1581,14 +1678,19 @@ mod tests {
         let mut app = two_local();
         app.handle_action(Action::MoveCursor(CursorMove::End));
         assert_eq!(cursor_name(&app, PaneSide::Left), "b");
+        // Home is the `..` row: Space there selects nothing.
         app.handle_action(Action::MoveCursor(CursorMove::Home));
+        assert!(app.core.pane(PaneSide::Left).cursor_entry().is_none());
+        app.handle_action(Action::ToggleSelect);
+        assert!(app.core.pane(PaneSide::Left).selection.is_empty());
+        assert_eq!(cursor_name(&app, PaneSide::Left), "sub");
         app.handle_action(Action::ToggleSelect);
         assert_eq!(cursor_name(&app, PaneSide::Left), "a");
         app.handle_action(Action::InvertSelection);
         assert_eq!(app.core.pane(PaneSide::Left).selection.len(), 2);
         app.handle_action(Action::SelectAll);
         assert_eq!(app.core.pane(PaneSide::Left).selection.len(), 3);
-        app.handle_action(Action::CycleSort);
+        app.handle_action(Action::ReverseSort);
         assert_ne!(app.core.pane(PaneSide::Left).sort, Default::default());
         app.handle_action(Action::ToggleHidden);
         assert!(app.core.pane(PaneSide::Left).show_hidden);
@@ -1632,7 +1734,7 @@ mod tests {
         app.handle_action(Action::StartFilter);
         assert_eq!(app.input_mode(), InputMode::Filter);
         app.handle_action(Action::Text(TextEdit::Insert('b')));
-        assert_eq!(app.core.pane(PaneSide::Left).visible_len(), 2);
+        assert_eq!(app.core.pane(PaneSide::Left).visible.len(), 2);
         app.handle_action(Action::Confirm);
         assert_eq!(app.input_mode(), InputMode::Browse);
         assert_eq!(app.core.pane(PaneSide::Left).filter, "b");
@@ -1676,11 +1778,14 @@ mod tests {
             toggle: false,
             range: true,
         };
-        app.handle_action(click(PaneSide::Left, 1, toggle));
+        app.handle_action(click(PaneSide::Left, 2, toggle));
         assert_eq!(app.core.focused(), PaneSide::Left);
         assert_eq!(cursor_name(&app, PaneSide::Left), "a");
-        app.handle_action(click(PaneSide::Left, 2, range));
+        app.handle_action(click(PaneSide::Left, 3, range));
         assert_eq!(app.core.pane(PaneSide::Left).targets().len(), 2);
+        // Toggling the `..` row selects nothing.
+        app.handle_action(click(PaneSide::Left, 0, toggle));
+        assert_eq!(app.core.pane(PaneSide::Left).selection.len(), 2);
 
         app.handle_action(Action::Click {
             target: ClickTarget::PaneArea(PaneSide::Right),
@@ -1692,12 +1797,165 @@ mod tests {
         let effects = app.handle_action(Action::DoubleClick {
             target: ClickTarget::PaneRow {
                 side: PaneSide::Left,
-                index: 0,
+                index: 1,
             },
             at,
         });
         assert_eq!(app.core.focused(), PaneSide::Left);
         assert_eq!(list_dir(&effects[0]).1, local("/l/sub"));
+
+        // A double click on `..` goes to the parent, reselecting `l`.
+        let effects = app.handle_action(Action::DoubleClick {
+            target: ClickTarget::PaneRow {
+                side: PaneSide::Right,
+                index: 0,
+            },
+            at,
+        });
+        assert_eq!(list_dir(&effects[0]).1, local("/"));
+        assert_eq!(
+            app.core
+                .pane(PaneSide::Right)
+                .pending
+                .as_ref()
+                .expect("listing")
+                .reselect,
+            Some("r".into())
+        );
+    }
+
+    #[test]
+    fn open_on_the_parent_row_goes_up() {
+        let mut app = two_local();
+        app.handle_action(Action::MoveCursor(CursorMove::Home));
+        let effects = app.handle_action(Action::Open);
+        assert_eq!(list_dir(&effects[0]).1, local("/"));
+        // Nothing to copy, delete, or drag on `..`.
+        let mut app = two_local();
+        app.handle_action(Action::MoveCursor(CursorMove::Home));
+        assert!(app.handle_action(Action::Copy).is_empty());
+        assert!(app.handle_action(Action::Delete).is_empty());
+        assert!(app.dialog.stack.is_empty());
+        app.handle_action(Action::DragStart {
+            side: PaneSide::Left,
+            index: 0,
+            at: Instant::now(),
+        });
+        assert!(app.transfer.drag.is_none());
+    }
+
+    #[test]
+    fn sorting_by_menu_header_and_reverse_is_remembered_per_endpoint() {
+        let mut app = two_local();
+        let at = Instant::now();
+        let header = |key| Action::Click {
+            target: ClickTarget::ColumnHeader {
+                side: PaneSide::Right,
+                key,
+            },
+            modifiers: ClickModifiers::default(),
+            at,
+        };
+        // A header click focuses its pane and sorts by the column.
+        let effects = app.handle_action(header(SortKey::Size));
+        assert_eq!(app.core.focused(), PaneSide::Right);
+        let size = Sort::by(SortKey::Size);
+        assert_eq!(app.core.pane(PaneSide::Right).sort, size);
+        assert_eq!(
+            effects,
+            [Effect::RememberSort {
+                endpoint: Endpoint::Local,
+                sort: size
+            }]
+        );
+        assert_eq!(app.persisted.last_sort(&Endpoint::Local), Some(size));
+        // Clicking the active header again reverses it.
+        app.handle_action(header(SortKey::Size));
+        assert_eq!(app.core.pane(PaneSide::Right).sort, size.reversed());
+
+        // The menu's `SortBy` keeps an active key, `ReverseSort` flips it.
+        app.handle_action(Action::SortBy(SortKey::Size));
+        assert_eq!(app.core.pane(PaneSide::Right).sort, size.reversed());
+        app.handle_action(Action::ReverseSort);
+        assert_eq!(app.core.pane(PaneSide::Right).sort, size);
+        let effects = app.handle_action(Action::SortBy(SortKey::Extension));
+        let extension = Sort::by(SortKey::Extension);
+        assert_eq!(app.core.pane(PaneSide::Right).sort, extension);
+        assert_eq!(effects.len(), 1);
+        // The left pane keeps its own sort.
+        assert_eq!(app.core.pane(PaneSide::Left).sort, Sort::default());
+
+        // A pane switched to an endpoint with a remembered sort takes it.
+        let mut state = PersistedState::default();
+        state.remember_sort(web(), Sort::by(SortKey::Modified));
+        let (mut app, _) = build(
+            state,
+            (Endpoint::Local, Some("/l".into())),
+            Some((web(), Some("/srv".into()))),
+        );
+        assert_eq!(
+            app.core.pane(PaneSide::Right).sort,
+            Sort::by(SortKey::Modified)
+        );
+        assert_eq!(app.core.pane(PaneSide::Left).sort, Sort::default());
+        app.switch_endpoint(PaneSide::Left, web(), Some("/tmp".into()));
+        assert_eq!(
+            app.core.pane(PaneSide::Left).sort,
+            Sort::by(SortKey::Modified)
+        );
+    }
+
+    #[test]
+    fn menus_run_the_chosen_action_like_its_key() {
+        let mut app = two_local();
+        app.handle_action(Action::SortMenu);
+        assert_eq!(app.input_mode(), InputMode::Dialog);
+        app.handle_action(Action::DialogHotkey('s'));
+        assert!(app.dialog.menu.is_none());
+        assert_eq!(app.core.pane(PaneSide::Left).sort, Sort::by(SortKey::Size));
+
+        // The context menu of the cursor row runs its items through core.
+        app.handle_action(Action::ContextMenu(None));
+        let effects = app.handle_action(Action::DialogHotkey('B'));
+        assert_eq!(effects, [Effect::SaveBookmark(local("/l"))]);
+        assert_eq!(app.input_mode(), InputMode::Browse);
+    }
+
+    #[test]
+    fn an_alt_click_on_a_pane_row_leaves_the_queue_for_the_context_menu() {
+        let mut app = two_local();
+        app.handle_action(Action::ToggleQueue);
+        app.handle_action(Action::SwitchFocus);
+        app.handle_action(Action::SwitchFocus);
+        assert_eq!(app.input_mode(), InputMode::Queue);
+        app.handle_action(Action::ContextMenu(Some(crate::ui::action::MenuAnchor {
+            side: PaneSide::Left,
+            index: 2,
+            column: 5,
+            row: 5,
+        })));
+        assert!(!app.core.queue_focused());
+        assert_eq!(cursor_name(&app, PaneSide::Left), "a");
+        assert!(app.dialog.menu.is_some());
+    }
+
+    #[test]
+    fn a_click_on_the_title_button_opens_the_host_picker_for_that_pane() {
+        let mut app = two_local();
+        app.handle_action(Action::Click {
+            target: ClickTarget::PaneTitle(PaneSide::Right),
+            modifiers: ClickModifiers::default(),
+            at: Instant::now(),
+        });
+        assert_eq!(app.core.focused(), PaneSide::Right);
+        assert_eq!(app.input_mode(), InputMode::Picker);
+        let picker = app.dialog.picker.as_ref().expect("picker");
+        assert_eq!(
+            picker.kind,
+            PickerKind::Hosts {
+                side: PaneSide::Right
+            }
+        );
     }
 
     #[test]
@@ -1707,12 +1965,12 @@ mod tests {
             (Endpoint::Local, Some("/l".into())),
             Some((Endpoint::Local, Some("/r".into()))),
         );
-        let many: Vec<Entry> = (0..100).map(|i| file(&format!("f{i:03}"))).collect();
-        deliver(&mut app, &effects[1], many);
         app.handle_action(Action::Resize {
             width: 80,
             height: 24,
         });
+        let many: Vec<Entry> = (0..100).map(|i| file(&format!("f{i:03}"))).collect();
+        deliver(&mut app, &effects[1], many);
         app.handle_action(Action::Scroll {
             region: ScrollRegion::Pane(PaneSide::Right),
             lines: 30,
@@ -1726,17 +1984,18 @@ mod tests {
     fn layout_and_page_height_follow_size_and_queue() {
         let mut app = two_local();
         let layout = app.core.layout();
-        assert_eq!(layout.left, Rect::new(0, 0, 40, 23));
-        assert_eq!(layout.right, Rect::new(40, 0, 40, 23));
-        assert_eq!(layout.status_bar, Rect::new(0, 23, 80, 1));
+        assert_eq!(layout.left, Rect::new(0, 0, 40, 22));
+        assert_eq!(layout.right, Rect::new(40, 0, 40, 22));
+        assert_eq!(layout.status_bar, Rect::new(0, 22, 80, 1));
+        assert_eq!(layout.button_bar, Rect::new(0, 23, 80, 1));
         assert_eq!(layout.queue, None);
-        assert_eq!(app.core.page_height(PaneSide::Left), 20);
+        assert_eq!(app.core.page_height(PaneSide::Left), 18);
 
         app.handle_action(Action::ToggleQueue);
         let layout = app.core.layout();
-        assert_eq!(layout.queue, Some(Rect::new(0, 16, 80, 7)));
-        assert_eq!(layout.left.height, 16);
-        assert_eq!(app.core.page_height(PaneSide::Right), 13);
+        assert_eq!(layout.queue, Some(Rect::new(0, 15, 80, 7)));
+        assert_eq!(layout.left.height, 15);
+        assert_eq!(app.core.page_height(PaneSide::Right), 11);
 
         assert!(!layout.queue_collapsed);
         // Wide enough for the quick view to take the other pane only.
@@ -1748,16 +2007,23 @@ mod tests {
             height: 12,
         });
         let layout = app.core.layout();
-        assert_eq!(layout.queue, Some(Rect::new(0, 10, 81, 1)));
+        assert_eq!(layout.queue, Some(Rect::new(0, 9, 81, 1)));
         assert!(layout.queue_collapsed);
-        assert_eq!(layout.right, Rect::new(40, 0, 41, 10));
+        assert_eq!(layout.right, Rect::new(40, 0, 41, 9));
         assert_eq!(layout.tabs, None);
-        assert_eq!(app.core.page_height(PaneSide::Left), 7);
+        assert_eq!(app.core.page_height(PaneSide::Left), 5);
 
         app.handle_action(Action::Resize {
             width: 0,
             height: 0,
         });
+        assert_eq!(app.core.layout().status_bar.height, 0);
+        assert_eq!(app.core.layout().button_bar.height, 0);
+        app.handle_action(Action::Resize {
+            width: 80,
+            height: 1,
+        });
+        assert_eq!(app.core.layout().button_bar, Rect::new(0, 0, 80, 1));
         assert_eq!(app.core.layout().status_bar.height, 0);
     }
 
@@ -1771,7 +2037,7 @@ mod tests {
         // Two panes of 35 columns: too narrow to split off the quick view.
         let layout = app.core.layout();
         assert_eq!(layout.tabs, None);
-        assert_eq!(layout.quick_view, Rect::new(0, 0, 70, 29));
+        assert_eq!(layout.quick_view, Rect::new(0, 0, 70, 28));
 
         app.handle_action(Action::Resize {
             width: 50,
@@ -1779,10 +2045,10 @@ mod tests {
         });
         let layout = app.core.layout();
         assert_eq!(layout.tabs, Some(Rect::new(0, 0, 50, 1)));
-        assert_eq!(layout.left, Rect::new(0, 1, 50, 18));
+        assert_eq!(layout.left, Rect::new(0, 1, 50, 17));
         assert_eq!(layout.right, layout.left);
         assert_eq!(layout.quick_view, layout.left);
-        assert_eq!(app.core.page_height(PaneSide::Right), 15);
+        assert_eq!(app.core.page_height(PaneSide::Right), 13);
         assert!(app.core.pane_drawn(PaneSide::Left));
         assert!(!app.core.pane_drawn(PaneSide::Right));
         // Tab switches the pane shown.
@@ -1876,14 +2142,16 @@ mod tests {
             width: 80,
             height: 50,
         });
+        // The cursor starts on the first entry (row 1) and moves a page
+        // of 44 rows.
         app.handle_action(Action::MoveCursor(CursorMove::PageDown));
-        assert_eq!(app.core.pane(PaneSide::Left).cursor, 46);
+        assert_eq!(app.core.pane(PaneSide::Left).cursor, 45);
         app.handle_action(Action::Resize {
             width: 80,
             height: 10,
         });
         let pane = app.core.pane(PaneSide::Left);
-        assert_eq!(pane.cursor, 46);
+        assert_eq!(pane.cursor, 45);
         assert!(pane.cursor < pane.scroll + app.core.page_height(PaneSide::Left));
     }
 

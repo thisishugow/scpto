@@ -1,9 +1,11 @@
 //! ratatui widgets, one per module.
 
+pub mod button_bar;
 pub mod dialog;
 pub mod drag_label;
 pub mod format;
 pub mod help;
+pub mod menu;
 pub mod pane;
 pub mod picker;
 pub mod preview;

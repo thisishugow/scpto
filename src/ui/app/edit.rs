@@ -3,7 +3,7 @@
 //!
 //! # Behavior
 //!
-//! - `e` / F4 on a regular file (or a symlink to one) of the focused pane
+//! - `e` on a regular file (or a symlink to one) of the focused pane
 //!   emits `Effect::Edit(location)` and adds the location to
 //!   [`EditState::active`]; a second edit of a location already active is a
 //!   status message. Directories and special files are a status message.
@@ -370,8 +370,15 @@ mod tests {
     fn point_at(app: &mut App, name: &str) {
         let side = app.core.focused();
         app.core.pane_mut(side).move_cursor(CursorMove::Home, 10);
-        while app.core.pane(side).cursor_entry().expect("row").name != name {
+        while app
+            .core
+            .pane(side)
+            .cursor_entry()
+            .is_none_or(|entry| entry.name != name)
+        {
+            let before = app.core.pane(side).cursor;
             app.core.pane_mut(side).move_cursor(CursorMove::Down, 10);
+            assert_ne!(app.core.pane(side).cursor, before, "{name} is not listed");
         }
     }
 

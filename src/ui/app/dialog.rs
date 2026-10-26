@@ -1,8 +1,9 @@
 //! Dialogs in the app: the modal stack (confirmations, text fields such as
 //! rename, mkdir, and chmod, delete and trash-failed prompts, and the
-//! prompts other features open), focus and hotkeys, the picker lists (the
-//! bookmark list and the host picker's mechanics), and the file operations
-//! those dialogs start.
+//! prompts other features open), focus and hotkeys, the popup menus (sort
+//! menu and context menu, plan 8.9), the picker lists (the bookmark list
+//! and the host picker's mechanics), and the file operations those dialogs
+//! start.
 //!
 //! # Opening dialogs from other features
 //!
@@ -19,13 +20,13 @@
 //!
 //! # Behavior of the dialogs owned here
 //!
-//! - `MakeDir` (F7): empty field; Ok → `Effect::FsOp` `FsOp::MakeDir` at
-//!   `parent/name`. `Rename` (F2): field prefilled with the cursor entry's
+//! - `MakeDir` (`n`): empty field; Ok → `Effect::FsOp` `FsOp::MakeDir` at
+//!   `parent/name`. `Rename` (`r`): field prefilled with the cursor entry's
 //!   name; Ok → `FsOp::Rename`. `Chmod` (`p`): field prefilled with the
 //!   cursor entry's mode in octal; Ok with a valid octal mode (at most
 //!   `0o7777`) → `FsOp::Chmod` on every target. An empty name, a name with
 //!   `/`, or an invalid mode keeps the dialog open with a message.
-//! - `Delete` (F8): "Delete N items?" with Yes / No; the message says the
+//! - `Delete` (`d`): "Delete N items?" with Yes / No; the message says the
 //!   deletion is permanent on remote endpoints; local endpoints use
 //!   `DeleteMethod::Trash`, remote ones `DeleteMethod::Permanent`.
 //! - `FsOpFinished`: refreshes the panes showing that endpoint
@@ -65,6 +66,25 @@
 //! - Text fields edit with `Action::Text`; a field with
 //!   [`TextField::max_len`] rejects input beyond it, so a masked password
 //!   buffer created with that capacity never reallocates.
+//! - Popup menus ([`DialogState::menu`], `InputMode::Dialog`): `s`
+//!   (`Action::SortMenu`) opens the sort menu of the focused pane under its
+//!   header (Name `n`, Extension `e`, Size `s`, Modified `m`, each checked
+//!   when it is the current key and running `Action::SortBy`, and Reverse
+//!   order `r` running `Action::ReverseSort`). `x` and Option/Alt+click
+//!   (`Action::ContextMenu`) open the context menu of a pane row: the click
+//!   first focuses the pane and moves the cursor to the row, and the menu
+//!   opens at the pointer (for `x`, under the cursor row). It lists the
+//!   actions for that row, each with its key: Open (Enter) for the `..`
+//!   row and enterable entries, else Preview (`v`) and Edit (`e`); then
+//!   Quick view (`i`), Copy (`c`), Move (`m`), Rename (`r`), Delete (`d`),
+//!   Chmod (`p`), Reveal (`R`), and Bookmark dir (`B`) for entries. Nothing
+//!   opens for a pane without rows. In a menu, Tab/arrows move the cursor
+//!   (wrapping), Enter or a click on an item runs it, its hotkey (matched
+//!   exactly, so `r` and `R` differ) runs it, and Esc closes it. Running an
+//!   item closes the menu and leaves [`Answer::Menu`] with the item's
+//!   action, which core handles as if its key had been pressed. A dialog
+//!   pushed by a background event while a menu is open takes the input
+//!   first.
 //! - Bookmark list (`b`): a [`PickerList`] of `PickerKind::Bookmarks`
 //!   with one row per bookmark (label `host:/path` or `/path`); Enter jumps
 //!   with `App::switch_endpoint`; `PickerRemove` removes the row's bookmark
@@ -87,23 +107,27 @@
 //! ```text
 //! impl App {
 //!     /// Claims `MakeDir`, `Rename`, `Chmod`, `Delete`, `ShowBookmarks`,
-//!     /// and every action while a dialog or picker is open
-//!     /// (`InputMode::TextField`, `Dialog`, `Picker`), including `Paste`
-//!     /// (inserted into the field or picker filter) and clicks on
-//!     /// `ClickTarget::DialogButton` / `PickerRow`; hands everything else
-//!     /// back unchanged.
+//!     /// `SortMenu`, `ContextMenu`, and every action while a dialog, menu,
+//!     /// or picker is open (`InputMode::TextField`, `Dialog`, `Picker`),
+//!     /// including `Paste` (inserted into the field or picker filter) and
+//!     /// clicks on `ClickTarget::DialogButton` / `MenuRow` / `PickerRow`;
+//!     /// hands everything else back unchanged.
 //!     pub fn dialog_action(&mut self, action: Action) -> Result<Vec<Effect>, Action>;
 //!     /// `BgEvent::FsOpFinished`.
 //!     pub fn dialog_fs_op_finished(&mut self, request: RequestId, endpoint: Endpoint, op: FsOp, failures: Vec<FsError>) -> Vec<Effect>;
 //!     /// `Some(InputMode::TextField)` when the top dialog's field has
-//!     /// focus, `Some(InputMode::Dialog)` for any other open dialog,
-//!     /// `Some(InputMode::Picker)` while only a picker is open, else `None`.
+//!     /// focus, `Some(InputMode::Dialog)` for any other open dialog and
+//!     /// for an open menu, `Some(InputMode::Picker)` while only a picker is
+//!     /// open, else `None`.
 //!     pub fn dialog_input_mode(&self) -> Option<InputMode>;
 //!
 //!     /// View accessors for render; `buttons` and `rows` are per-frame
 //!     /// scratch buffers owned by render.
 //!     pub fn dialog_view<'a>(&'a self, buttons: &'a mut Vec<ButtonView<'a>>) -> Option<DialogView<'a>>;
 //!     pub fn picker_view<'a>(&'a self, tabs: &'a mut Vec<&'a str>, rows: &'a mut Vec<PickerRow<'a>>) -> Option<PickerView<'a>>;
+//!     /// The open menu's title, cursor, and placement, with its items
+//!     /// written into the per-frame scratch buffer `items`.
+//!     pub fn menu_view<'a>(&'a self, items: &'a mut Vec<MenuItemView<'a>>) -> Option<(MenuView<'a>, MenuPlace)>;
 //! }
 //! ```
 
@@ -117,13 +141,15 @@ use zeroize::{Zeroize, Zeroizing};
 use super::core::StatusMessage;
 use super::App;
 use crate::error::FsError;
+use crate::state::SortKey;
 use crate::sync::SyncDirection;
 use crate::transfer::model::{ItemId, JobId};
 use crate::ui::action::{
     Action, ClickTarget, CursorMove, DeleteMethod, DialogButton, Effect, FocusStep, FsOp,
-    InputMode, PaneSide, RequestId, ScrollRegion, TextEdit,
+    InputMode, MenuAnchor, PaneSide, RequestId, ScrollRegion, TextEdit,
 };
 use crate::ui::widgets::dialog::{ButtonView, CheckboxView, DialogView};
+use crate::ui::widgets::menu::{MenuItemView, MenuView};
 use crate::ui::widgets::picker::{self, PickerRow, PickerView};
 use crate::ui::widgets::text_input::TextInputView;
 use crate::vfs::{Endpoint, Location};
@@ -134,6 +160,8 @@ use crate::vfs::{Endpoint, Location};
 pub struct DialogState {
     /// Open dialogs; the last one is on top and has the input.
     pub stack: Vec<Dialog>,
+    /// The open popup menu, drawn above the picker and below the dialogs.
+    pub menu: Option<Menu>,
     /// The open picker (host picker or bookmark list), drawn below the
     /// dialogs.
     pub picker: Option<PickerList>,
@@ -307,6 +335,52 @@ pub enum DialogPurpose {
     },
 }
 
+/// A popup menu: the sort menu or a pane row's context menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Menu {
+    /// Title in the top border.
+    pub title: String,
+    /// The items in display order.
+    pub items: Vec<MenuItem>,
+    /// Index of the highlighted item.
+    pub cursor: usize,
+    /// Where render opens it.
+    pub place: MenuPlace,
+}
+
+/// One menu item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuItem {
+    /// The key as shown, for example `c` or `Enter`.
+    pub key: &'static str,
+    /// What the item does.
+    pub label: &'static str,
+    /// The hotkey inside the menu (matched exactly); `None` for an item
+    /// reached only with Enter or a click.
+    pub hotkey: Option<char>,
+    /// `Some` shows a check box: the sort menu checks the current key.
+    pub checked: Option<bool>,
+    /// What running the item does: the action of its key.
+    pub action: Action,
+}
+
+/// Where a menu opens; render turns it into screen cells from the last
+/// frame's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuPlace {
+    /// At the pointer (Option/Alt+click).
+    At {
+        /// Column.
+        column: u16,
+        /// Row.
+        row: u16,
+    },
+    /// Under the cursor row of a pane (`x`).
+    BelowCursor(PaneSide),
+    /// Under the column header of a pane (the sort menu).
+    BelowHeader(PaneSide),
+}
+
 /// The answer of a dialog another feature opened.
 pub struct DialogAnswer {
     /// The dialog's purpose.
@@ -330,6 +404,8 @@ pub enum Answer {
         /// The picked row's target.
         target: PickerTarget,
     },
+    /// A menu item was run: core handles its action like the key's.
+    Menu(Action),
 }
 
 /// Which list a picker shows.
@@ -954,6 +1030,10 @@ impl App {
         if !self.dialog.stack.is_empty() {
             return Ok(self.top_dialog_action(action));
         }
+        if self.dialog.menu.is_some() {
+            self.menu_action(action);
+            return Ok(Vec::new());
+        }
         if self.dialog.picker.is_some() {
             return Ok(self.picker_action(action));
         }
@@ -963,6 +1043,8 @@ impl App {
             Action::Chmod => self.open_chmod(),
             Action::Delete => self.open_delete(),
             Action::ShowBookmarks => self.open_bookmarks(),
+            Action::SortMenu => self.open_sort_menu(),
+            Action::ContextMenu(anchor) => self.open_context_menu(anchor),
             other => return Err(other),
         }
         Ok(Vec::new())
@@ -998,8 +1080,32 @@ impl App {
                 Some(InputMode::TextField)
             }
             Some(_) => Some(InputMode::Dialog),
+            None if self.dialog.menu.is_some() => Some(InputMode::Dialog),
             None => self.dialog.picker.as_ref().map(|_| InputMode::Picker),
         }
+    }
+
+    /// The open menu's title, cursor, and placement, with its items written
+    /// into the per-frame scratch buffer `items`.
+    pub fn menu_view<'a>(
+        &'a self,
+        items: &'a mut Vec<MenuItemView<'a>>,
+    ) -> Option<(MenuView<'a>, MenuPlace)> {
+        let menu = self.dialog.menu.as_ref()?;
+        items.clear();
+        items.extend(menu.items.iter().map(|item| MenuItemView {
+            key: item.key,
+            label: item.label,
+            checked: item.checked,
+        }));
+        let view = MenuView {
+            title: &menu.title,
+            items,
+            cursor: menu.cursor,
+            // Render replaces the anchor with the cells `place` names.
+            anchor: (0, 0),
+        };
+        Some((view, menu.place))
     }
 
     /// View of the top dialog for render; `buttons` is a per-frame scratch
@@ -1066,6 +1172,145 @@ impl App {
             cursor,
             first_visible,
         })
+    }
+
+    // Menus.
+
+    fn open_sort_menu(&mut self) {
+        let side = self.core.focused();
+        let current = self.core.pane(side).sort.key;
+        let item = |key: &'static str, label, hotkey, sort_key: SortKey| MenuItem {
+            key,
+            label,
+            hotkey: Some(hotkey),
+            checked: Some(current == sort_key),
+            action: Action::SortBy(sort_key),
+        };
+        let mut items = vec![
+            item("n", "Name", 'n', SortKey::Name),
+            item("e", "Extension", 'e', SortKey::Extension),
+            item("s", "Size", 's', SortKey::Size),
+            item("m", "Modified", 'm', SortKey::Modified),
+        ];
+        let cursor = items
+            .iter()
+            .position(|item| item.checked == Some(true))
+            .unwrap_or(0);
+        items.push(MenuItem {
+            key: "r",
+            label: "Reverse order",
+            hotkey: Some('r'),
+            checked: None,
+            action: Action::ReverseSort,
+        });
+        self.dialog.menu = Some(Menu {
+            title: "Sort by".to_owned(),
+            items,
+            cursor,
+            place: MenuPlace::BelowHeader(side),
+        });
+    }
+
+    fn open_context_menu(&mut self, anchor: Option<MenuAnchor>) {
+        let place = match anchor {
+            Some(MenuAnchor {
+                side,
+                index,
+                column,
+                row,
+            }) => {
+                self.core.focus(side);
+                let page = self.core.page_height(side);
+                self.core.pane_mut(side).set_cursor(index, page);
+                MenuPlace::At { column, row }
+            }
+            None => MenuPlace::BelowCursor(self.core.focused()),
+        };
+        let pane = self.core.pane(self.core.focused());
+        if pane.row_count() == 0 {
+            return;
+        }
+        let item = |key: &'static str, label, hotkey, action| MenuItem {
+            key,
+            label,
+            hotkey,
+            checked: None,
+            action,
+        };
+        let open = item("Enter", "Open", None, Action::Open);
+        let items = match pane.cursor_entry() {
+            None => vec![open],
+            Some(entry) => {
+                let mut items = if entry.is_enterable() {
+                    vec![open]
+                } else {
+                    vec![
+                        item("v", "Preview", Some('v'), Action::Preview),
+                        item("e", "Edit", Some('e'), Action::Edit),
+                    ]
+                };
+                items.extend([
+                    item("i", "Quick view", Some('i'), Action::ToggleQuickView),
+                    item("c", "Copy", Some('c'), Action::Copy),
+                    item("m", "Move", Some('m'), Action::Move),
+                    item("r", "Rename", Some('r'), Action::Rename),
+                    item("d", "Delete", Some('d'), Action::Delete),
+                    item("p", "Chmod", Some('p'), Action::Chmod),
+                    item("R", "Reveal", Some('R'), Action::Reveal),
+                    item("B", "Bookmark dir", Some('B'), Action::AddBookmark),
+                ]);
+                items
+            }
+        };
+        let title = pane.cursor_entry().map_or_else(
+            || "..".to_owned(),
+            |entry| entry.name.to_string_lossy().into_owned(),
+        );
+        self.dialog.menu = Some(Menu {
+            title,
+            items,
+            cursor: 0,
+            place,
+        });
+    }
+
+    /// Every action while a menu is open (and no dialog).
+    fn menu_action(&mut self, action: Action) {
+        let Some(menu) = self.dialog.menu.as_mut() else {
+            return;
+        };
+        let count = menu.items.len();
+        let chosen = match action {
+            Action::DialogFocus(FocusStep::Next) => {
+                menu.cursor = (menu.cursor + 1) % count.max(1);
+                None
+            }
+            Action::DialogFocus(FocusStep::Previous) => {
+                menu.cursor = (menu.cursor + count.max(1) - 1) % count.max(1);
+                None
+            }
+            Action::Confirm => Some(menu.cursor),
+            Action::DialogHotkey(key) => {
+                menu.items.iter().position(|item| item.hotkey == Some(key))
+            }
+            Action::Click {
+                target: ClickTarget::MenuRow(index),
+                ..
+            } => Some(index),
+            Action::Cancel => {
+                self.dialog.menu = None;
+                None
+            }
+            // Everything else means nothing while a menu is open.
+            _ => None,
+        };
+        let Some(index) = chosen.filter(|&index| index < count) else {
+            return;
+        };
+        if let Some(menu) = self.dialog.menu.take() {
+            let action = menu.items[index].action.clone();
+            self.dialog.answer = Some(Answer::Menu(action));
+        }
     }
 
     // Opening this feature's dialogs.
@@ -1443,7 +1688,8 @@ impl App {
     /// Rows the picker popup shows on the current screen (at least 1); the
     /// same arithmetic as `widgets::picker::render`.
     fn picker_page(&self, list: &PickerList) -> usize {
-        let screen_rows = self.core.layout().status_bar.bottom();
+        // The picker is drawn above the button bar.
+        let screen_rows = self.core.layout().button_bar.y;
         let tab_rows = u16::from(!list.tabs.is_empty());
         let rows = screen_rows
             .saturating_sub(PICKER_VERTICAL_MARGIN)
@@ -1754,8 +2000,172 @@ mod tests {
         match app.dialog.answer.take() {
             Some(Answer::Dialog(answer)) => answer,
             Some(Answer::Picked { .. }) => panic!("expected a dialog answer, got a pick"),
+            Some(Answer::Menu(action)) => panic!("expected a dialog answer, got {action:?}"),
             None => panic!("expected a dialog answer"),
         }
+    }
+
+    // Menus.
+
+    fn menu(app: &App) -> &Menu {
+        app.dialog.menu.as_ref().expect("an open menu")
+    }
+
+    fn menu_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+        menu(app)
+            .items
+            .iter()
+            .map(|item| (item.key, item.label))
+            .collect()
+    }
+
+    fn menu_answer(app: &mut App) -> Option<Action> {
+        match app.dialog.answer.take() {
+            Some(Answer::Menu(action)) => Some(action),
+            Some(_) => panic!("expected a menu answer"),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn the_sort_menu_checks_the_current_key_and_runs_hotkeys() {
+        let mut app = two_local();
+        app.core
+            .pane_mut(PaneSide::Left)
+            .set_sort(crate::state::Sort::by(SortKey::Size), 10);
+        act(&mut app, Action::SortMenu);
+        assert_eq!(app.dialog_input_mode(), Some(InputMode::Dialog));
+        let open = menu(&app);
+        assert_eq!(open.place, MenuPlace::BelowHeader(PaneSide::Left));
+        assert_eq!(
+            menu_keys(&app),
+            [
+                ("n", "Name"),
+                ("e", "Extension"),
+                ("s", "Size"),
+                ("m", "Modified"),
+                ("r", "Reverse order")
+            ]
+        );
+        let checks: Vec<_> = menu(&app).items.iter().map(|item| item.checked).collect();
+        assert_eq!(
+            checks,
+            [Some(false), Some(false), Some(true), Some(false), None]
+        );
+        // The cursor starts on the current key and wraps.
+        assert_eq!(menu(&app).cursor, 2);
+        act(&mut app, Action::DialogFocus(FocusStep::Previous));
+        act(&mut app, Action::DialogFocus(FocusStep::Previous));
+        act(&mut app, Action::DialogFocus(FocusStep::Previous));
+        assert_eq!(menu(&app).cursor, 4);
+        act(&mut app, Action::DialogFocus(FocusStep::Next));
+        assert_eq!(menu(&app).cursor, 0);
+        // Keys that are no hotkey, other actions, and clicks past the items
+        // keep it open.
+        for action in [
+            Action::DialogHotkey('x'),
+            Action::Copy,
+            click(ClickTarget::MenuRow(9)),
+        ] {
+            act(&mut app, action);
+            assert!(app.dialog.menu.is_some());
+            assert_eq!(menu_answer(&mut app), None);
+        }
+        act(&mut app, Action::DialogHotkey('e'));
+        assert!(app.dialog.menu.is_none());
+        assert_eq!(
+            menu_answer(&mut app),
+            Some(Action::SortBy(SortKey::Extension))
+        );
+
+        act(&mut app, Action::SortMenu);
+        act(&mut app, click(ClickTarget::MenuRow(4)));
+        assert_eq!(menu_answer(&mut app), Some(Action::ReverseSort));
+        act(&mut app, Action::SortMenu);
+        act(&mut app, Action::Confirm);
+        assert_eq!(menu_answer(&mut app), Some(Action::SortBy(SortKey::Size)));
+        act(&mut app, Action::SortMenu);
+        act(&mut app, Action::Cancel);
+        assert!(app.dialog.menu.is_none());
+        assert_eq!(menu_answer(&mut app), None);
+    }
+
+    #[test]
+    fn the_context_menu_lists_the_actions_of_its_row() {
+        let mut app = two_local();
+        // Option/Alt+click on `a` (row 2) focuses the pane and moves the
+        // cursor there first.
+        app.core.focus(PaneSide::Right);
+        act(
+            &mut app,
+            Action::ContextMenu(Some(MenuAnchor {
+                side: PaneSide::Left,
+                index: 2,
+                column: 12,
+                row: 5,
+            })),
+        );
+        assert_eq!(app.core.focused(), PaneSide::Left);
+        assert_eq!(cursor_name(&app, PaneSide::Left), "a");
+        assert_eq!(menu(&app).title, "a");
+        assert_eq!(menu(&app).place, MenuPlace::At { column: 12, row: 5 });
+        assert_eq!(
+            menu_keys(&app),
+            [
+                ("v", "Preview"),
+                ("e", "Edit"),
+                ("i", "Quick view"),
+                ("c", "Copy"),
+                ("m", "Move"),
+                ("r", "Rename"),
+                ("d", "Delete"),
+                ("p", "Chmod"),
+                ("R", "Reveal"),
+                ("B", "Bookmark dir")
+            ]
+        );
+        // Hotkeys match exactly: `R` reveals, `r` renames.
+        act(&mut app, Action::DialogHotkey('R'));
+        assert_eq!(menu_answer(&mut app), Some(Action::Reveal));
+
+        // A directory opens instead of previewing and is not edited.
+        set_cursor(&mut app, PaneSide::Left, 1);
+        act(&mut app, Action::ContextMenu(None));
+        assert_eq!(menu(&app).place, MenuPlace::BelowCursor(PaneSide::Left));
+        assert_eq!(
+            menu_keys(&app)[..2],
+            [("Enter", "Open"), ("i", "Quick view")]
+        );
+        act(&mut app, Action::DialogHotkey('r'));
+        assert_eq!(menu_answer(&mut app), Some(Action::Rename));
+
+        // The `..` row only opens.
+        set_cursor(&mut app, PaneSide::Left, 0);
+        act(&mut app, Action::ContextMenu(None));
+        assert_eq!(menu(&app).title, "..");
+        assert_eq!(menu_keys(&app), [("Enter", "Open")]);
+        act(&mut app, Action::Confirm);
+        assert_eq!(menu_answer(&mut app), Some(Action::Open));
+    }
+
+    #[test]
+    fn no_context_menu_without_rows_and_dialogs_take_the_input_first() {
+        let mut app = two_local();
+        app.core
+            .pane_mut(PaneSide::Left)
+            .set_endpoint(Endpoint::Local);
+        act(&mut app, Action::ContextMenu(None));
+        assert!(app.dialog.menu.is_none());
+
+        let mut app = two_local();
+        act(&mut app, Action::SortMenu);
+        app.dialog
+            .stack
+            .push(foreign(DialogPurpose::Notice, vec![DialogButton::Ok]));
+        act(&mut app, Action::Confirm);
+        assert!(app.dialog.stack.is_empty());
+        assert!(app.dialog.menu.is_some());
+        assert_eq!(app.dialog_input_mode(), Some(InputMode::Dialog));
     }
 
     // Claiming.
@@ -1917,7 +2327,7 @@ mod tests {
     #[test]
     fn rename_prefills_the_name_and_reselects_the_new_one() {
         let mut app = two_local();
-        set_cursor(&mut app, PaneSide::Left, 1);
+        set_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Rename);
         assert_eq!(top(&app).message, "Rename \"a\" to:");
         assert_eq!(field_value(&app), "a");
@@ -1972,7 +2382,7 @@ mod tests {
     #[test]
     fn a_failed_rename_refreshes_without_reselecting() {
         let mut app = two_local();
-        set_cursor(&mut app, PaneSide::Left, 1);
+        set_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Rename);
         act(&mut app, Action::Text(TextEdit::Clear));
         typing(&mut app, "sub");
@@ -2007,7 +2417,7 @@ mod tests {
     #[test]
     fn chmod_prefills_the_mode_and_validates_octal() {
         let mut app = two_local();
-        set_cursor(&mut app, PaneSide::Left, 1);
+        set_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Chmod);
         assert_eq!(top(&app).title, "Permissions");
         assert_eq!(top(&app).message, "Permissions of \"a\" (octal):");
@@ -2035,7 +2445,7 @@ mod tests {
     fn chmod_applies_to_every_selected_entry() {
         let mut app = two_local();
         app.core.pane_mut(PaneSide::Left).select_all();
-        set_cursor(&mut app, PaneSide::Left, 0);
+        set_cursor(&mut app, PaneSide::Left, 1);
         act(&mut app, Action::Chmod);
         // The cursor entry (`sub`, 755) gives the prefill.
         assert_eq!(field_value(&app), "755");
@@ -2075,7 +2485,7 @@ mod tests {
     #[test]
     fn local_delete_asks_and_trashes() {
         let mut app = two_local();
-        set_cursor(&mut app, PaneSide::Left, 1);
+        set_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Delete);
         assert_eq!(app.dialog_input_mode(), Some(InputMode::Dialog));
         let dialog = top(&app);
@@ -2216,7 +2626,7 @@ mod tests {
     #[test]
     fn cancelling_the_trash_question_deletes_nothing() {
         let mut app = two_local();
-        set_cursor(&mut app, PaneSide::Left, 1);
+        set_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Delete);
         let (request, endpoint, op) = fs_op(&act(&mut app, Action::Confirm));
         let failure = FsError::TrashFailed {
@@ -2659,7 +3069,6 @@ mod tests {
 
     fn bookmarked() -> App {
         let state = PersistedState {
-            last_directories: Vec::new(),
             bookmarks: vec![
                 local("/tmp"),
                 Location {
@@ -2674,6 +3083,7 @@ mod tests {
                     path: "/etc".into(),
                 },
             ],
+            ..PersistedState::default()
         };
         app_with(
             state,
@@ -2985,8 +3395,8 @@ mod tests {
                 .collect(),
             &[],
         );
-        // 24 rows: 4 margin, 3 chrome, no tabs.
-        let page = 17;
+        // 24 rows: the button bar, 4 margin, 3 chrome, no tabs.
+        let page = 16;
         let state = |app: &App| {
             let list = app.dialog.picker.as_ref().expect("picker");
             (list.cursor, list.first_visible)
@@ -3057,7 +3467,8 @@ mod tests {
                 let page = app.picker_page(list);
                 let (mut tab_names, mut rows) = (Vec::new(), Vec::new());
                 let view = app.picker_view(&mut tab_names, &mut rows).expect("picker");
-                let screen = Rect::new(0, 0, width, height);
+                // Render draws the picker above the button bar.
+                let screen = Rect::new(0, 0, width, height - 1);
                 let mut buf = Buffer::empty(screen);
                 let hit = picker::render(&view, screen, &mut buf);
                 assert_eq!(hit.row_count, page, "{width}x{height} tabs {tabs:?}");

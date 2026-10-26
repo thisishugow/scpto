@@ -926,7 +926,7 @@ impl App {
                 .map(|location| (JobKind::Copy, location)),
             DropTarget::Folder { side, index } => {
                 let pane = self.core.pane(side);
-                if !pane.visible_entry(index)?.is_enterable() {
+                if !pane.row_entry(index)?.is_enterable() {
                     return None;
                 }
                 let path = pane.path_of(index)?;
@@ -1479,9 +1479,9 @@ mod tests {
         }
     }
 
-    /// Directory contents of the fixture tree. Visible order puts
-    /// directories first: `/l` is `sub`, `a.txt`, `b.txt`; `/srv` is `www`,
-    /// `x`.
+    /// Directory contents of the fixture tree. Rows start with `..`, then
+    /// directories first: `/l` is `..`, `sub`, `a.txt`, `b.txt`; `/srv` is
+    /// `..`, `www`, `x`.
     fn entries(path: &Path) -> Vec<Entry> {
         match path.to_str() {
             Some("/l") => vec![file("a.txt", 10), dir("sub"), file("b.txt", 20)],
@@ -1604,7 +1604,7 @@ mod tests {
 
     /// Copies `a.txt` (job 1) and lets the engine create it with `items`.
     fn copied(app: &mut App, mode: TransferMode, items: Vec<Item>) {
-        select_cursor(app, PaneSide::Left, 1);
+        select_cursor(app, PaneSide::Left, 2);
         act(app, Action::Copy);
         app.transfer_event(TransferEvent::JobCreated {
             job: JobId(1),
@@ -1652,7 +1652,7 @@ mod tests {
     #[test]
     fn copy_submits_the_cursor_entry_into_the_other_pane_directory() {
         let mut app = app();
-        select_cursor(&mut app, PaneSide::Left, 1);
+        select_cursor(&mut app, PaneSide::Left, 2);
         let effects = act(&mut app, Action::Copy);
         assert_eq!(
             *submitted(&effects),
@@ -1686,8 +1686,8 @@ mod tests {
     #[test]
     fn move_uses_the_selection_and_job_ids_are_fresh() {
         let mut app = app();
-        app.core.pane_mut(PaneSide::Left).toggle(1);
         app.core.pane_mut(PaneSide::Left).toggle(2);
+        app.core.pane_mut(PaneSide::Left).toggle(3);
         let first = act(&mut app, Action::Move);
         let request = submitted(&first);
         assert_eq!(request.kind, JobKind::Move);
@@ -1708,7 +1708,7 @@ mod tests {
     fn copy_from_the_right_pane_goes_to_the_left_directory() {
         let mut app = app();
         app.handle_action(Action::SwitchFocus);
-        select_cursor(&mut app, PaneSide::Right, 1);
+        select_cursor(&mut app, PaneSide::Right, 2);
         let effects = act(&mut app, Action::Copy);
         let request = submitted(&effects);
         assert_eq!(
@@ -1727,7 +1727,7 @@ mod tests {
     #[test]
     fn copy_into_the_same_directory_is_refused() {
         let mut app = build((Endpoint::Local, "/l"), (Endpoint::Local, "/l"));
-        select_cursor(&mut app, PaneSide::Left, 1);
+        select_cursor(&mut app, PaneSide::Left, 2);
         assert!(act(&mut app, Action::Copy).is_empty());
         assert_eq!(
             status(&app),
@@ -1739,7 +1739,7 @@ mod tests {
     #[test]
     fn copy_of_a_directory_into_itself_is_refused() {
         let mut app = build((Endpoint::Local, "/l"), (Endpoint::Local, "/l/sub/deep"));
-        select_cursor(&mut app, PaneSide::Left, 0);
+        select_cursor(&mut app, PaneSide::Left, 1);
         assert!(act(&mut app, Action::Move).is_empty());
         assert_eq!(
             status(&app),
@@ -1751,7 +1751,7 @@ mod tests {
     #[test]
     fn copy_between_endpoints_with_equal_paths_is_allowed() {
         let mut app = build((Endpoint::Local, "/srv"), (web(), "/srv"));
-        select_cursor(&mut app, PaneSide::Left, 1);
+        select_cursor(&mut app, PaneSide::Left, 2);
         let effects = act(&mut app, Action::Copy);
         assert_eq!(submitted(&effects).destination, web());
     }
@@ -1808,7 +1808,7 @@ mod tests {
             width: 50,
             height: 20,
         });
-        drag_start(&mut app, PaneSide::Left, 1);
+        drag_start(&mut app, PaneSide::Left, 2);
         let moved = |target| Action::DragMove {
             target,
             column: 30,
@@ -1833,7 +1833,7 @@ mod tests {
             &mut app,
             moved(DropTarget::Folder {
                 side: PaneSide::Right,
-                index: 0
+                index: 1
             })
         )
         .is_empty());
@@ -1841,7 +1841,7 @@ mod tests {
             &mut app,
             DropTarget::Folder {
                 side: PaneSide::Right,
-                index: 0,
+                index: 1,
             },
         );
         let request = submitted(&effects);
@@ -1862,7 +1862,7 @@ mod tests {
             width: 50,
             height: 20,
         });
-        drag_start(&mut app, PaneSide::Left, 1);
+        drag_start(&mut app, PaneSide::Left, 2);
         let at = |target| Action::DragMove {
             target,
             column: 30,
@@ -1889,7 +1889,7 @@ mod tests {
     #[test]
     fn two_panes_side_by_side_need_no_tab_hover() {
         let mut app = app();
-        drag_start(&mut app, PaneSide::Left, 1);
+        drag_start(&mut app, PaneSide::Left, 2);
         drag_move(&mut app, DropTarget::Pane(PaneSide::Right));
         assert_eq!(app.transfer.drag.as_ref().and_then(|d| d.hover), None);
     }
@@ -1897,7 +1897,7 @@ mod tests {
     #[test]
     fn drop_on_the_other_pane_copies_into_its_directory() {
         let mut app = app();
-        drag_start(&mut app, PaneSide::Left, 1);
+        drag_start(&mut app, PaneSide::Left, 2);
         assert_eq!(
             app.drag_label_view(),
             Some(DragLabelView {
@@ -1938,10 +1938,10 @@ mod tests {
     #[test]
     fn drop_on_a_folder_of_the_other_pane_copies_into_it() {
         let mut app = app();
-        drag_start(&mut app, PaneSide::Left, 2);
+        drag_start(&mut app, PaneSide::Left, 3);
         let folder = DropTarget::Folder {
             side: PaneSide::Right,
-            index: 0,
+            index: 1,
         };
         drag_move(&mut app, folder);
         assert_eq!(app.drop_target(PaneSide::Right), Some(folder));
@@ -1964,12 +1964,12 @@ mod tests {
     #[test]
     fn drop_on_a_folder_of_the_source_pane_moves_the_selection() {
         let mut app = app();
-        app.core.pane_mut(PaneSide::Left).toggle(1);
         app.core.pane_mut(PaneSide::Left).toggle(2);
-        drag_start(&mut app, PaneSide::Left, 2);
+        app.core.pane_mut(PaneSide::Left).toggle(3);
+        drag_start(&mut app, PaneSide::Left, 3);
         let folder = DropTarget::Folder {
             side: PaneSide::Left,
-            index: 0,
+            index: 1,
         };
         drag_move(&mut app, folder);
         assert_eq!(app.drop_target(PaneSide::Left), Some(folder));
@@ -1998,17 +1998,17 @@ mod tests {
             // A file row is not a folder.
             DropTarget::Folder {
                 side: PaneSide::Right,
-                index: 1,
+                index: 2,
             },
             // A row index past the list.
             DropTarget::Folder {
                 side: PaneSide::Right,
-                index: 9,
+                index: 10,
             },
         ];
         for target in targets {
             let mut app = app();
-            drag_start(&mut app, PaneSide::Left, 1);
+            drag_start(&mut app, PaneSide::Left, 2);
             drag_move(&mut app, target);
             assert_eq!(app.drop_target(PaneSide::Left), None, "{target:?}");
             assert_eq!(app.drop_target(PaneSide::Right), None, "{target:?}");
@@ -2021,10 +2021,10 @@ mod tests {
     #[test]
     fn a_folder_dropped_on_itself_does_nothing() {
         let mut app = app();
-        drag_start(&mut app, PaneSide::Left, 0);
+        drag_start(&mut app, PaneSide::Left, 1);
         let itself = DropTarget::Folder {
             side: PaneSide::Left,
-            index: 0,
+            index: 1,
         };
         drag_move(&mut app, itself);
         assert_eq!(app.drop_target(PaneSide::Left), None);
@@ -2035,7 +2035,7 @@ mod tests {
     #[test]
     fn drag_cancel_and_stray_drops_have_no_effect() {
         let mut app = app();
-        drag_start(&mut app, PaneSide::Left, 1);
+        drag_start(&mut app, PaneSide::Left, 2);
         assert!(act(&mut app, Action::DragCancel).is_empty());
         assert_eq!(app.transfer.drag, None);
         assert!(drop_on(&mut app, DropTarget::Pane(PaneSide::Right)).is_empty());
@@ -2043,7 +2043,7 @@ mod tests {
         drag_move(&mut app, DropTarget::Pane(PaneSide::Right));
         assert_eq!(app.transfer.drag, None);
         // A press past the list starts no drag.
-        drag_start(&mut app, PaneSide::Left, 7);
+        drag_start(&mut app, PaneSide::Left, 8);
         assert_eq!(app.transfer.drag, None);
         assert!(app.transfer.jobs.is_empty());
     }
@@ -2324,7 +2324,7 @@ mod tests {
     #[test]
     fn finished_move_refreshes_source_and_destination() {
         let mut app = app();
-        select_cursor(&mut app, PaneSide::Left, 1);
+        select_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Move);
         let effects = app.transfer_event(TransferEvent::JobFinished {
             job: JobId(1),
@@ -2351,7 +2351,7 @@ mod tests {
     #[test]
     fn job_failed_records_the_error() {
         let mut app = app();
-        select_cursor(&mut app, PaneSide::Left, 1);
+        select_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Copy);
         let effects = app.transfer_event(TransferEvent::JobFailed {
             job: JobId(1),
@@ -2752,7 +2752,7 @@ mod tests {
     #[test]
     fn a_job_being_expanded_can_be_paused() {
         let mut app = app();
-        select_cursor(&mut app, PaneSide::Left, 1);
+        select_cursor(&mut app, PaneSide::Left, 2);
         act(&mut app, Action::Copy);
         let job = QueueTarget::Job(JobId(1));
         assert_eq!(
