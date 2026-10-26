@@ -22,6 +22,12 @@ pub mod preview;
 pub mod sync;
 pub mod transfer;
 
+use crate::groups::Groups;
+use crate::hosts::HostList;
+use crate::preview::Background;
+use crate::settings::Settings;
+use crate::state::PersistedState;
+
 /// The whole application state. It deliberately derives nothing, so feature
 /// state structs are free to hold non-`Debug` values such as image protocols.
 pub struct App {
@@ -39,4 +45,17 @@ pub struct App {
     pub edit: edit::EditState,
     /// Previews and quick view.
     pub preview: preview::PreviewState,
+    /// Effective settings.
+    pub settings: Settings,
+    /// Host aliases from the ssh configuration.
+    pub hosts: HostList,
+    /// sshto groups for the host picker.
+    pub groups: Groups,
+    /// In-memory mirror of `state.json`: kept in step with every
+    /// `RememberDirectory`, `SaveBookmark`, and `RemoveBookmark` the app
+    /// emits, so later decisions (start directories, bookmark list) see the
+    /// same data the effect executor saves.
+    pub persisted: PersistedState,
+    /// The terminal background, for the preview theme.
+    pub background: Background,
 }
