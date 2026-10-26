@@ -36,6 +36,9 @@
 //!   nor rsync, and one start means one password prompt. The password is
 //!   never retained: when a reconnect of a sudo endpoint needs a password
 //!   again, the session sends `BgEvent::SudoPasswordRequired` again.
+//!   Password replies start stage 2 only after `PasswordRequired` or
+//!   `WrongPassword` (whose `ConnectFailed` event asks again in the UI).
+//!   Replies in every other state are dropped and zeroized.
 //! - Teardown (`shutdown`): `ssh -O exit <host>` for every master this
 //!   process started, then wait up to 3 s for the sockets to disappear
 //!   before removing the `<pid>` directory. `disconnect` closes a host's
@@ -109,7 +112,8 @@
 //!     /// answers `Connected` again.
 //!     pub fn connect(&self, endpoint: Endpoint);
 //!     /// Continues a sudo start with the typed password (`sudo::start`
-//!     /// stage 2); the password is dropped (zeroized) afterwards.
+//!     /// stage 2) only after `PasswordRequired` or `WrongPassword`.
+//!     /// The password is dropped (zeroized) afterwards or when ignored.
 //!     pub fn sudo_password(&self, endpoint: Endpoint, password: Secret);
 //!     /// Retries now, resetting the backoff.
 //!     pub fn reconnect(&self, endpoint: Endpoint);
@@ -537,8 +541,8 @@ impl Sessions {
     }
 
     /// Continues a sudo start with the typed password (`sudo::start`
-    /// stage 2); the password is dropped (zeroized) afterwards. Ignored
-    /// while the endpoint is already connecting.
+    /// stage 2) only after `PasswordRequired` or `WrongPassword`.
+    /// The password is dropped (zeroized) afterwards or when ignored.
     pub fn sudo_password(&self, endpoint: Endpoint, password: Secret) {
         self.start(endpoint, StartReason::Password(password));
     }
@@ -626,7 +630,21 @@ impl Sessions {
             }),
             task: None,
         });
-        if slot.task.as_ref().is_some_and(|task| !task.is_finished()) {
+        if matches!(reason, StartReason::Password(_))
+            && !matches!(
+                &*slot.state.status.borrow(),
+                Status::Down(Error::Sudo(
+                    SudoError::PasswordRequired | SudoError::WrongPassword
+                ))
+            )
+        {
+            return;
+        }
+        // A terminal task publishes Down before its event and finishes afterward.
+        // Accept the reply immediately; that task cannot write the state again.
+        if slot.task.as_ref().is_some_and(|task| !task.is_finished())
+            && !matches!(&*slot.state.status.borrow(), Status::Down(_))
+        {
             match reason {
                 StartReason::Connect => {
                     if let Status::Ready(channels) = &*slot.state.status.borrow() {
@@ -2042,6 +2060,210 @@ mod tests {
             program: PathBuf::from("ssh"),
             config_file: Some(file),
         }
+    }
+
+    #[tokio::test]
+    async fn sudo_password_is_dropped_unless_the_endpoint_asked_for_it() {
+        let local = TestBackends::new().local();
+        let statuses = [
+            Status::Down(Error::Connect(ConnectError::AuthFailed {
+                detail: "fixture authentication failed".into(),
+            })),
+            Status::Down(Error::Connect(ConnectError::ConnectionLost)),
+            Status::Down(Error::Sudo(SudoError::NotInSudoers)),
+            Status::Down(Error::Sudo(SudoError::Timeout)),
+            Status::Pending,
+            Status::Ready(Channels {
+                browse: Arc::clone(&local),
+                transfer: local,
+                home: PathBuf::from("/"),
+                tools: Arc::default(),
+            }),
+        ];
+        for status in statuses {
+            // A missing, finished, or still-running task must not authorize
+            // a password reply when the status did not ask for one.
+            for task_state in [None, Some(false), Some(true)] {
+                let mut harness = Harness::new(SshClient {
+                    program: PathBuf::from("true"),
+                    config_file: None,
+                });
+                let endpoint = Endpoint::Remote {
+                    host: "unsolicited-password".into(),
+                    sudo: true,
+                };
+                let task = match task_state {
+                    None => None,
+                    Some(false) => Some(tokio::spawn(std::future::pending())),
+                    Some(true) => {
+                        let mut task = tokio::spawn(async {});
+                        (&mut task).await.unwrap();
+                        Some(task)
+                    }
+                };
+                let task_id = task.as_ref().map(JoinHandle::id);
+                lock(&harness.sessions.shared.endpoints).insert(
+                    endpoint.clone(),
+                    Slot {
+                        state: Arc::new(SlotState {
+                            status: watch::Sender::new(status.clone()),
+                            retry_now: Notify::new(),
+                            lost: AtomicBool::new(false),
+                        }),
+                        task,
+                    },
+                );
+                harness.sessions.sudo_password(
+                    endpoint.clone(),
+                    Secret::new(zeroize::Zeroizing::new("unsolicited".into())),
+                );
+                {
+                    let slots = lock(&harness.sessions.shared.endpoints);
+                    let slot = &slots[&endpoint];
+                    assert_eq!(slot.task.as_ref().map(JoinHandle::id), task_id);
+                    let current = slot.state.status.borrow();
+                    assert_eq!(
+                        std::mem::discriminant(&*current),
+                        std::mem::discriminant(&status)
+                    );
+                    if let (Status::Down(actual), Status::Down(expected)) = (&*current, &status) {
+                        assert_eq!(actual, expected);
+                    }
+                }
+                assert!(lock(&harness.sessions.shared.masters).is_empty());
+                assert!(matches!(
+                    harness.events.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                harness.sessions.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sudo_password_replies_continue_after_required_and_wrong_password() {
+        let mut harness = Harness::new(SshClient {
+            program: PathBuf::from("true"),
+            config_file: None,
+        });
+        let endpoint = Endpoint::Remote {
+            host: "password-retry".into(),
+            sudo: true,
+        };
+        harness.sessions.connect(endpoint.clone());
+        assert!(matches!(
+            harness.next().await,
+            BgEvent::SudoPasswordRequired(got) if got == endpoint
+        ));
+        for _ in 0..2 {
+            harness.sessions.sudo_password(
+                endpoint.clone(),
+                Secret::new(zeroize::Zeroizing::new("wrong".into())),
+            );
+            assert!(matches!(
+                harness.next().await,
+                BgEvent::ConnectFailed {
+                    endpoint: got,
+                    error: Error::Sudo(SudoError::WrongPassword),
+                } if got == endpoint
+            ));
+        }
+        harness.sessions.shutdown().await;
+    }
+
+    async fn reply_before_terminal_task_finishes(reason: StartReason) {
+        // The existing backend exercises sudo's password exchange. `true`
+        // makes the master check succeed without contacting an SSH host.
+        let mut harness = Harness::new(SshClient {
+            program: PathBuf::from("true"),
+            config_file: None,
+        });
+        let endpoint = Endpoint::Remote {
+            host: "terminal-reply".into(),
+            sudo: true,
+        };
+        let state = Arc::new(SlotState {
+            status: watch::Sender::new(Status::Pending),
+            retry_now: Notify::new(),
+            lost: AtomicBool::new(false),
+        });
+        let expects_password_failure = matches!(reason, StartReason::Password(_));
+        let initial_password = if expects_password_failure {
+            None
+        } else {
+            Some(Secret::new(zeroize::Zeroizing::new("wrong".into())))
+        };
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let task = {
+            let shared = Arc::clone(&harness.sessions.shared);
+            let endpoint = endpoint.clone();
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                shared.run_endpoint(endpoint, state, initial_password).await;
+                // Hold open the real terminal-event/JoinHandle completion
+                // window without depending on executor scheduling.
+                finishing.await.unwrap();
+            })
+        };
+        lock(&harness.sessions.shared.endpoints).insert(
+            endpoint.clone(),
+            Slot {
+                state,
+                task: Some(task),
+            },
+        );
+        match harness.next().await {
+            BgEvent::SudoPasswordRequired(got) if expects_password_failure => {
+                assert_eq!(got, endpoint);
+            }
+            BgEvent::ConnectFailed {
+                endpoint: got,
+                error: Error::Sudo(SudoError::WrongPassword),
+            } if !expects_password_failure => assert_eq!(got, endpoint),
+            other => panic!("unexpected first event {other:?}"),
+        }
+        assert!(!lock(&harness.sessions.shared.endpoints)[&endpoint]
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished());
+        match reason {
+            StartReason::Connect => harness.sessions.connect(endpoint.clone()),
+            StartReason::Reconnect => harness.sessions.reconnect(endpoint.clone()),
+            StartReason::Password(password) => {
+                harness.sessions.sudo_password(endpoint.clone(), password);
+            }
+        }
+        match harness.next().await {
+            BgEvent::ConnectFailed {
+                endpoint: got,
+                error: Error::Sudo(SudoError::WrongPassword),
+            } if expects_password_failure => assert_eq!(got, endpoint),
+            BgEvent::SudoPasswordRequired(got) if !expects_password_failure => {
+                assert_eq!(got, endpoint);
+            }
+            other => panic!("unexpected reply event {other:?}"),
+        }
+        finish.send(()).unwrap();
+        harness.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sudo_password_reply_precedes_terminal_task_completion() {
+        reply_before_terminal_task_finishes(StartReason::Password(Secret::new(
+            zeroize::Zeroizing::new("wrong".into()),
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn connect_reply_precedes_terminal_task_completion() {
+        reply_before_terminal_task_finishes(StartReason::Connect).await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_reply_precedes_terminal_task_completion() {
+        reply_before_terminal_task_finishes(StartReason::Reconnect).await;
     }
 
     #[tokio::test]
