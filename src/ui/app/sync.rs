@@ -46,8 +46,9 @@
 //!   sync backend recurses on its own. `SelectAll` selects and
 //!   `InvertSelection` inverts every visible entry.
 //! - `StartSync` without a selection sets a status message. The dialog's
-//!   N counts the selected entries that exist on the source side; M is
-//!   `sync::extraneous(..).len()`, the paths the executor would delete.
+//!   N counts the selected entries that exist on the source side and M the
+//!   selected entries that exist only on the destination (every row that
+//!   would be deleted, even beneath a selected directory).
 //! - The view is drawn over every row above the status bar; its list rows
 //!   are that height minus three (the two borders and the header row of
 //!   `widgets::sync_view`); paging and scrolling use this. [`App::sync_view`] pulls `first_visible` onto the cursor's page
@@ -256,15 +257,19 @@ impl SyncView {
     /// The confirmation dialog for syncing the selection in `direction`;
     /// `None` when nothing is selected.
     fn confirm_dialog(&self, direction: SyncDirection) -> Option<Dialog> {
-        let paths = self.selected_paths();
-        if paths.is_empty() {
+        let selected = self.selected_entries().count();
+        if selected == 0 {
             return None;
         }
         let copied = self
             .selected_entries()
             .filter(|entry| source_side(entry, direction).is_some())
             .count();
-        let extraneous = crate::sync::extraneous(direction, &self.comparison, &paths).len();
+        // Every compared entry exists on at least one side, so the rest
+        // exist only on the destination: exactly the selected paths
+        // `sync::extraneous` covers, counted row by row as the view shows
+        // them rather than collapsed to their outermost directories.
+        let extraneous = selected - copied;
         let (source, destination) = directories(&self.comparison, direction);
         let message = format!(
             "Copy {} {}?\nFrom: {}\nTo: {}",
@@ -1079,13 +1084,38 @@ mod tests {
             ],
         );
         act(&mut app, Action::SelectAll);
-        // Right to left, `old` and its files exist only on the destination;
-        // the executor deletes the directory as one entry.
+        // Right to left, `old` and its two files exist only on the
+        // destination: every one of those rows counts.
         act(&mut app, Action::StartSync(SyncDirection::RightToLeft));
-        let dialog = app.dialog.stack.last().unwrap();
+        let dialog = app.dialog.stack.pop().unwrap();
         assert_eq!(
             dialog.message,
             "Copy 1 entry right -> left?\nFrom: Local:/r\nTo: Local:/l"
+        );
+        assert_eq!(
+            dialog.checkbox,
+            Some(Checkbox {
+                label: "Delete 3 entries that exist only on the destination".to_owned(),
+                checked: false,
+            })
+        );
+
+        // Only `old/x` selected.
+        act(&mut app, Action::InvertSelection);
+        act(
+            &mut app,
+            Action::Click {
+                target: ClickTarget::SyncRow(2),
+                modifiers: ClickModifiers::default(),
+                at: Instant::now(),
+            },
+        );
+        act(&mut app, Action::ToggleSelect);
+        act(&mut app, Action::StartSync(SyncDirection::RightToLeft));
+        let dialog = app.dialog.stack.pop().unwrap();
+        assert_eq!(
+            dialog.message,
+            "Copy 0 entries right -> left?\nFrom: Local:/r\nTo: Local:/l"
         );
         assert_eq!(
             dialog.checkbox,
