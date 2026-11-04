@@ -92,7 +92,7 @@ export function createLauncher(host) {
     // Wait for that specific terminal before issuing a command against it.
     await waitFor(
       () => host.terminals().some((item) => item.address === terminal.address && item.state === "live"),
-      "Herdr has not discovered the scpto terminal yet. Try Open scpto again.",
+      "Herdr has not discovered the scpto terminal yet. Try again.",
     );
     if (host.panes().some((pane) => pane.terminal === terminal.address)) {
       host.run("pane.focus", { terminal: terminal.address });
@@ -102,7 +102,7 @@ export function createLauncher(host) {
     }
     await waitFor(
       () => host.panes().some((pane) => pane.terminal === terminal.address),
-      "Herdr has not attached the scpto tab yet. Try Open scpto again.",
+      "Herdr has not attached the scpto tab yet. Try again.",
     );
     return { address: terminal.address, reused };
   }

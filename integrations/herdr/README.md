@@ -39,42 +39,49 @@ or GitHub plugin installation is required.
 
 ## Desktop mod
 
-Check the generated mod. With Herdr running, clone its shipped `main` layout
-into a personal layout, then copy the mod into the app's mods directory. Shipped
-layouts do not automatically dock newly discovered mods. Choose a different
-`as` name if a layout named `scpto` already exists; do not overwrite it. The copy
-command below also refuses to replace an existing `scpto` mod; use the update
-instructions for an existing installation.
+Check the generated mod and copy it into the app's mods directory. No layout
+clone or persistent toolbar is needed. The copy command refuses to replace an
+existing `scpto` mod; use the update instructions for an existing installation.
 
 ```sh
 herdr-app check target/herdr/desktop/scpto
-herdr-app do layout.clone '{"name":"main","as":"scpto"}'
 app_home="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
 mkdir -p "$app_home/mods"
 test ! -e "$app_home/mods/scpto" && cp -R target/herdr/desktop/scpto "$app_home/mods/scpto"
 ```
 
-Herdr selects the cloned layout and discovers the new mod, adding an
-**Open scpto** control at the top. Select a local space and click the control. The first launch
-uses that space's focused terminal directory, otherwise the space's folder or
-your home directory. A remote space is rejected; select remote SFTP hosts inside
-scpto instead.
+Choose an unused shortcut and merge it into the `global` object in
+`$app_home/keys.json`. Check all existing sections for conflicts and preserve
+other bindings. For example, on macOS:
+
+```json
+"cmd-shift-f": "mod.open:scpto"
+```
+
+On Linux, use an unused binding such as `ctrl-shift-f` with the same action.
+Select a local space and press the shortcut to open or focus scpto directly.
+You can also activate it from the CLI:
+
+```sh
+herdr-app do mod.open '{"name":"scpto"}'
+```
+
+A brief progress popup closes automatically when the terminal is ready; there
+is no second launch button. Errors stay in that popup with a **Retry** button.
+Escape or clicking outside dismisses it. Activating the shortcut while the
+popup is open dismisses it too. Herdr 0.1.12 does not automatically list this
+mod in its command palette.
+
+The first launch uses the selected space's focused terminal directory,
+otherwise the space's folder or your home directory. A remote space is
+rejected; select remote SFTP hosts inside scpto instead. This is a terminal
+integration: the existing scpto interface runs in a full terminal tab.
 
 Repeated activation focuses the live integration-owned session without changing
 its directories. One desktop session is shared across local spaces. After scpto
 exits, the next activation starts a new session. The reserved core terminal name
 is `scpto-files`; an unrelated terminal using that name produces an error rather
-than being adopted. Launch errors appear as Herdr notifications.
-
-The mod also accepts `scpto.open`. To assign a key, merge an unused binding into
-the `global` object in `keys.json`, for example:
-
-```json
-"ctrl-shift-f": "scpto.open"
-```
-
-Keep the mod visible: Herdr delivers mod commands to shown copies. Do not replace
-other key settings when adding the binding.
+than being adopted.
 
 ## Terminal plugin
 
@@ -114,8 +121,9 @@ and installed tools are the ones scpto uses.
 ## Updating and removing
 
 Prepare an updated package into a new directory, for example
-`python3 tools/herdr.py target/herdr-next`. Quit scpto normally before replacing
-or unlinking its adapter.
+`python3 tools/herdr.py target/herdr-next`. Close any scpto launch popup before
+updating the desktop mod; its terminal session can keep running. Quit scpto
+normally before replacing or unlinking the terminal plugin.
 
 For the desktop mod, replace its runtime files and license from the new package:
 
@@ -124,9 +132,16 @@ app_home="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
 cp target/herdr-next/desktop/scpto/main.js target/herdr-next/desktop/scpto/session.js target/herdr-next/desktop/scpto/mod.json target/herdr-next/desktop/scpto/LICENSE "$app_home/mods/scpto/"
 ```
 
-Herdr hot-reloads the mod. Remove it by deleting that `mods/scpto` directory and
-removing any `scpto.open` keybinding you added. Do not remove other mods or reset
-the app layout.
+Herdr hot-reloads the mod. If upgrading from the toolbar version, replace its
+`scpto.open` keybinding with `mod.open:scpto`. Remove only the block whose
+`content.mod` is `scpto` from your custom layout, preserving its other blocks.
+Alternatively, switch back to the shipped layout with
+`herdr-app do layout.switch '{"name":"main"}'`; your terminal sessions remain.
+Changing the manifest alone does not remove a block already in a saved layout.
+
+Remove the mod by deleting its `mods/scpto` directory and removing any
+`mod.open:scpto` keybinding you added. Do not remove other mods or reset the app
+layout.
 
 For the terminal plugin, unlink the previous package and link the new one:
 

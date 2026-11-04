@@ -1,11 +1,8 @@
 {
-  "place": "top",
-  "size": 48,
+  "place": "none",
   "overlay": {
     "kind": "popup",
-    "width": 560,
-    "height": 64,
-    "at": "top",
-    "offset": 60
+    "width": 480,
+    "height": 176
   }
 }

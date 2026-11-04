@@ -53,7 +53,7 @@ cargo install --locked --path .
 
 ## Herdr 整合
 
-在 Herdr 中使用 scpto，保留原本的終端機介面。桌面 mod 提供 **Open scpto** 按鈕；終端 plugin 提供依工作區啟動的操作。兩者都會開啟完整終端機分頁，並重用各自仍在執行的 session。首次啟動使用目前的本機目錄；再次開啟會保留 session 中的目錄與傳輸工作。
+在 Herdr 中使用 scpto，保留原本的終端機介面。桌面 mod 透過可設定的快捷鍵直接開啟，不佔用常駐工具列；終端 plugin 提供依工作區啟動的操作。兩者都會開啟完整終端機分頁，並重用各自仍在執行的 session。首次啟動使用目前的本機目錄；再次開啟會保留 session 中的目錄與傳輸工作。
 
 先安裝 scpto，再於 repository checkout 中使用 Python 3.11+ 準備整合套件：
 
