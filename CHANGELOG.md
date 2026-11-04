@@ -2,6 +2,17 @@
 
 All notable changes are recorded here. This file follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Herdr desktop mod and terminal plugin adapters that launch the existing scpto TUI, use the current local directory, and reuse their live session.
+- Cargo-versioned integration package preparation and isolated adapter tests.
+
+### Changed
+
+- Replace client-specific configuration examples and test host names with fictional names.
+
 ## [0.1.0] - 2026-10-26
 
 ### Added

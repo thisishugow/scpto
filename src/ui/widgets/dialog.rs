@@ -550,7 +550,7 @@ mod tests {
         let buttons = [button(DialogButton::Run, "Run", 'x')];
         let view = DialogView {
             title: "VPN",
-            message: "VPN may be required for nadi-gpu.\nCommand: ssh -t ts-dgx-dev ovpn",
+            message: "VPN may be required for work-gpu.\nCommand: ssh -t vpn-gateway ovpn",
             field: None,
             checkbox: None,
             buttons: &buttons,
@@ -561,8 +561,8 @@ mod tests {
         assert!(buf[(run.x + 6, run.y)]
             .modifier
             .contains(Modifier::UNDERLINED));
-        assert!(row_text(&buf, hit.area.y + 1).contains("VPN may be required for nadi-gpu."));
-        assert!(row_text(&buf, hit.area.y + 2).contains("Command: ssh -t ts-dgx-dev ovpn"));
+        assert!(row_text(&buf, hit.area.y + 1).contains("VPN may be required for work-gpu."));
+        assert!(row_text(&buf, hit.area.y + 2).contains("Command: ssh -t vpn-gateway ovpn"));
     }
 
     #[test]

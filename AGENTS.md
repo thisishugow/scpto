@@ -24,14 +24,19 @@
 | `src/ui/effects/` | Filesystem, session, transfer, editor, preview, sync, external-command, state, and timer I/O |
 | `src/ui/widgets/` | Individual widgets and shared formatting |
 | `src/ui/render.rs`, `src/ui/runtime.rs` | Frame composition and event loop |
+| `integrations/herdr/desktop/scpto/` | Desktop mod UI and owned local terminal launch/reuse |
+| `integrations/herdr/tui/` | Terminal plugin manifest and workspace-aware launch/reuse |
+| `tools/herdr.py` | Cargo-versioned local adapter packages, including the MIT license |
 
-Read each affected module's `//!` contract and Public API section before editing. App state emits effects; executors perform I/O; rendering builds the hit map consumed by input.
+Read each affected Rust module's `//!` contract and Public API section before editing. App state emits effects; executors perform I/O; rendering builds the hit map consumed by input.
 
 ## Shared contracts
 
 Treat these as shared contracts and change them deliberately, in a focused commit that updates every caller and its tests: `Cargo.toml`, `src/main.rs`, `src/lib.rs` module declarations, any `mod.rs`, the error enums in `src/error.rs`, the `Fs`/entry/endpoint types in `src/vfs/mod.rs`, `src/transfer/model.rs`, `src/ui/action.rs`, `src/connections.rs`, the key list in `src/settings.rs`, the `HitMap`, the `Pane` API, the persisted-state/partials API, and the widget view structs.
 
 Keep feature logic in its existing app/effect/widget files; `startup.rs`, `ui/runtime.rs`, and `ui/render.rs` only wire features together. Keep changes scoped to the task and preserve unrelated work.
+
+Herdr adapters invoke the installed `scpto` through its existing CLI; keep their launch behavior in the integration files without duplicating the TUI or transfer engine. Desktop and terminal adapters manage separate host sessions and do not coordinate standalone processes. Verify terminal ownership before reuse, pass directories through argv, and keep package versions sourced from `Cargo.toml`.
 
 ## Checks
 
@@ -41,12 +46,14 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo test
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-rg -n '[\x{4e00}-\x{9fff}]' src tests Cargo.toml
-rg -n 'TODO|FIXME|todo!|unimplemented!|allow\(dead_code\)|allow\(unused' src tests
+rg -n '[\x{4e00}-\x{9fff}]' src tests integrations tools/herdr.py Cargo.toml
+rg -n 'TODO|FIXME|todo!|unimplemented!|allow\(dead_code\)|allow\(unused' src tests integrations tools/herdr.py
 python3 tests/verify.py
+python3 -m unittest discover -s tests -p 'test_herdr.py'
+node --test tests/herdr-desktop.test.mjs
 ```
 
-The two scans pass only with no matches (exit 1); all other checks must exit 0. For fixture coverage, run `tests/it/fixtures/up.sh`, `SCPTO_IT=1 cargo test`, `SCPTO_IT=1 cargo test -- --ignored`, and `SCPTO_IT=1 python3 tests/verify.py`. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and manual checks. Report failures honestly; never alter tests just to make them pass.
+The adapter tests require Python 3.11+ and Node.js 20+, with no third-party packages. The two scans pass only with no matches (exit 1); all other checks must exit 0. For fixture coverage, run `tests/it/fixtures/up.sh`, `SCPTO_IT=1 cargo test`, `SCPTO_IT=1 cargo test -- --ignored`, and `SCPTO_IT=1 python3 tests/verify.py`. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and manual checks. Report failures honestly; never alter tests just to make them pass.
 
 ## Language and implementation
 

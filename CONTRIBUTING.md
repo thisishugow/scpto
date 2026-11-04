@@ -30,6 +30,15 @@ python3 tests/verify.py
 
 Both `rg` commands must print nothing and exit 1. The other commands must exit 0. Do not suppress warnings or change assertions merely to get a passing run.
 
+Herdr adapter changes also require Python 3.11+ and Node.js 20+ for the dependency-free tests:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_herdr.py'
+node --test tests/herdr-desktop.test.mjs
+```
+
+These tests isolate filesystem and subprocess boundaries; they do not connect to your Herdr sessions. Use the [Herdr integration guide](integrations/herdr/README.md) for live-host checks with disposable configuration and a separate core session.
+
 For integration coverage, start the [Docker fixtures](tests/it/fixtures/README.md), then enable the fixture tests and PTY round:
 
 ```sh

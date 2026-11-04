@@ -12,6 +12,23 @@ defaults:
     shell: bash
 
 jobs:
+  herdr-adapters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: python3 -m unittest discover -s tests -p 'test_herdr.py'
+      - run: node --test tests/herdr-desktop.test.mjs
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 10

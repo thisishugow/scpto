@@ -10,7 +10,7 @@
 //! set|tar-threshold|200
 //! set|show-hidden|false
 //! set|mtime-tolerance|2
-//! vpn|nadi-*|ssh -t ts-dgx-dev ovpn
+//! vpn|work-*|ssh -t vpn-gateway ovpn
 //! ```
 //!
 //! Settings are data: a `vpn` command runs only when the user presses "Run"
@@ -346,7 +346,7 @@ mod tests {
         let settings = Settings {
             vpn_rules: vec![
                 VpnRule {
-                    pattern: "nadi-*".into(),
+                    pattern: "work-*".into(),
                     command: "first".into(),
                     line: 1,
                 },
@@ -363,7 +363,7 @@ mod tests {
                 .vpn_rule(alias, hostname)
                 .map(|rule| rule.command.as_str())
         };
-        assert_eq!(command("NADI-gpu", Some("x.lab")), Some("first"));
+        assert_eq!(command("WORK-gpu", Some("x.lab")), Some("first"));
         assert_eq!(command("box", Some("x.Lab")), Some("second"));
         assert_eq!(command("box", None), None);
         assert_eq!(command("box", Some("x.example")), None);
@@ -445,11 +445,11 @@ mod tests {
 
     #[test]
     fn vpn_command_keeps_pipes_and_records_the_line() {
-        let settings = parse_ok("\nvpn|nadi-*|ssh -t jump 'a|b'\n");
+        let settings = parse_ok("\nvpn|work-*|ssh -t jump 'a|b'\n");
         assert_eq!(
             settings.vpn_rules,
             vec![VpnRule {
-                pattern: "nadi-*".into(),
+                pattern: "work-*".into(),
                 command: "ssh -t jump 'a|b'".into(),
                 line: 2
             }]
