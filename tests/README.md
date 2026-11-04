@@ -1,7 +1,27 @@
 # Verification
 
 Run the usual build, clippy, formatting, unit tests, and rustdoc checks from the
-repository root. No new development dependencies are required.
+repository root. Herdr adapter checks additionally use Python 3.11+ and Node.js 20+; no third-party Python or npm packages are required.
+
+## Herdr adapters
+
+```sh
+python3 -m unittest discover -s tests -p 'test_herdr.py'
+node --test tests/herdr-desktop.test.mjs
+```
+
+The Python tests prepare real packages in temporary directories and execute the
+terminal launcher against an isolated fake CLI boundary. The Node tests load the
+actual desktop session controller and exercise the documented host boundary;
+they do not mock GPUI rendering. These checks cover launch context, literal argv,
+session ownership, reuse/relaunch, failures, and duplicate activation without
+reading or changing the user's Herdr sessions.
+
+Run `herdr-app check` against the generated desktop package for the host's initial
+render check. Full interactive validation requires an isolated Herdr configuration
+and core session; see the [integration guide](../integrations/herdr/README.md).
+A passing controller test or initial render does not establish drag/drop,
+authentication, editor handoff, or shutdown compatibility.
 
 ## SSH integration
 

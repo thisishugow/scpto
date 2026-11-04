@@ -1,0 +1,11 @@
+{
+  "place": "top",
+  "size": 48,
+  "overlay": {
+    "kind": "popup",
+    "width": 560,
+    "height": 64,
+    "at": "top",
+    "offset": 60
+  }
+}

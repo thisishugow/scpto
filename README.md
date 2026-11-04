@@ -51,6 +51,18 @@ cargo install --locked --path .
 
 Ensure `~/.cargo/bin` is on your `PATH`.
 
+## Herdr integrations
+
+Use scpto inside Herdr without changing its terminal interface. The desktop mod adds an **Open scpto** control; the terminal plugin adds a workspace-aware action. Both open a full terminal tab and reuse their own live session. The first launch uses the current local directory; reopening retains the session's directories and transfers.
+
+Install scpto first, then prepare the adapters from a repository checkout with Python 3.11+:
+
+```sh
+python3 tools/herdr.py target/herdr
+```
+
+See the [Herdr integration guide](integrations/herdr/README.md) for desktop installation, terminal-plugin linking, updates, and removal. These are local-host integrations; a remote SFTP endpoint is selected inside scpto as usual. The adapters do not coordinate separate standalone scpto processes.
+
 ## Usage
 
 ```sh

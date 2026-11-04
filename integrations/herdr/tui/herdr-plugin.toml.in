@@ -1,0 +1,18 @@
+id = "scpto.files"
+name = "scpto"
+version = "@@VERSION@@"
+min_herdr_version = "0.9.5"
+description = "Open or focus the scpto file manager"
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "open"
+title = "Open scpto"
+contexts = ["workspace", "pane"]
+command = ["python3", "launch.py"]
+
+[[panes]]
+id = "files"
+title = "scpto"
+placement = "tab"
+command = ["scpto"]

@@ -51,6 +51,18 @@ cargo install --locked --path .
 
 確認 `~/.cargo/bin` 位於 `PATH` 中。
 
+## Herdr 整合
+
+在 Herdr 中使用 scpto，保留原本的終端機介面。桌面 mod 提供 **Open scpto** 按鈕；終端 plugin 提供依工作區啟動的操作。兩者都會開啟完整終端機分頁，並重用各自仍在執行的 session。首次啟動使用目前的本機目錄；再次開啟會保留 session 中的目錄與傳輸工作。
+
+先安裝 scpto，再於 repository checkout 中使用 Python 3.11+ 準備整合套件：
+
+```sh
+python3 tools/herdr.py target/herdr
+```
+
+桌面版安裝、終端 plugin 連結、更新與移除方式，請參閱 [Herdr 整合指南](integrations/herdr/README.md)。這些整合在本機執行；遠端 SFTP 端點仍照常於 scpto 中選取。整合入口不會協調另外獨立啟動的 scpto 程序。
+
 ## 使用方式
 
 ```sh
